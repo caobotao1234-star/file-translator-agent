@@ -1,4 +1,5 @@
 import os
+import json
 from volcenginesdkarkruntime import Ark
 
 # 设置 API Key
@@ -9,7 +10,7 @@ client = Ark(
     api_key=api_key,
 )
 
-print("--- 已进入对话模式（输入 'exit' 或 'quit' 退出） ---")
+print("--- 已进入对话模式（支持上下文，输入 'exit' 或 'quit' 退出） ---")
 
 while True:
     # 1. 获取终端输入
@@ -20,25 +21,44 @@ while True:
         print("对话结束。")
         break
 
+    # --- 核心修改：将用户输入添加到历史记录 ---
+    history.append({"role": "user", "content": user_input})
+
+    # --- 【新增：监控区】打印发送给模型的所有数据 ---
+    print("\n" + "="*30 + " 发送给模型的原始数据 " + "="*30)
+    # 使用 json.dumps 让输出带缩进和颜色（如果终端支持），ensure_ascii=False 保证中文正常显示
+    print(json.dumps(history, indent=2, ensure_ascii=False))
+    print("=" * 80 + "\n")
+    # ----------------------------------------------
+
     # 2. 创建流式对话请求
-    # 注意：这里改用了 chat.completions.create，这是最稳妥的流式调用方式
+    # 注意：这里 messages 直接传我们的 history 列表
     stream = client.chat.completions.create(
         model="ep-20260225180145-r528v",
-        messages=[
-            {"role": "user", "content": user_input},
-        ],
-        stream=True, # 开启流式输出
+        messages=history, 
+        stream=True,
     )
 
     # 3. 处理流式返回的内容
     print("助手: ", end="")
+    
+    # 用于记录 AI 本次回答的完整内容，以便存入历史
+    full_assistant_response = ""
+    
     for chunk in stream:
-        # 获取每一块内容并立即打印
         if not chunk.choices:
             continue
         
         content = chunk.choices[0].delta.content
         if content:
-            print(content, end="", flush=True) # flush=True 确保文字立即显示在屏幕上
+            print(content, end="", flush=True)
+            full_assistant_response += content # 累加每一块文字
     
     print() # 换行
+
+    # --- 核心修改：将 AI 的完整回答也添加到历史记录中 ---
+    history.append({"role": "assistant", "content": full_assistant_response})
+
+    # (可选) 进阶操作：如果对话非常长，建议限制历史记录长度，防止 Token 消耗过快
+    # if len(history) > 11:  # 只保留最近 5 轮对话 (1个system + 5个user + 5个assistant)
+    #     history = [history[0]] + history[-10:]
