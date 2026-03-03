@@ -32,7 +32,8 @@ class BaseAgent:
             # ==========================================
             # 🔧 [Agent 核心逻辑]：工具拦截器 (Tool Interceptor)
             # ==========================================
-            if "[TOOL: get_time]" in full_response:
+            # 【修改这里】：去掉两端空格后，必须【完全等于】这个指令，而不是仅仅包含
+            if full_response.strip() == "[TOOL: get_time]":
                 yield "\n\n🛠️ [系统动作]: 触发了获取时间工具，正在执行本地代码..."
                 
                 # 执行 Python 代码拿到真正的时间
