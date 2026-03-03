@@ -3,7 +3,7 @@ from core.llm_engine import ArkLLMEngine
 from core.agent import BaseAgent
 
 # 导入我们的工具对象
-from tools.basic_tools import TimeTool, WeatherTool, CalculatorTool
+from tools.basic_tools import TimeTool, WeatherTool, CalculatorTool, NewsTool
 
 def main():
     print("--- 🚀 正在初始化 Agent 系统 ---")
@@ -15,7 +15,8 @@ def main():
     my_tools =[
         TimeTool(),
         WeatherTool(),
-        CalculatorTool()
+        CalculatorTool(),
+        NewsTool(),
     ]
     
     # 3. 组装 Agent (注意：这里不再传入 memory，Agent 内部会根据工具自动生成)

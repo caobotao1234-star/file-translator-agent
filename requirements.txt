@@ -1,2 +1,3 @@
-volcenginesdkarkruntime
+volcengine
 python-dotenv
+duckduckgo-search
