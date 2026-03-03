@@ -17,6 +17,13 @@ class BaseAgent:
         # 1. 记录用户输入到记忆
         self.memory.add_user_message(user_input)
 
+        # =========================================================
+        # 🔍 [新增 Debug 逻辑]：打印即将发送给大模型的完整 payload
+        # =========================================================
+        print("\n" + "▼"*20 + " [Debug: 真正发送给模型的上下文] " + "▼"*20)
+        print(self.memory.get_debug_info())
+        print("▲"*65 + "\n")
+
         # ---------------------------------------------------------
         # [预留位]：未来这里可以加入 Tool Calling 逻辑
         # 比如：判断意图 -> 调用搜索工具 -> 把搜索结果追加到 memory 中
@@ -24,6 +31,7 @@ class BaseAgent:
 
         # 2. 调用 LLM 进行思考和回复
         full_response = ""
+        # 这里把 memory 里的所有对话记录提取出来发给模型
         for chunk in self.llm.stream_chat(self.memory.get_messages()):
             full_response += chunk
             yield chunk  # 将每一个字的生成抛给上一层 (如UI界面)
