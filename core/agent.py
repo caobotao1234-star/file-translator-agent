@@ -1,4 +1,5 @@
 import json
+import re # 引入正则库
 from typing import Generator, List
 from core.llm_engine import ArkLLMEngine
 from core.memory import ConversationMemory
@@ -29,6 +30,7 @@ class BaseAgent:
     def chat(self, user_input: str) -> Generator[str, None, None]:
         self.memory.add_user_message(user_input)
 
+        # 调试信息打印...
         print("\n" + "▼"*20 + "[Debug: 真正发送给模型的上下文] " + "▼"*20)
         print(self.memory.get_debug_info())
         print("▲"*65 + "\n")
@@ -41,38 +43,41 @@ class BaseAgent:
                 
             self.memory.add_ai_message(full_response)
 
-            clean_text = full_response.strip()
-            if clean_text.startswith("```json"): clean_text = clean_text[7:]
-            if clean_text.startswith("```"): clean_text = clean_text[3:]
-            if clean_text.endswith("```"): clean_text = clean_text[:-3]
-            clean_text = clean_text.strip()
+            # ==========================================
+            # 🔧 [强力正则解析器]：从混合文本中提取 JSON
+            # ==========================================
+            # 匹配 ```json ... ``` 中的内容，re.DOTALL 让 . 可以匹配换行符
+            match = re.search(r'```json\s*(.*?)\s*```', full_response, re.DOTALL)
+            
+            tool_call_dict = None
+            if match:
+                json_str = match.group(1).strip()
+                try:
+                    tool_call_dict = json.loads(json_str)
+                except json.JSONDecodeError:
+                    yield "\n\n⚠️ [系统警告]: 模型输出了不合法的 JSON 格式，无法解析。\n"
+                    break # 退出当前思考循环
 
-            try:
-                tool_call_dict = json.loads(clean_text)
+            # 如果成功解析出字典，且包含 action
+            if tool_call_dict and isinstance(tool_call_dict, dict) and "action" in tool_call_dict:
+                action_name = tool_call_dict["action"]
+                action_params = tool_call_dict.get("action_input", {})
+
+                yield f"\n\n🛠️ [系统动作]: 请求调用[{action_name}]，参数: {action_params}...\n"
                 
-                if isinstance(tool_call_dict, dict) and "action" in tool_call_dict:
-                    action_name = tool_call_dict["action"]
-                    action_params = tool_call_dict.get("action_input", {})
-
-                    yield f"\n\n🛠️ [系统动作]: 请求调用[{action_name}]，参数: {action_params}...\n"
-                    
-                    # ==========================================
-                    # 🔧 [Agent 动态路由]：消灭了 if/elif，优雅调用！
-                    # ==========================================
-                    if action_name in self.tools_map:
-                        tool_instance = self.tools_map[action_name]
-                        # 直接把参数丢给工具对象的 execute 方法
-                        tool_result = tool_instance.execute(action_params) 
-                    else:
-                        tool_result = f"错误：未知的工具 '{action_name}'"
-                    
-                    yield f" 拿到结果：{tool_result}\n"
-                    
-                    tool_feedback = f"【系统内部反馈】工具执行完毕。结果是：{tool_result}。请基于此结果回答。"
-                    self.memory.add_user_message(tool_feedback)
-                    
-                    yield "🧠 [Agent 思考]: 已将结果存入记忆，正在生成回答...\n\n"
-                    continue 
-                    
-            except json.JSONDecodeError:
+                if action_name in self.tools_map:
+                    tool_instance = self.tools_map[action_name]
+                    tool_result = tool_instance.execute(action_params) 
+                else:
+                    tool_result = f"错误：未知的工具 '{action_name}'"
+                
+                yield f" 拿到结果：{tool_result}\n"
+                
+                tool_feedback = f"【系统内部反馈】工具执行完毕。结果是：{tool_result}。请基于此结果回答。"
+                self.memory.add_user_message(tool_feedback)
+                
+                yield "🧠 [Agent 思考]: 已将结果存入记忆，正在生成最终回答...\n\n"
+                continue # 继续死循环，让大模型读入结果后重新输出
+            else:
+                # 如果没有匹配到包含 action 的 JSON，说明模型认为不需要调用工具，或者回答完毕
                 break
