@@ -10,39 +10,39 @@ class ArkLLMEngine:
         )
         self.model_id = model_id
 
-    # 注意这里的入参多了一个 tools
     def stream_chat(self, messages: List[Dict], tools: List[Dict] = None) -> Generator[Dict, None, None]:
         try:
             stream = self.client.chat.completions.create(
                 model=self.model_id,
                 messages=messages,
-                tools=tools, # 真正的核心：把工具列表发给火山 API！
+                tools=tools,
                 stream=True,
             )
             
-            tool_call_name = ""
-            tool_call_args = ""
-            is_tool_call = False
+            # 【核心修改】：用字典通过 index 区分不同的并发工具调用
+            tool_calls_dict = {}
 
             for chunk in stream:
                 delta = chunk.choices[0].delta
                 
-                # 1. 如果模型正常说话（文本）
+                # 1. 正常文本输出
                 if delta.content:
                     yield {"type": "text", "content": delta.content}
                     
-                # 2. 如果模型决定调用工具（流式模式下，API 返回的 JSON 字符串是被切碎的，需要我们拼起来）
-                elif delta.tool_calls:
-                    is_tool_call = True
-                    tc = delta.tool_calls[0]
-                    if tc.function.name:
-                        tool_call_name = tc.function.name
-                    if tc.function.arguments:
-                        tool_call_args += tc.function.arguments
+                # 2. 工具调用输出
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index # 获取当前工具的并发编号
+                        if idx not in tool_calls_dict:
+                            tool_calls_dict[idx] = {"name": "", "arguments": ""}
+                        if tc.function.name:
+                            tool_calls_dict[idx]["name"] += tc.function.name
+                        if tc.function.arguments:
+                            tool_calls_dict[idx]["arguments"] += tc.function.arguments
 
-            # 3. 循环结束后，如果是工具调用，就把拼接好的结果抛出
-            if is_tool_call:
-                yield {"type": "tool_call", "name": tool_call_name, "arguments": tool_call_args}
+            # 3. 数据流接收完毕后，把收集到的多个工具全部抛出
+            for idx, tc_data in tool_calls_dict.items():
+                yield {"type": "tool_call", "name": tc_data["name"], "arguments": tc_data["arguments"]}
                 
         except Exception as e:
             yield {"type": "text", "content": f"\n[LLM 请求错误]: {e}"}
