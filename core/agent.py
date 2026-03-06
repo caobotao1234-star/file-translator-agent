@@ -81,23 +81,40 @@ class BaseAgent:
                     action_args_str = tc["arguments"]
                     yield f"\n\n⚙️[原生 API 动作]: 模型请求调用[{action_name}]，参数: {action_args_str}...\n"
                     
+                    # 【核心改变：智能纠错拦截机制】
+                    tool_result = ""
                     try:
-                        action_params = json.loads(action_args_str)
+                        # 1. 尝试解析参数（如果解析失败，直接跳到 except）
+                        action_params = json.loads(action_args_str) if action_args_str else {}
+                        
+                        # 2. 检查工具是否存在
+                        if action_name not in self.tools_map:
+                            tool_result = f"系统错误：未知的工具 '{action_name}'。请检查系统工具箱中提供的可用工具列表。"
+                        else:
+                            tool = self.tools_map[action_name]
+                            
+                            # 3. 【重点】安检员上岗：校验必填参数
+                            is_valid, error_msg = tool.validate_params(action_params)
+                            if not is_valid:
+                                # 明确告诉模型缺了什么，它下次循环就会补上！
+                                tool_result = f"调用失败：{error_msg}。请更正参数后重新调用该工具。"
+                            else:
+                                # 4. 安检通过，真正执行工具
+                                tool_result = tool.execute(action_params)
+                                
                     except json.JSONDecodeError:
-                        action_params = {}
+                        tool_result = f"调用失败：参数不是合法的 JSON 格式 ({action_args_str})。请输出标准的 JSON 后重试。"
+                    except Exception as e:
+                        # 捕捉工具内部写的代码报错（比如除以 0、网络断开等）
+                        tool_result = f"执行失败，工具内部抛出异常：{str(e)}。你可以尝试更换参数重试，或告知用户无法完成。"
                         
-                    if action_name in self.tools_map:
-                        tool_result = self.tools_map[action_name].execute(action_params) 
-                    else:
-                        tool_result = f"未知的工具: {action_name}"
-                        
-                    yield f" 拿到结果：{tool_result}\n"
+                    yield f" 拿到结果（或反馈）：{tool_result}\n"
                     
-                    # 【核心改变】：用专属的 role="tool" 存入记忆，并绑定 ID！
+                    # 不管是成功的结果，还是报错的信息，都必须作为 role="tool" 存入记忆反馈给大模型！
                     self.memory.add_tool_message(
                         tool_call_id=action_id, 
                         name=action_name, 
-                        content=str(tool_result) # 确保结果是字符串
+                        content=str(tool_result) 
                     )
                 
                 # 防御逻辑：依然保留，防止死循环
