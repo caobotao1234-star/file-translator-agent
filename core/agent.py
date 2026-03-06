@@ -59,8 +59,24 @@ class BaseAgent:
                     self.total_tokens += chunk["total_tokens"]
 
             if tool_calls_this_turn:
-                tool_results_str = ""
+                # --- 【新增步骤 A】：记录 Assistant 发起的工具调用请求 ---
+                # 构造符合 API 标准的 tool_calls 列表格式
+                api_tool_calls =[
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": tc["arguments"]
+                        }
+                    } for tc in tool_calls_this_turn
+                ]
+                # 存入记忆（注意：如果模型在此之前输出了思考文本，把 full_response 也带上）
+                self.memory.add_assistant_tool_call(tool_calls=api_tool_calls, content=full_response)
+                
+                # --- 【新增步骤 B】：依次执行工具，并记录标准的 Tool 消息 ---
                 for tc in tool_calls_this_turn:
+                    action_id = tc["id"]
                     action_name = tc["name"]
                     action_args_str = tc["arguments"]
                     yield f"\n\n⚙️[原生 API 动作]: 模型请求调用[{action_name}]，参数: {action_args_str}...\n"
@@ -76,18 +92,23 @@ class BaseAgent:
                         tool_result = f"未知的工具: {action_name}"
                         
                     yield f" 拿到结果：{tool_result}\n"
-                    tool_results_str += f"调用 [{action_name}] 参数 {action_args_str} 的结果是: {tool_result}\n"
+                    
+                    # 【核心改变】：用专属的 role="tool" 存入记忆，并绑定 ID！
+                    self.memory.add_tool_message(
+                        tool_call_id=action_id, 
+                        name=action_name, 
+                        content=str(tool_result) # 确保结果是字符串
+                    )
                 
-                # 【新增防御逻辑】：如果已经到了最后一次循环，强制警告
+                # 防御逻辑：依然保留，防止死循环
                 if current_loop == max_loops:
                     yield "\n⚠️[系统警告]: 思考次数超限，强制停止深入思考。\n"
-                    self.memory.add_ai_message(f"(内部记录: 调用了 {len(tool_calls_this_turn)} 个工具，但思考次数耗尽)")
-                    self.memory.add_user_message(f"工具结果是：\n{tool_results_str}\n请直接基于现有结果给出最终总结，不要再调用工具了！")
+                    # 这里是真正的系统干预，用 user 角色发警告是合理的
+                    self.memory.add_user_message("系统警告：工具调用次数已达上限，请立即基于现有信息给出最终结论，严禁再次调用工具！")
                 else:
                     yield "\n🧠[Agent]: 正在综合处理所有结果...\n\n"
-                    self.memory.add_ai_message(f"(内部记录: 我并发调用了 {len(tool_calls_this_turn)} 个工具)")
-                    self.memory.add_user_message(f"系统返回了工具调用的汇总结果：\n{tool_results_str}\n请基于结果回答，或继续调用工具推进任务。")
-                continue 
+                    
+                continue
 
             if not tool_calls_this_turn:
                 self.memory.add_ai_message(full_response)

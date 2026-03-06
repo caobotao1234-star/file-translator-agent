@@ -48,7 +48,12 @@ class ArkLLMEngine:
                     for tc in delta.tool_calls:
                         idx = tc.index
                         if idx not in tool_calls_dict:
-                            tool_calls_dict[idx] = {"name": "", "arguments": ""}
+                            # 【修改1】：字典初始化时，增加 id 字段
+                            tool_calls_dict[idx] = {"id": "", "name": "", "arguments": ""}
+                        
+                        # 【修改2】：抓取流式返回的工具 ID
+                        if tc.id:
+                            tool_calls_dict[idx]["id"] += tc.id
                         if tc.function.name:
                             tool_calls_dict[idx]["name"] += tc.function.name
                         if tc.function.arguments:
@@ -56,7 +61,13 @@ class ArkLLMEngine:
 
             # 3. 数据流接收完毕后，把收集到的多个工具全部抛出
             for idx, tc_data in tool_calls_dict.items():
-                yield {"type": "tool_call", "name": tc_data["name"], "arguments": tc_data["arguments"]}
+                # 【修改3】：抛出时，带上 id 给外层的 Agent
+                yield {
+                    "type": "tool_call", 
+                    "id": tc_data["id"], 
+                    "name": tc_data["name"], 
+                    "arguments": tc_data["arguments"]
+                }
                 
         except Exception as e:
             yield {"type": "text", "content": f"\n[LLM 请求错误]: {e}"}

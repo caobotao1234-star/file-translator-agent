@@ -16,6 +16,25 @@ class ConversationMemory:
     def add_ai_message(self, content: str):
         self.messages.append({"role": "assistant", "content": content})
         self._trim()
+        
+    def add_assistant_tool_call(self, tool_calls: List[Dict], content: str = ""):
+        """记录模型发起工具调用的这个动作"""
+        self.messages.append({
+            "role": "assistant",
+            "content": content, # 可能伴随的思考过程文本
+            "tool_calls": tool_calls
+        })
+        self._trim()
+
+    def add_tool_message(self, tool_call_id: str, name: str, content: str):
+        """记录工具执行的最终结果"""
+        self.messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": name,
+            "content": content
+        })
+        self._trim()
 
     def _trim(self):
         # 【核心逻辑：滑动窗口】
