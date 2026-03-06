@@ -13,7 +13,10 @@ class BaseAgent:
         self.api_tools = [tool.get_api_format() for tool in tools]
         
         # 【修改】：将硬编码的 simple_prompt 替换为导入的 AGENT_SYSTEM_PROMPT
-        self.memory = ConversationMemory(system_prompt=AGENT_SYSTEM_PROMPT)
+        self.memory = ConversationMemory(
+            system_prompt=AGENT_SYSTEM_PROMPT, 
+            llm_engine=self.llm, 
+        )
         
         self.total_tokens = 0
         self.total_prompt_tokens = 0      
