@@ -17,12 +17,26 @@ class ArkLLMEngine:
                 messages=messages,
                 tools=tools,
                 stream=True,
+                # 【新增】：强制要求 API 在流的最后返回 Token 使用量
+                stream_options={"include_usage": True} 
             )
             
-            # 【核心修改】：用字典通过 index 区分不同的并发工具调用
             tool_calls_dict = {}
 
             for chunk in stream:
+                # 【新增】：如果这一块包含了账单信息，我们就单独把它抛出去
+                if chunk.usage:
+                    yield {
+                        "type": "usage", 
+                        "prompt_tokens": chunk.usage.prompt_tokens,
+                        "completion_tokens": chunk.usage.completion_tokens,
+                        "total_tokens": chunk.usage.total_tokens
+                    }
+                
+                # 注意：带有 usage 的最后一块 chunk，通常不包含对话内容 choices，所以我们要跳过，防止报错
+                if not chunk.choices:
+                    continue
+
                 delta = chunk.choices[0].delta
                 
                 # 1. 正常文本输出
@@ -32,7 +46,7 @@ class ArkLLMEngine:
                 # 2. 工具调用输出
                 if delta.tool_calls:
                     for tc in delta.tool_calls:
-                        idx = tc.index # 获取当前工具的并发编号
+                        idx = tc.index
                         if idx not in tool_calls_dict:
                             tool_calls_dict[idx] = {"name": "", "arguments": ""}
                         if tc.function.name:
