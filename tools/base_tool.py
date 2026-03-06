@@ -2,14 +2,22 @@
 from abc import ABC, abstractmethod
 
 class BaseTool(ABC):
-    """所有工具的基类/接口"""
-    
-    # 工具的名称（模型调用时输出的 action）
     name: str = ""
-    # 工具的说明（自动生成进 Prompt 给模型看的）
     description: str = ""
+    # 新增：工具的参数定义（默认是空参数的 JSON Schema）
+    parameters: dict = {"type": "object", "properties": {}}
 
     @abstractmethod
     def execute(self, params: dict) -> str:
-        """执行工具的具体逻辑，子类必须实现"""
         pass
+
+    # 新增：将我们的 Python 工具类，转换成大模型 API 认识的标准字典格式
+    def get_api_format(self) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters
+            }
+        }
