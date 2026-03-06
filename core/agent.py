@@ -4,16 +4,16 @@ from typing import Generator, List
 from core.llm_engine import ArkLLMEngine
 from core.memory import ConversationMemory
 from tools.base_tool import BaseTool
+from prompts.system_prompts import AGENT_SYSTEM_PROMPT 
 
 class BaseAgent:
     def __init__(self, llm_engine: ArkLLMEngine, tools: List[BaseTool]):
         self.llm = llm_engine
         self.tools_map = {tool.name: tool for tool in tools}
-        self.api_tools =[tool.get_api_format() for tool in tools]
+        self.api_tools = [tool.get_api_format() for tool in tools]
         
-        # 给模型一点个性
-        simple_prompt = "你是一个强大且幽默的 AI 助理。你可以使用工具解决问题，如果没有查到结果，请诚实地告诉用户。回答请尽量简洁明了。"
-        self.memory = ConversationMemory(system_prompt=simple_prompt)
+        # 【修改】：将硬编码的 simple_prompt 替换为导入的 AGENT_SYSTEM_PROMPT
+        self.memory = ConversationMemory(system_prompt=AGENT_SYSTEM_PROMPT)
         
         self.total_tokens = 0
         self.total_prompt_tokens = 0      
