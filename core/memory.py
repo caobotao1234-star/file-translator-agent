@@ -1,19 +1,25 @@
 # core/memory.py
 import json
-from typing import List, Dict
+from typing import List, Dict, Optional
 # 【新增】：把大模型引擎引入进来
 from core.llm_engine import ArkLLMEngine
 
 class ConversationMemory:
-    # 【修改】：__init__ 方法现在需要接收 llm_engine
-    def __init__(self, system_prompt: str, llm_engine: ArkLLMEngine, max_memory_length: int = 20):
+    def __init__(
+        self,
+        system_prompt: str,
+        llm_engine: Optional[ArkLLMEngine] = None,
+        max_memory_length: int = 20,
+        enable_summary: bool = False,
+        debug: bool = False,
+    ):
         self.base_system_prompt = system_prompt
-        self.messages: List[Dict] =[]
+        self.messages: List[Dict] = []
         self.max_memory_length = max_memory_length
-        self.memory_summary = "" 
-        
-        # 将大模型引擎存为内部属性，供后台提炼记忆时使用
+        self.memory_summary = ""
         self.llm_engine = llm_engine
+        self.enable_summary = enable_summary
+        self.debug = debug
 
     def add_user_message(self, content: str):
         self.messages.append({"role": "user", "content": content})
@@ -41,23 +47,23 @@ class ConversationMemory:
         self._trim()
 
     def _trim(self):
-        # 1. 如果没超长，直接返回
         if len(self.messages) <= self.max_memory_length:
             return
 
-        # 2. 寻找安全边界（依然保留，防止切断工具链）
         cut_index = len(self.messages) - self.max_memory_length
         while cut_index < len(self.messages):
             if self.messages[cut_index]["role"] == "user":
                 break
             cut_index += 1
-            
+
         if cut_index == len(self.messages):
             return
-            
-        # 3. 把即将被遗忘的消息提取出来
+
         forgotten_messages = self.messages[:cut_index]
         self.messages = self.messages[cut_index:]
+
+        if not self.enable_summary or self.llm_engine is None:
+            return
         
         # -----------------------------------------------------
         # 🌟 4. 【核心升级：LLM 智能记忆凝缩】
@@ -88,7 +94,8 @@ class ConversationMemory:
 剔除寒暄、报错、无关紧要的废话。如果有冲突的偏好（比如以前说喜欢A，现在说喜欢B），以最新的对话为准。
 请用极其简练的语言输出最新记忆摘要（不要超过 100 字）。只输出摘要文本本身。
 """
-        print("\n[🧠 记忆系统]: 检测到短期记忆已满，正在后台运行大模型凝缩长时记忆...")
+        if self.debug:
+            print("\n[🧠 记忆系统]: 检测到短期记忆已满，正在后台运行大模型凝缩长时记忆...")
         
         # 悄悄调用 LLM 生成摘要（不抛出到终端流，只是静默收集文本）
         new_summary = ""
@@ -97,7 +104,8 @@ class ConversationMemory:
                 new_summary += chunk["content"]
         
         self.memory_summary = new_summary.strip()
-        print(f"[🧠 记忆系统]: 凝缩完成！最新潜意识更新为：\n   👉 {self.memory_summary}\n")
+        if self.debug:
+            print(f"[🧠 记忆系统]: 凝缩完成！最新潜意识更新为：\n   👉 {self.memory_summary}\n")
 
     def get_messages(self) -> List[Dict]:
         final_system_content = self.base_system_prompt
