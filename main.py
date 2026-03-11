@@ -1,9 +1,9 @@
 from config.settings import Config
 from core.llm_engine import ArkLLMEngine
-from core.agent import BaseAgent
 from core.agent_config import AgentConfig
 from core.storage import ChatStorage
-from tools.basic_tools import TimeTool, WeatherTool, CalculatorTool, NewsTool, WebSearchTool
+from core.orchestrator import OrchestratorAgent
+from agents.agent_registry import AGENT_REGISTRY
 
 
 def render_event(event):
@@ -56,11 +56,11 @@ def render_event(event):
 # =============================================================
 
 
-def create_agent(llm, tools, config, session_id=None):
-    """工厂函数：创建一个 Agent 实例"""
-    return BaseAgent(
+def create_agent(llm, config, session_id=None):
+    """工厂函数：创建一个调度员 Agent 实例"""
+    return OrchestratorAgent(
         llm_engine=llm,
-        tools=tools,
+        agent_registry=AGENT_REGISTRY,
         config=config,
         session_id=session_id,
     )
@@ -89,23 +89,15 @@ def main():
         model_id=Config.DEFAULT_MODEL_ID
     )
 
-    my_tools = [
-        TimeTool(),
-        WeatherTool(),
-        CalculatorTool(),
-        NewsTool(),
-        WebSearchTool(),
-    ]
-
     config = AgentConfig(
         max_loops=8,
         debug=True,
         show_usage=True,
         enable_memory_summary=True,
-        enable_persistence=True,  # 📘 开启持久化
+        enable_persistence=True,
     )
 
-    agent = create_agent(llm, my_tools, config)
+    agent = create_agent(llm, config)
     print(f"--- ✅ Agent 启动完毕 | 会话ID: {agent.session_id} ---")
     print("--- 输入 /help 查看会话管理命令，输入 exit 退出 ---")
 
@@ -124,7 +116,7 @@ def main():
             continue
 
         if user_input == "/new":
-            agent = create_agent(llm, my_tools, config)
+            agent = create_agent(llm, config)
             print(f"[📂 会话管理]: 已创建新会话 | ID: {agent.session_id}")
             continue
 
@@ -142,7 +134,7 @@ def main():
 
         if user_input.startswith("/load "):
             target_id = user_input[6:].strip()
-            agent = create_agent(llm, my_tools, config, session_id=target_id)
+            agent = create_agent(llm, config, session_id=target_id)
             if agent.memory.messages:
                 print(f"[📂 会话管理]: 已加载会话 {target_id}（{len(agent.memory.messages)} 条消息）")
             else:
@@ -155,7 +147,7 @@ def main():
             if storage.delete(target_id):
                 print(f"[📂 会话管理]: 已删除会话 {target_id}")
                 if target_id == agent.session_id:
-                    agent = create_agent(llm, my_tools, config)
+                    agent = create_agent(llm, config)
                     print(f"[📂 会话管理]: 当前会话已被删除，自动创建新会话 | ID: {agent.session_id}")
             else:
                 print(f"[📂 会话管理]: 会话 {target_id} 不存在")

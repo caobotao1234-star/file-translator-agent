@@ -12,17 +12,36 @@ from prompts.system_prompts import AGENT_SYSTEM_PROMPT
 
 
 class BaseAgent:
+    """
+    基础 Agent 类。
+    
+    📘 教学笔记：为什么要让 BaseAgent 支持自定义 system_prompt？
+    
+    之前 system_prompt 是写死的 AGENT_SYSTEM_PROMPT。但在多 Agent 架构中，
+    每个子 Agent 都有自己的"人设"：
+      - 翻译 Agent 的 prompt 强调"你是专业翻译"
+      - 代码 Agent 的 prompt 强调"你是编程专家"
+      - 调度员 Agent 的 prompt 强调"你负责分析任务并分配给合适的专家"
+    
+    所以我们把 system_prompt 变成构造参数，默认值还是原来的通用 prompt，
+    但子类可以传入自己的专属 prompt。这就是"开放封闭原则"：
+    对扩展开放（新 Agent 可以自定义），对修改封闭（BaseAgent 代码不用改）。
+    """
+
     def __init__(
         self,
         llm_engine: ArkLLMEngine,
         tools: List[BaseTool],
         config: AgentConfig | None = None,
         session_id: str | None = None,
+        system_prompt: str | None = None,
+        agent_name: str = "助手",
     ):
         self.llm = llm_engine
         self.tools_map = {tool.name: tool for tool in tools}
         self.api_tools = [tool.get_api_format() for tool in tools]
         self.config = config or AgentConfig()
+        self.agent_name = agent_name
 
         # 📘 初始化存储引擎（如果开启了持久化）
         self.storage = None
@@ -34,7 +53,7 @@ class BaseAgent:
         self.session_id = session_id
 
         self.memory = ConversationMemory(
-            system_prompt=AGENT_SYSTEM_PROMPT,
+            system_prompt=system_prompt or AGENT_SYSTEM_PROMPT,
             llm_engine=self.llm,
             enable_summary=self.config.enable_memory_summary,
             debug=self.config.debug,
@@ -145,16 +164,7 @@ class BaseAgent:
                     tool_result = ""
                     try:
                         action_params = json.loads(action_args_str) if action_args_str else {}
-
-                        if action_name not in self.tools_map:
-                            tool_result = f"系统错误：未知工具 '{action_name}'"
-                        else:
-                            tool = self.tools_map[action_name]
-                            is_valid, error_msg = tool.validate_params(action_params)
-                            if not is_valid:
-                                tool_result = f"调用失败：{error_msg}"
-                            else:
-                                tool_result = tool.execute(action_params)
+                        tool_result = self._execute_tool(action_name, action_params)
 
                     except json.JSONDecodeError:
                         tool_result = f"调用失败：参数不是合法 JSON ({action_args_str})"
@@ -212,3 +222,45 @@ class BaseAgent:
             # 📘 每轮对话结束后自动持久化
             self.memory.save_to_storage()
             break
+
+    def run(self, user_input: str) -> str:
+        """
+        非流式执行：消费所有事件，只返回最终文本结果。
+        
+        📘 教学笔记：为什么需要 run() 方法？
+        
+        chat() 是流式的 Generator，适合终端实时展示。
+        但子 Agent 被调度员调用时，调度员不需要流式输出，
+        它只关心"你最终给我什么结果"。
+        
+        run() 就是 chat() 的"同步包装"：
+        遍历所有事件，收集最终文本，一次性返回。
+        """
+        final_content = ""
+        for event in self.chat(user_input):
+            if event.type == "final":
+                final_content = event.data.get("content", "")
+        return final_content
+
+    def _execute_tool(self, action_name: str, action_params: dict) -> str:
+        """
+        执行一个工具调用。子类可以覆写此方法来拦截特定工具。
+        
+        📘 教学笔记：模板方法模式（Template Method Pattern）
+        
+        BaseAgent 定义了工具执行的"骨架流程"，但把具体的执行逻辑
+        抽成一个可覆写的方法。OrchestratorAgent 覆写它来拦截
+        delegate_to_agent 工具，路由到子 Agent。
+        
+        这样 BaseAgent 的 chat() 方法完全不用改，
+        新的行为通过继承和覆写来注入。
+        """
+        if action_name not in self.tools_map:
+            return f"系统错误：未知工具 '{action_name}'"
+
+        tool = self.tools_map[action_name]
+        is_valid, error_msg = tool.validate_params(action_params)
+        if not is_valid:
+            return f"调用失败：{error_msg}"
+
+        return tool.execute(action_params)
