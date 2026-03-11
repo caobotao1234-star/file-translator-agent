@@ -1,8 +1,21 @@
 # core/memory.py
 import json
 from typing import List, Dict, Optional
-# 【新增】：把大模型引擎引入进来
 from core.llm_engine import ArkLLMEngine
+from core.storage import ChatStorage
+
+# =============================================================
+# 📘 教学笔记：Memory 与 Storage 的关系
+# =============================================================
+# Memory 是"运行时的大脑"，Storage 是"硬盘"。
+#   - Memory 负责管理当前对话的消息列表、裁剪、摘要
+#   - Storage 负责把 Memory 的状态写到文件 / 从文件恢复
+#
+# 为什么不让 Memory 直接读写文件？
+#   - 单一职责原则：Memory 管内存，Storage 管磁盘
+#   - 以后你想换成数据库，只需要改 Storage，Memory 完全不用动
+# =============================================================
+
 
 class ConversationMemory:
     def __init__(
@@ -12,6 +25,8 @@ class ConversationMemory:
         max_memory_length: int = 20,
         enable_summary: bool = False,
         debug: bool = False,
+        storage: Optional[ChatStorage] = None,
+        session_id: Optional[str] = None,
     ):
         self.base_system_prompt = system_prompt
         self.messages: List[Dict] = []
@@ -20,6 +35,8 @@ class ConversationMemory:
         self.llm_engine = llm_engine
         self.enable_summary = enable_summary
         self.debug = debug
+        self.storage = storage
+        self.session_id = session_id
 
     def add_user_message(self, content: str):
         self.messages.append({"role": "user", "content": content})
@@ -117,3 +134,32 @@ class ConversationMemory:
 
     def get_debug_info(self) -> str:
         return json.dumps(self.get_messages(), ensure_ascii=False, indent=2)
+
+    # =============================================================
+    # 📘 持久化相关方法
+    # =============================================================
+
+    def save_to_storage(self):
+        """把当前记忆状态持久化到磁盘"""
+        if self.storage is None or self.session_id is None:
+            return
+        self.storage.save(
+            session_id=self.session_id,
+            messages=self.messages,
+            memory_summary=self.memory_summary,
+        )
+        if self.debug:
+            print(f"[💾 存储系统]: 会话 {self.session_id} 已保存（{len(self.messages)} 条消息）")
+
+    def load_from_storage(self) -> bool:
+        """从磁盘恢复记忆状态，返回是否成功"""
+        if self.storage is None or self.session_id is None:
+            return False
+        data = self.storage.load(self.session_id)
+        if data is None:
+            return False
+        self.messages = data.get("messages", [])
+        self.memory_summary = data.get("memory_summary", "")
+        if self.debug:
+            print(f"[💾 存储系统]: 已恢复会话 {self.session_id}（{len(self.messages)} 条消息）")
+        return True

@@ -6,6 +6,7 @@ from core.llm_engine import ArkLLMEngine, LLMRetryError
 from core.memory import ConversationMemory
 from core.agent_config import AgentConfig
 from core.agent_events import AgentEvent
+from core.storage import ChatStorage
 from tools.base_tool import BaseTool
 from prompts.system_prompts import AGENT_SYSTEM_PROMPT
 
@@ -16,18 +17,34 @@ class BaseAgent:
         llm_engine: ArkLLMEngine,
         tools: List[BaseTool],
         config: AgentConfig | None = None,
+        session_id: str | None = None,
     ):
         self.llm = llm_engine
         self.tools_map = {tool.name: tool for tool in tools}
         self.api_tools = [tool.get_api_format() for tool in tools]
         self.config = config or AgentConfig()
 
+        # 📘 初始化存储引擎（如果开启了持久化）
+        self.storage = None
+        if self.config.enable_persistence:
+            self.storage = ChatStorage(storage_dir=self.config.storage_dir)
+            if session_id is None:
+                session_id = ChatStorage.generate_session_id()
+
+        self.session_id = session_id
+
         self.memory = ConversationMemory(
             system_prompt=AGENT_SYSTEM_PROMPT,
             llm_engine=self.llm,
             enable_summary=self.config.enable_memory_summary,
             debug=self.config.debug,
+            storage=self.storage,
+            session_id=self.session_id,
         )
+
+        # 如果指定了 session_id，尝试恢复历史对话
+        if self.storage and self.session_id:
+            self.memory.load_from_storage()
 
         self.total_tokens = 0
         self.total_prompt_tokens = 0
@@ -191,4 +208,7 @@ class BaseAgent:
                 )
 
             yield AgentEvent(type="final", data={"content": full_response})
+
+            # 📘 每轮对话结束后自动持久化
+            self.memory.save_to_storage()
             break
