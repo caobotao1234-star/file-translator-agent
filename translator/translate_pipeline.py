@@ -219,9 +219,9 @@ class TranslatePipeline:
         source_lang: str = "中文",
         target_lang: str = "英文",
         on_progress=None,
-    ) -> Dict[int, str]:
+    ) -> Dict[str, str]:
         """
-        翻译整个文档。
+        翻译整个文档（段落 + 表格单元格）。
 
         参数：
             parsed_data: docx_parser.parse_docx() 的返回值
@@ -229,16 +229,18 @@ class TranslatePipeline:
             target_lang: 目标语言
             on_progress: 进度回调 fn(completed, total)
 
-        返回：{段落index: 翻译后文本} 字典
+        返回：{key: 翻译后文本} 字典，key 如 "p_0", "t_0_1_2" 等
         """
-        # 收集需要翻译的段落
+        # 收集需要翻译的项目
         to_translate = []
-        for para in parsed_data["paragraphs"]:
-            if not para["is_empty"]:
-                to_translate.append((para["index"], para["full_text"]))
+        for item in parsed_data["items"]:
+            if item.get("is_empty"):
+                continue
+            if item.get("full_text"):
+                to_translate.append((item["key"], item["full_text"]))
 
         total = len(to_translate)
-        logger.info(f"开始翻译文档: {total} 个段落，batch_size={self.batch_size}")
+        logger.info(f"开始翻译文档: {total} 个翻译单元，batch_size={self.batch_size}")
 
         translations = {}
         completed = 0
@@ -246,20 +248,19 @@ class TranslatePipeline:
         # 分批翻译
         for i in range(0, total, self.batch_size):
             batch = to_translate[i:i + self.batch_size]
-            batch_indices = [idx for idx, _ in batch]
+            batch_keys = [key for key, _ in batch]
             batch_texts = [text for _, text in batch]
 
-            logger.info(f"翻译进度: {completed}/{total} "
-                        f"(当前批次: 段落 {batch_indices[0]}~{batch_indices[-1]})")
+            logger.info(f"翻译进度: {completed}/{total}")
 
             results = self.translate_batch(batch_texts, source_lang, target_lang)
 
-            for idx, translated in zip(batch_indices, results):
-                translations[idx] = translated
+            for key, translated in zip(batch_keys, results):
+                translations[key] = translated
 
             completed += len(batch)
             if on_progress:
                 on_progress(completed, total)
 
-        logger.info(f"文档翻译完成: {total} 个段落")
+        logger.info(f"文档翻译完成: {total} 个翻译单元")
         return translations

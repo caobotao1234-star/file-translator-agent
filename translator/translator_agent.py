@@ -101,8 +101,12 @@ class TranslatorAgent:
         # 1. 解析文档
         print(f"[📄 解析文档] {input_path}")
         parsed_data = parse_docx(input_path)
-        content_count = sum(1 for p in parsed_data["paragraphs"] if not p["is_empty"])
-        print(f"[📄 解析完成] {content_count} 个段落待翻译")
+        para_count = sum(1 for i in parsed_data["items"]
+                         if i["type"] == "paragraph" and not i.get("is_empty"))
+        cell_count = sum(1 for i in parsed_data["items"]
+                         if i["type"] == "table_cell")
+        total_count = para_count + cell_count
+        print(f"[📄 解析完成] {para_count} 个段落 + {cell_count} 个表格单元格 = {total_count} 个翻译单元")
 
         # 2. 翻译
         def on_progress(completed, total):
