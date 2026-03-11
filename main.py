@@ -29,6 +29,9 @@ def render_event(event):
     elif event.type == "warning":
         print(f"\n[Warning] {event.data['message']}", flush=True)
 
+    elif event.type == "error":
+        print(f"\n[❌ Error] {event.data['message']}", flush=True)
+
     elif event.type == "usage":
         print(
             f"\n[Usage] turn={event.data['turn_tokens']} "

@@ -2,7 +2,7 @@
 import json
 from typing import Generator, List
 
-from core.llm_engine import ArkLLMEngine
+from core.llm_engine import ArkLLMEngine, LLMRetryError
 from core.memory import ConversationMemory
 from core.agent_config import AgentConfig
 from core.agent_events import AgentEvent
@@ -53,25 +53,45 @@ class BaseAgent:
             full_response = ""
             tool_calls_this_turn = []
 
-            for chunk in self.llm.stream_chat(
-                self.memory.get_messages(),
-                tools=self.api_tools
-            ):
-                if chunk["type"] == "text":
-                    full_response += chunk["content"]
-                    yield AgentEvent(type="text_delta", data={"content": chunk["content"]})
+            # =============================================================
+            # 📘 教学笔记：Agent 层的错误处理
+            # =============================================================
+            # LLM 引擎内部已经有了重试机制，但如果所有重试都失败了，
+            # 会抛出 LLMRetryError。Agent 需要优雅地捕获它，
+            # 把错误信息通过事件系统告诉用户，而不是让程序直接崩溃。
+            #
+            # 这就是"分层错误处理"的思想：
+            #   - LLM 引擎层：负责重试（战术层面）
+            #   - Agent 层：负责兜底和用户通知（战略层面）
+            # =============================================================
+            try:
+                for chunk in self.llm.stream_chat(
+                    self.memory.get_messages(),
+                    tools=self.api_tools
+                ):
+                    if chunk["type"] == "text":
+                        full_response += chunk["content"]
+                        yield AgentEvent(type="text_delta", data={"content": chunk["content"]})
 
-                elif chunk["type"] == "tool_call":
-                    tool_calls_this_turn.append(chunk)
+                    elif chunk["type"] == "tool_call":
+                        tool_calls_this_turn.append(chunk)
 
-                elif chunk["type"] == "usage":
-                    turn_prompt_tokens += chunk["prompt_tokens"]
-                    turn_completion_tokens += chunk["completion_tokens"]
-                    turn_tokens += chunk["total_tokens"]
+                    elif chunk["type"] == "usage":
+                        turn_prompt_tokens += chunk["prompt_tokens"]
+                        turn_completion_tokens += chunk["completion_tokens"]
+                        turn_tokens += chunk["total_tokens"]
 
-                    self.total_prompt_tokens += chunk["prompt_tokens"]
-                    self.total_completion_tokens += chunk["completion_tokens"]
-                    self.total_tokens += chunk["total_tokens"]
+                        self.total_prompt_tokens += chunk["prompt_tokens"]
+                        self.total_completion_tokens += chunk["completion_tokens"]
+                        self.total_tokens += chunk["total_tokens"]
+
+            except LLMRetryError as e:
+                error_msg = f"抱歉，AI 服务暂时不可用（{e}），请稍后再试。"
+                self.memory.add_ai_message(error_msg)
+                yield AgentEvent(type="error", data={"message": str(e)})
+                yield AgentEvent(type="text_delta", data={"content": error_msg})
+                yield AgentEvent(type="final", data={"content": error_msg})
+                return
 
             if tool_calls_this_turn:
                 api_tool_calls = [
