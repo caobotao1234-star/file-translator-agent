@@ -51,6 +51,13 @@ def main():
     )
 
     print("--- ✅ 翻译 Agent 启动完毕 ---")
+
+    # 显示 COM 增强模式状态
+    if agent.com_enabled:
+        print("--- 🖥️ COM 增强模式: ✅ 已开启（支持图表/文本框/SmartArt 翻译）---")
+    else:
+        print("--- 🖥️ COM 增强模式: ❌ 未开启（仅翻译段落和表格文字）---")
+        print("---    提示: 安装 Microsoft Office 并安装 pywin32 可开启增强模式 ---")
     print_help()
 
     while True:

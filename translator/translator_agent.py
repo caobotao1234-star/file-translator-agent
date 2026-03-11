@@ -9,6 +9,7 @@ from translator.docx_parser import parse_docx
 from translator.docx_writer import write_docx
 from translator.format_engine import FormatEngine
 from translator.translate_pipeline import TranslatePipeline
+from translator.com_engine import is_com_available, extract_extra_texts, write_extra_texts
 
 # =============================================================
 # 📘 教学笔记：翻译 Agent 主控制器
@@ -67,8 +68,14 @@ class TranslatorAgent:
             debug=debug,
         )
 
+        # 📘 教学笔记：COM 增强模式自动检测
+        # 启动时探测一次 COM 环境，结果缓存，后续不再重复检测。
+        # 有 COM → 能处理图表/文本框/SmartArt
+        # 无 COM → 静默降级，只处理段落+表格（python-docx 能力范围）
+        self.com_enabled = is_com_available()
+
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        logger.info("翻译 Agent 初始化完成")
+        logger.info(f"翻译 Agent 初始化完成 (COM 增强: {'✅ 开启' if self.com_enabled else '❌ 关闭'})")
 
     def translate_file(
         self,
@@ -123,6 +130,34 @@ class TranslatorAgent:
         print(f"[📝 生成文档] 应用格式规则并写入...")
         write_docx(parsed_data, translations, output_path, self.format_engine,
                    source_path=input_path)
+
+        # 4. COM 增强：处理图表/文本框/SmartArt
+        # 📘 教学笔记：COM 处理必须在 python-docx 写完之后
+        # 因为 COM 直接操作输出文件，而 python-docx 会覆盖写入。
+        # 顺序：python-docx 生成 → COM 打开输出文件 → 替换额外文本 → 保存
+        if self.com_enabled:
+            print(f"[🔍 COM 增强] 检测图表/文本框/SmartArt...")
+            extra_items = extract_extra_texts(input_path)
+            if extra_items:
+                print(f"[🔍 COM 增强] 发现 {len(extra_items)} 个额外元素，翻译中...")
+                # 提取文本，送入翻译流水线
+                extra_texts = [item["text"] for item in extra_items]
+                extra_translations = self.pipeline.translate_batch(
+                    extra_texts,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                )
+                # 把译文写回 item
+                for item, trans in zip(extra_items, extra_translations):
+                    item["translated"] = trans
+
+                # 写回输出文档
+                print(f"[📝 COM 写回] 将译文写入图表/文本框...")
+                written = write_extra_texts(output_path, extra_items)
+                print(f"[✅ COM 完成] 成功写回 {written} 个元素")
+            else:
+                print(f"[ℹ️ COM 增强] 未发现需要额外处理的元素")
+
         print(f"[✅ 翻译完成] 输出文件: {output_path}")
 
         return output_path
