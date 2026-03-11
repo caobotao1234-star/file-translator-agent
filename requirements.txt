@@ -1,3 +1,4 @@
 volcengine
 python-dotenv
 duckduckgo-search
+python-docx
