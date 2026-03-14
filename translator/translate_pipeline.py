@@ -133,14 +133,34 @@ class TranslatePipeline:
         text = response.strip()
         if text.startswith("```"):
             lines = text.split("\n")
-            # 去掉首尾的 ``` 行
             lines = [l for l in lines if not l.strip().startswith("```")]
             text = "\n".join(lines).strip()
 
         try:
             result = json.loads(text)
             if isinstance(result, list):
-                return result
+                # 📘 教学笔记：LLM 返回格式防御
+                # 有时 LLM 不听话，返回的不是纯字符串数组，而是对象数组，如：
+                #   [{"原文": "你好", "译文": "Hello"}, ...]
+                # 我们需要把这种情况也兜住，提取出译文字符串。
+                cleaned = []
+                for item in result:
+                    if isinstance(item, str):
+                        cleaned.append(item)
+                    elif isinstance(item, dict):
+                        # 尝试从常见的 key 中提取译文
+                        for key in ("译文", "翻译", "translation", "translated",
+                                    "审校", "result", "text", "初翻"):
+                            if key in item:
+                                cleaned.append(str(item[key]))
+                                break
+                        else:
+                            # 实在找不到，取第一个值
+                            vals = list(item.values())
+                            cleaned.append(str(vals[-1]) if vals else "")
+                    else:
+                        cleaned.append(str(item))
+                return cleaned
         except json.JSONDecodeError:
             logger.warning(f"JSON 解析失败，原始响应: {text[:200]}...")
         return None

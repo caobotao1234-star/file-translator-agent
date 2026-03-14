@@ -3,7 +3,8 @@ import re
 from pptx import Presentation
 from pptx.util import Pt
 from pptx.enum.shapes import MSO_SHAPE_TYPE
-from typing import List, Dict, Any, Optional
+from pptx.enum.text import MSO_AUTO_SIZE
+from typing import List, Dict, Any, Optional, Set
 from translator.format_engine import FormatEngine
 from core.logger import get_logger
 
@@ -96,57 +97,45 @@ def _replace_paragraph_text(paragraph, translated_text: str, is_tagged: bool,
         run.text = ""
 
 
-def _resolve_paragraph(shapes, key: str):
+def _resolve_paragraph_and_shape(shapes, key: str):
     """
-    根据 key 在形状集合中定位到具体的段落对象。
+    根据 key 在形状集合中定位到具体的段落对象，同时返回所属的 shape。
 
-    📘 教学笔记：Key 解析
-    key 格式：s{slide}_[g{group}_]sh{shape}_p{para}
-              s{slide}_sh{shape}_t{row}_{col}[_p{para}]
-
-    我们不需要 slide 层级（调用时已经定位到具体 slide），
-    所以这里只解析 shape 以下的部分。
+    返回 (paragraph, shape) 或 (None, None)。
     """
-    # 去掉 slide 前缀，得到 shape 路径
-    # e.g. "s0_sh1_p2" → "sh1_p2"
-    # e.g. "s0_g0_sh1_p2" → "g0_sh1_p2"
     parts = key.split("_")
-
-    # 跳过 s{N} 前缀
     idx = 1  # 跳过 "s0"
 
-    # 处理组合形状前缀
     current_shapes = shapes
     while idx < len(parts) and parts[idx].startswith("g"):
         group_idx = int(parts[idx][1:])
         shape_list = list(current_shapes)
         if group_idx >= len(shape_list):
-            return None
+            return None, None
         group_shape = shape_list[group_idx]
         if group_shape.shape_type != MSO_SHAPE_TYPE.GROUP:
-            return None
+            return None, None
         current_shapes = group_shape.shapes
         idx += 1
 
-    # 解析 sh{N}
     if idx >= len(parts) or not parts[idx].startswith("sh"):
-        return None
+        return None, None
     shape_idx = int(parts[idx][2:])
     shape_list = list(current_shapes)
     if shape_idx >= len(shape_list):
-        return None
+        return None, None
     shape = shape_list[shape_idx]
     idx += 1
 
     if idx >= len(parts):
-        return None
+        return None, None
 
     # 表格：t{row}_{col}[_p{para}]
     if parts[idx].startswith("t"):
         row_idx = int(parts[idx][1:])
         idx += 1
         if idx >= len(parts):
-            return None
+            return None, None
         col_idx = int(parts[idx])
         idx += 1
         para_idx = 0
@@ -154,27 +143,27 @@ def _resolve_paragraph(shapes, key: str):
             para_idx = int(parts[idx][1:])
 
         if not shape.has_table:
-            return None
+            return None, None
         table = shape.table
         if row_idx >= len(table.rows) or col_idx >= len(table.rows[row_idx].cells):
-            return None
+            return None, None
         cell = table.rows[row_idx].cells[col_idx]
         paras = cell.text_frame.paragraphs
         if para_idx >= len(paras):
-            return None
-        return paras[para_idx]
+            return None, None
+        return paras[para_idx], shape
 
     # 普通文本：p{para}
     if parts[idx].startswith("p"):
         para_idx = int(parts[idx][1:])
         if not shape.has_text_frame:
-            return None
+            return None, None
         paras = shape.text_frame.paragraphs
         if para_idx >= len(paras):
-            return None
-        return paras[para_idx]
+            return None, None
+        return paras[para_idx], shape
 
-    return None
+    return None, None
 
 
 def write_pptx(
@@ -187,12 +176,12 @@ def write_pptx(
     """
     基于原 PPT 生成翻译后的文件（克隆 + 原地替换）。
 
-    参数：
-        parsed_data: pptx_parser.parse_pptx() 的返回值
-        translations: {key: 翻译后文本} 字典
-        output_path: 输出文件路径
-        format_engine: 格式映射引擎
-        source_path: 原 PPT 文件路径
+    📘 教学笔记：自动缩小字体防溢出
+    翻译后文本往往比原文长（尤其中→英），容易撑破文本框导致换行。
+    我们的策略：给所有被翻译过的文本框开启 PPT 原生的
+    "Shrink text on overflow"（溢出时缩小字体）功能。
+    PowerPoint 会自动计算最合适的字号，保证文字不溢出。
+    表格单元格不需要处理（单元格会自动扩展高度）。
     """
     if not source_path:
         raise ValueError("source_path 不能为空，需要原 PPT 来克隆格式")
@@ -201,19 +190,21 @@ def write_pptx(
     prs = Presentation(source_path)
 
     replaced_count = 0
+    # 📘 收集被修改过的非表格形状，后续统一设置 auto_size
+    modified_shapes: Set[int] = set()  # 用 shape 的 id() 去重
+
     for item in parsed_data["items"]:
         key = item["key"]
         if key not in translations:
             continue
 
-        # 从 key 中提取 slide 索引
-        slide_idx = int(key.split("_")[0][1:])  # "s0_..." → 0
+        slide_idx = int(key.split("_")[0][1:])
         if slide_idx >= len(prs.slides):
             logger.warning(f"幻灯片索引越界 key={key}，跳过")
             continue
 
         slide = prs.slides[slide_idx]
-        paragraph = _resolve_paragraph(slide.shapes, key)
+        paragraph, shape = _resolve_paragraph_and_shape(slide.shapes, key)
         if paragraph is None:
             logger.warning(f"无法定位 key={key}，跳过")
             continue
@@ -224,5 +215,16 @@ def write_pptx(
         _replace_paragraph_text(paragraph, translated_text, is_tagged, format_engine)
         replaced_count += 1
 
+        # 记录被修改的非表格形状（表格单元格不需要 auto_size）
+        if item["type"] != "table_cell" and shape.has_text_frame:
+            modified_shapes.add(id(shape))
+            # 直接在这里设置，id() 去重保证每个 shape 只设一次也无所谓
+            # 但为了清晰，我们在循环里就设
+            try:
+                shape.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+            except Exception as e:
+                logger.debug(f"设置 auto_size 失败 key={key}: {e}")
+
     prs.save(output_path)
-    logger.info(f"PPT 生成完成: {output_path}（替换了 {replaced_count} 个翻译单元）")
+    logger.info(f"PPT 生成完成: {output_path}（替换了 {replaced_count} 个翻译单元，"
+                f"{len(modified_shapes)} 个形状启用自动缩放）")
