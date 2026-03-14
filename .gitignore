@@ -4,3 +4,7 @@ logs/
 translator_config/
 output/
 *.docx
+*.pptx
+~$*
+.env
+volcengine/
