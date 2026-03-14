@@ -83,20 +83,19 @@ class TranslatorAgent:
         self,
         input_path: str,
         output_path: str = None,
-        source_lang: str = "中文",
         target_lang: str = "英文",
     ) -> str:
         """
         翻译文档（支持 .docx 和 .pptx）。
 
-        📘 教学笔记：统一入口，按扩展名分发
-        用户不需要关心底层用的是 python-docx 还是 python-pptx，
-        只需要丢一个文件路径进来，Agent 自动识别并处理。
+        📘 教学笔记：源语言自动识别，目标语言用户指定
+        源语言不需要用户选——LLM 自己能识别原文是什么语言。
+        但目标语言必须用户指定，因为中英混合文档无法自动判断"翻成什么"。
+        翻译 prompt 里不再指定源语言，只告诉 LLM "翻译成XX"。
 
         参数：
             input_path: 输入文件路径（.docx 或 .pptx）
             output_path: 输出文件路径（默认自动生成）
-            source_lang: 源语言
             target_lang: 目标语言
 
         返回：输出文件路径
@@ -137,7 +136,6 @@ class TranslatorAgent:
 
         translations = self.pipeline.translate_document(
             parsed_data,
-            source_lang=source_lang,
             target_lang=target_lang,
             on_progress=on_progress,
         )
@@ -157,13 +155,12 @@ class TranslatorAgent:
         # 不像 python-docx 那样有盲区。所以 PPT 不需要 COM 增强。
         # COM 增强只用于 Word 的图表标题/坐标轴等 python-docx 搞不定的元素。
         if ext == ".docx" and self.com_enabled:
-            self._com_enhance(input_path, output_path, source_lang, target_lang)
+            self._com_enhance(input_path, output_path, target_lang)
 
         print(f"[✅ 翻译完成] 输出文件: {output_path}")
         return output_path
 
-    def _com_enhance(self, input_path: str, output_path: str,
-                     source_lang: str, target_lang: str):
+    def _com_enhance(self, input_path: str, output_path: str, target_lang: str):
         """COM 增强处理：图表/文本框/SmartArt（仅 Word）"""
         print(f"[🔍 COM 增强] 检测图表/文本框/SmartArt...")
         extra_items = extract_extra_texts(input_path)
@@ -172,7 +169,6 @@ class TranslatorAgent:
             extra_texts = [item["text"] for item in extra_items]
             extra_translations = self.pipeline.translate_batch(
                 extra_texts,
-                source_lang=source_lang,
                 target_lang=target_lang,
             )
             for item, trans in zip(extra_items, extra_translations):

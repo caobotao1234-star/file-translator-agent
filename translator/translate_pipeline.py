@@ -132,7 +132,6 @@ class TranslatePipeline:
     def translate_batch(
         self,
         texts: List[str],
-        source_lang: str = "中文",
         target_lang: str = "英文",
     ) -> List[str]:
         """
@@ -140,7 +139,6 @@ class TranslatePipeline:
 
         参数：
             texts: 待翻译的文本列表
-            source_lang: 源语言
             target_lang: 目标语言
 
         返回：翻译后的文本列表（与输入一一对应）
@@ -150,7 +148,7 @@ class TranslatePipeline:
 
         # ---- 第一步：初翻 ----
         draft_prompt = (
-            f"请将以下{source_lang}段落翻译成{target_lang}。\n"
+            f"请将以下段落翻译成{target_lang}。\n"
             f"输入：{json.dumps(texts, ensure_ascii=False)}"
         )
 
@@ -179,7 +177,7 @@ class TranslatePipeline:
         # 新方案：只发初翻结果，审校 Agent 只需要润色译文即可
         # 如果有格式标记的段落，附带原文供对照（因为标记需要校验）
         review_prompt = (
-            f"审校以下{source_lang}→{target_lang}的初翻译文，输出修正后的JSON数组。\n"
+            f"审校以下→{target_lang}的初翻译文，输出修正后的JSON数组。\n"
             f"译文：{json.dumps(draft_results, ensure_ascii=False)}"
         )
 
@@ -199,7 +197,6 @@ class TranslatePipeline:
     def translate_document(
         self,
         parsed_data: Dict[str, Any],
-        source_lang: str = "中文",
         target_lang: str = "英文",
         on_progress=None,
     ) -> Dict[str, str]:
@@ -207,12 +204,11 @@ class TranslatePipeline:
         翻译整个文档（段落 + 表格单元格）。
 
         参数：
-            parsed_data: docx_parser.parse_docx() 的返回值
-            source_lang: 源语言
+            parsed_data: 解析器返回值
             target_lang: 目标语言
             on_progress: 进度回调 fn(completed, total)
 
-        返回：{key: 翻译后文本} 字典，key 如 "p_0", "t_0_1_2" 等
+        返回：{key: 翻译后文本} 字典
         """
         # 收集需要翻译的项目
         to_translate = []
@@ -236,7 +232,7 @@ class TranslatePipeline:
 
             logger.info(f"翻译进度: {completed}/{total}")
 
-            results = self.translate_batch(batch_texts, source_lang, target_lang)
+            results = self.translate_batch(batch_texts, target_lang)
 
             for key, translated in zip(batch_keys, results):
                 translations[key] = translated

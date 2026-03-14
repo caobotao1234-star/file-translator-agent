@@ -15,8 +15,12 @@ from translator.translator_agent import TranslatorAgent
 # =============================================================
 
 
-def print_help():
-    print("""
+SUPPORTED_LANGS = ["中文", "英文", "日文", "韩文", "法文", "德文", "西班牙文", "俄文"]
+
+
+def print_help(target_lang: str = None):
+    lang_display = target_lang or "未设置"
+    print(f"""
 ╔═══════════════════════════════════════════════════════╗
 ║              📖 翻译 Agent 使用指南                   ║
 ╠═══════════════════════════════════════════════════════╣
@@ -25,7 +29,11 @@ def print_help():
 ║    直接输入文件路径即可开始翻译                       ║
 ║    支持: .docx (Word)  .pptx (PowerPoint)            ║
 ║    例: test.docx / slides.pptx                        ║
-║    例: C:\\docs\\report.docx                           ║
+║                                                       ║
+║  语言设置：                                           ║
+║    /lang               查看/切换目标语言              ║
+║    /lang 英文          直接设置目标语言               ║
+║    当前目标语言: {lang_display:<36s}║
 ║                                                       ║
 ║  格式规则命令：                                       ║
 ║    /rules              查看当前格式映射规则           ║
@@ -41,25 +49,50 @@ def print_help():
 """)
 
 
+def _select_target_lang() -> str:
+    """交互式选择目标语言"""
+    print("\n[🌐 请选择目标语言]")
+    for i, lang in enumerate(SUPPORTED_LANGS, 1):
+        print(f"  {i}. {lang}")
+    print(f"  或直接输入其他语言名称")
+
+    while True:
+        choice = input("  请选择 (数字或语言名): ").strip()
+        if not choice:
+            continue
+        # 数字选择
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(SUPPORTED_LANGS):
+                return SUPPORTED_LANGS[idx]
+            print("  [⚠️] 序号超出范围，请重新选择")
+            continue
+        # 直接输入语言名
+        return choice
+
+
 def main():
     print("--- 🚀 正在初始化翻译 Agent ---")
 
     agent = TranslatorAgent(
-        # draft_model_id 默认用 .env 里的模型
-        # review_model_id 不指定时，审校也用同一个模型
         batch_size=20,
         debug=True,
     )
 
     print("--- ✅ 翻译 Agent 启动完毕 ---")
 
-    # 显示 COM 增强模式状态
     if agent.com_enabled:
         print("--- 🖥️ COM 增强模式: ✅ 已开启（支持图表/文本框/SmartArt 翻译）---")
     else:
         print("--- 🖥️ COM 增强模式: ❌ 未开启（仅翻译段落和表格文字）---")
         print("---    提示: 安装 Microsoft Office 并安装 pywin32 可开启增强模式 ---")
-    print_help()
+
+    # 📘 教学笔记：目标语言由用户决定
+    # 源语言不需要用户选——LLM 自己能识别原文是什么语言。
+    # 但目标语言必须用户指定，因为中英混合文档无法自动判断"翻成什么"。
+    target_lang = None
+
+    print_help(target_lang)
 
     while True:
         user_input = input("\n[🧑 用户]: ").strip()
@@ -71,11 +104,24 @@ def main():
             break
 
         if user_input == "/help":
-            print_help()
+            print_help(target_lang)
             continue
 
         if user_input == "/rules":
             agent.show_format_rules()
+            continue
+
+        # /lang 或 /lang 英文
+        if user_input == "/lang" or user_input.startswith("/lang "):
+            arg = user_input[5:].strip() if len(user_input) > 5 else ""
+            if arg:
+                target_lang = arg
+                print(f"[🌐 目标语言] 已设置为: {target_lang}")
+            else:
+                if target_lang:
+                    print(f"[🌐 目标语言] 当前: {target_lang}")
+                target_lang = _select_target_lang()
+                print(f"[🌐 目标语言] 已设置为: {target_lang}")
             continue
 
         # /font 宋体 Arial
@@ -89,9 +135,6 @@ def main():
 
         # /style Heading 1 Times New Roman
         if user_input.startswith("/style "):
-            # 样式名可能包含空格，用最后一个词作为字体名不太靠谱
-            # 简单处理：用 | 分隔，或者让用户用引号
-            # 这里先用简单逻辑：前面是样式名，最后两个词是字体名
             parts = user_input[7:].strip().rsplit(maxsplit=1)
             if len(parts) == 2:
                 agent.update_style_rule(parts[0].strip(), font_name=parts[1].strip())
@@ -106,8 +149,14 @@ def main():
         # ---- 文件翻译 ----
         filepath = user_input.strip('"').strip("'")
         if filepath.endswith((".docx", ".pptx")):
+            # 首次翻译时必须先选目标语言
+            if target_lang is None:
+                print("[🌐 提示] 首次翻译，请先选择目标语言")
+                target_lang = _select_target_lang()
+                print(f"[🌐 目标语言] 已设置为: {target_lang}")
+
             try:
-                agent.translate_file(filepath)
+                agent.translate_file(filepath, target_lang=target_lang)
             except FileNotFoundError as e:
                 print(f"[❌ 错误] {e}")
             except Exception as e:
