@@ -13,14 +13,20 @@ from datetime import datetime
 #   - print() 没有时间戳、模块名等上下文信息
 #   - 多 Agent 并发时，print() 输出会混在一起，分不清谁打的
 #
-# Python 标准库的 logging 模块就够用了：
-#   - 支持日志级别过滤
-#   - 支持同时输出到终端和文件
-#   - 支持格式化（时间戳、模块名、级别）
-#   - 每个 Agent 可以有自己的 logger 实例（通过 name 区分）
+# 日志级别控制：
+#   通过 .env 中的 LOG_LEVEL 环境变量控制终端输出级别：
+#     LOG_LEVEL=DEBUG   → 终端显示所有日志（含 LLM 输入输出摘要）
+#     LOG_LEVEL=INFO    → 终端只显示关键流程信息（默认）
+#     LOG_LEVEL=WARNING → 终端只显示警告和错误
+#   文件日志始终记录 DEBUG 级别，方便事后排查。
 # =============================================================
 
 LOG_DIR = "logs"
+
+# 📘 教学笔记：从环境变量读取日志级别
+# 这样不需要改代码，只改 .env 就能切换调试模式。
+# 生产环境用 INFO，排查问题时临时改成 DEBUG。
+_CONSOLE_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 
 def get_logger(
@@ -31,39 +37,28 @@ def get_logger(
     """
     获取一个配置好的 logger 实例。
 
-    参数：
-        name: logger 名称，建议用 Agent 名字
-              （如 "orchestrator", "translator"）
-        level: 日志级别，DEBUG/INFO/WARNING/ERROR
-        log_to_file: 是否同时写入日志文件
-
-    用法：
-        logger = get_logger("translator")
-        logger.info("开始翻译任务")
-        logger.debug(f"LLM 返回: {response}")
-        logger.error(f"翻译失败: {e}")
+    终端日志级别由环境变量 LOG_LEVEL 控制（默认 INFO）。
+    文件日志始终记录 DEBUG 级别。
     """
     logger = logging.getLogger(name)
 
-    # 避免重复添加 handler（多次调用 get_logger 时）
     if logger.handlers:
         return logger
 
     logger.setLevel(getattr(logging, level.upper(), logging.DEBUG))
 
-    # 日志格式：时间 | 级别 | 模块名 | 消息
     formatter = logging.Formatter(
         fmt="%(asctime)s | %(levelname)-7s | %(name)-15s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # 终端输出（只显示 INFO 及以上，避免 DEBUG 刷屏）
+    # 终端输出（级别由 LOG_LEVEL 环境变量控制）
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(getattr(logging, _CONSOLE_LEVEL, logging.INFO))
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # 文件输出（记录所有级别，方便排查问题）
+    # 文件输出（始终 DEBUG）
     if log_to_file:
         os.makedirs(LOG_DIR, exist_ok=True)
         today = datetime.now().strftime("%Y-%m-%d")

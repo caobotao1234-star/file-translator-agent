@@ -168,7 +168,8 @@ class TranslatePipeline:
         )
 
         print(f"  [📝 初翻中] {len(texts)} 个段落...", flush=True)
-        logger.debug(f"初翻请求: {len(texts)} 段")
+        logger.debug(f"初翻请求: {len(texts)} 段, 目标语言={target_lang}({lang_english})")
+        logger.debug(f"初翻输入摘要: {[t[:30] for t in texts[:3]]}{'...' if len(texts) > 3 else ''}")
         draft_response = self.draft_agent.run(draft_prompt)
         draft_results = self._parse_json_response(draft_response)
 
@@ -180,6 +181,10 @@ class TranslatePipeline:
             # 兜底：如果解析失败，返回原文
             return texts if not draft_results else draft_results
 
+        # 📘 教学笔记：DEBUG 级别输出译文摘要
+        # 这条日志在排查"中译中"等问题时非常有用。
+        # LOG_LEVEL=DEBUG 时终端直接可见，不用翻日志文件。
+        logger.debug(f"初翻输出摘要: {[t[:30] for t in draft_results[:3]]}{'...' if len(draft_results) > 3 else ''}")
         print(f"  [✅ 初翻完成]", flush=True)
 
         # ---- 第二步：审校（如果有审校 Agent）----
@@ -208,6 +213,7 @@ class TranslatePipeline:
             print(f"  [⚠️ 审校失败] 使用初翻结果", flush=True)
             return draft_results
 
+        logger.debug(f"审校输出摘要: {[t[:30] for t in review_results[:3]]}{'...' if len(review_results) > 3 else ''}")
         print(f"  [✅ 审校完成]", flush=True)
         return review_results
 

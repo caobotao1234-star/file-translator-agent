@@ -45,6 +45,7 @@ def print_help(target_lang: str = None):
 ║                        设置样式字体                   ║
 ║                                                       ║
 ║  其他：                                               ║
+║    /debug              切换调试日志(DEBUG/INFO)       ║
 ║    /help               显示此帮助                     ║
 ║    exit                退出程序                       ║
 ║                                                       ║
@@ -110,6 +111,26 @@ def main():
 
         if user_input == "/rules":
             agent.show_format_rules()
+            continue
+
+        # /debug — 运行时切换日志级别
+        if user_input == "/debug":
+            import logging
+            root = logging.getLogger()
+            # 切换所有 logger 的终端 handler 级别
+            current = None
+            for handler in logging.getLogger("translate_pipeline").handlers:
+                if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                    current = handler.level
+                    break
+            new_level = logging.DEBUG if current != logging.DEBUG else logging.INFO
+            for name in logging.Logger.manager.loggerDict:
+                lgr = logging.getLogger(name)
+                for handler in lgr.handlers:
+                    if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                        handler.setLevel(new_level)
+            level_name = "DEBUG" if new_level == logging.DEBUG else "INFO"
+            print(f"[🔧 日志级别] 终端日志已切换为: {level_name}")
             continue
 
         # /lang 或 /lang 英文
