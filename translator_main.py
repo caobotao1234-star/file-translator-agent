@@ -45,7 +45,8 @@ def print_help(target_lang: str = None):
 ║                        设置样式字体                   ║
 ║                                                       ║
 ║  其他：                                               ║
-║    /debug              切换调试日志(DEBUG/INFO)       ║
+║    /debug              切换日志级别                   ║
+║                       (INFO→DEBUG→TRACE循环)         ║
 ║    /help               显示此帮助                     ║
 ║    exit                退出程序                       ║
 ║                                                       ║
@@ -113,23 +114,33 @@ def main():
             agent.show_format_rules()
             continue
 
-        # /debug — 运行时切换日志级别
+        # /debug — 运行时切换日志级别（INFO → DEBUG → TRACE → INFO 循环）
         if user_input == "/debug":
             import logging
-            root = logging.getLogger()
-            # 切换所有 logger 的终端 handler 级别
+            from core.logger import TRACE
+            # 读取当前终端 handler 级别
             current = None
             for handler in logging.getLogger("translate_pipeline").handlers:
                 if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
                     current = handler.level
                     break
-            new_level = logging.DEBUG if current != logging.DEBUG else logging.INFO
+            # 循环切换：INFO(20) → DEBUG(10) → TRACE(5) → INFO(20)
+            if current == logging.INFO:
+                new_level = logging.DEBUG
+            elif current == logging.DEBUG:
+                new_level = TRACE
+            else:
+                new_level = logging.INFO
+            # 应用到所有 logger 的终端 handler
             for name in logging.Logger.manager.loggerDict:
                 lgr = logging.getLogger(name)
                 for handler in lgr.handlers:
                     if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
                         handler.setLevel(new_level)
-            level_name = "DEBUG" if new_level == logging.DEBUG else "INFO"
+                # logger 自身的 level 也要够低，否则消息到不了 handler
+                if lgr.level > new_level:
+                    lgr.setLevel(new_level)
+            level_name = {logging.INFO: "INFO", logging.DEBUG: "DEBUG", TRACE: "TRACE"}.get(new_level, str(new_level))
             print(f"[🔧 日志级别] 终端日志已切换为: {level_name}")
             continue
 

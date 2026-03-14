@@ -2,6 +2,7 @@
 import time
 from volcenginesdkarkruntime import Ark
 from typing import List, Dict, Generator
+from core.logger import get_logger
 
 # =============================================================
 # 📘 教学笔记：重试机制（Retry with Exponential Backoff）
@@ -46,6 +47,7 @@ class ArkLLMEngine:
         self.model_id = model_id
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay
+        self.logger = get_logger("llm_engine")
 
     def _is_retryable(self, error: Exception) -> bool:
         """
@@ -123,6 +125,17 @@ class ArkLLMEngine:
 
     def _do_stream_chat(self, messages: List[Dict], tools: List[Dict] = None) -> Generator[Dict, None, None]:
         """实际执行一次流式 API 调用（不含重试逻辑）"""
+        # 📘 教学笔记：TRACE 级别 — 完整 LLM 请求
+        # 这里输出发给模型的完整 messages，包括 system prompt 和用户输入。
+        # 排查"模型不听话"问题时，第一步就是看它到底收到了什么。
+        import json as _json
+        self.logger.trace(
+            f"LLM 请求 [model={self.model_id}]\n"
+            f"messages={_json.dumps(messages, ensure_ascii=False, indent=2)}"
+        )
+        if tools:
+            self.logger.trace(f"tools={_json.dumps(tools, ensure_ascii=False, indent=2)}")
+
         stream = self.client.chat.completions.create(
             model=self.model_id,
             messages=messages,
@@ -132,6 +145,7 @@ class ArkLLMEngine:
         )
 
         tool_calls_dict = {}
+        full_text = ""  # 收集完整响应文本，用于 TRACE 输出
 
         for chunk in stream:
             if chunk.usage:
@@ -149,6 +163,7 @@ class ArkLLMEngine:
 
             # 1. 正常文本输出
             if delta.content:
+                full_text += delta.content
                 yield {"type": "text", "content": delta.content}
 
             # 2. 工具调用输出
@@ -163,6 +178,14 @@ class ArkLLMEngine:
                         tool_calls_dict[idx]["name"] += tc.function.name
                     if tc.function.arguments:
                         tool_calls_dict[idx]["arguments"] += tc.function.arguments
+
+        # 📘 教学笔记：TRACE 级别 — 完整 LLM 响应
+        # 输出模型返回的完整文本，一字不漏。
+        # 排查翻译质量问题时，看这个就知道模型到底输出了什么。
+        if full_text:
+            self.logger.trace(f"LLM 响应 [text]\n{full_text}")
+        if tool_calls_dict:
+            self.logger.trace(f"LLM 响应 [tool_calls]\n{_json.dumps(dict(tool_calls_dict), ensure_ascii=False, indent=2)}")
 
         # 3. 流结束后，抛出收集到的工具调用
         for idx, tc_data in tool_calls_dict.items():
