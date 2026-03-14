@@ -7,6 +7,8 @@ from core.llm_router import LLMRouter
 from core.logger import get_logger
 from translator.docx_parser import parse_docx
 from translator.docx_writer import write_docx
+from translator.pptx_parser import parse_pptx
+from translator.pptx_writer import write_pptx
 from translator.format_engine import FormatEngine
 from translator.translate_pipeline import TranslatePipeline
 from translator.com_engine import is_com_available, extract_extra_texts, write_extra_texts
@@ -85,10 +87,14 @@ class TranslatorAgent:
         target_lang: str = "英文",
     ) -> str:
         """
-        翻译一个 Word 文档。
+        翻译文档（支持 .docx 和 .pptx）。
+
+        📘 教学笔记：统一入口，按扩展名分发
+        用户不需要关心底层用的是 python-docx 还是 python-pptx，
+        只需要丢一个文件路径进来，Agent 自动识别并处理。
 
         参数：
-            input_path: 输入文件路径
+            input_path: 输入文件路径（.docx 或 .pptx）
             output_path: 输出文件路径（默认自动生成）
             source_lang: 源语言
             target_lang: 目标语言
@@ -98,26 +104,36 @@ class TranslatorAgent:
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"文件不存在: {input_path}")
 
-        # 自动生成输出路径
+        ext = os.path.splitext(input_path)[1].lower()
+        if ext not in (".docx", ".pptx"):
+            raise ValueError(f"不支持的文件格式: {ext}，仅支持 .docx 和 .pptx")
+
+        # 自动生成输出路径（保持原扩展名）
         if output_path is None:
             basename = os.path.splitext(os.path.basename(input_path))[0]
-            output_path = os.path.join(OUTPUT_DIR, f"{basename}_translated.docx")
+            output_path = os.path.join(OUTPUT_DIR, f"{basename}_translated{ext}")
 
         logger.info(f"开始翻译: {input_path} -> {output_path}")
 
-        # 1. 解析文档
+        # 1. 解析文档（按格式分发）
         print(f"[📄 解析文档] {input_path}")
-        parsed_data = parse_docx(input_path)
-        para_count = sum(1 for i in parsed_data["items"]
-                         if i["type"] == "paragraph" and not i.get("is_empty"))
+        if ext == ".docx":
+            parsed_data = parse_docx(input_path)
+            para_count = sum(1 for i in parsed_data["items"]
+                             if i["type"] == "paragraph" and not i.get("is_empty"))
+        else:
+            parsed_data = parse_pptx(input_path)
+            para_count = sum(1 for i in parsed_data["items"]
+                             if i["type"] == "slide_text")
+
         cell_count = sum(1 for i in parsed_data["items"]
                          if i["type"] == "table_cell")
         total_count = para_count + cell_count
-        print(f"[📄 解析完成] {para_count} 个段落 + {cell_count} 个表格单元格 = {total_count} 个翻译单元")
+        print(f"[📄 解析完成] {para_count} 个文本段落 + {cell_count} 个表格单元格 = {total_count} 个翻译单元")
 
-        # 2. 翻译
+        # 2. 翻译（流水线通用，不区分文件格式）
         def on_progress(completed, total):
-            print(f"[🔄 翻译进度] {completed}/{total} 段落", flush=True)
+            print(f"[🔄 翻译进度] {completed}/{total}", flush=True)
 
         translations = self.pipeline.translate_document(
             parsed_data,
@@ -126,41 +142,47 @@ class TranslatorAgent:
             on_progress=on_progress,
         )
 
-        # 3. 生成文档
+        # 3. 生成文档（按格式分发）
         print(f"[📝 生成文档] 应用格式规则并写入...")
-        write_docx(parsed_data, translations, output_path, self.format_engine,
-                   source_path=input_path)
+        if ext == ".docx":
+            write_docx(parsed_data, translations, output_path, self.format_engine,
+                       source_path=input_path)
+        else:
+            write_pptx(parsed_data, translations, output_path, self.format_engine,
+                       source_path=input_path)
 
-        # 4. COM 增强：处理图表/文本框/SmartArt
-        # 📘 教学笔记：COM 处理必须在 python-docx 写完之后
-        # 因为 COM 直接操作输出文件，而 python-docx 会覆盖写入。
-        # 顺序：python-docx 生成 → COM 打开输出文件 → 替换额外文本 → 保存
-        if self.com_enabled:
-            print(f"[🔍 COM 增强] 检测图表/文本框/SmartArt...")
-            extra_items = extract_extra_texts(input_path)
-            if extra_items:
-                print(f"[🔍 COM 增强] 发现 {len(extra_items)} 个额外元素，翻译中...")
-                # 提取文本，送入翻译流水线
-                extra_texts = [item["text"] for item in extra_items]
-                extra_translations = self.pipeline.translate_batch(
-                    extra_texts,
-                    source_lang=source_lang,
-                    target_lang=target_lang,
-                )
-                # 把译文写回 item
-                for item, trans in zip(extra_items, extra_translations):
-                    item["translated"] = trans
-
-                # 写回输出文档
-                print(f"[📝 COM 写回] 将译文写入图表/文本框...")
-                written = write_extra_texts(output_path, extra_items)
-                print(f"[✅ COM 完成] 成功写回 {written} 个元素")
-            else:
-                print(f"[ℹ️ COM 增强] 未发现需要额外处理的元素")
+        # 4. COM 增强：处理图表/文本框/SmartArt（仅 Word）
+        # 📘 教学笔记：PPT 的文本框/SmartArt 已经被 python-pptx 处理了
+        # python-pptx 能遍历所有 Shape（包括文本框、SmartArt），
+        # 不像 python-docx 那样有盲区。所以 PPT 不需要 COM 增强。
+        # COM 增强只用于 Word 的图表标题/坐标轴等 python-docx 搞不定的元素。
+        if ext == ".docx" and self.com_enabled:
+            self._com_enhance(input_path, output_path, source_lang, target_lang)
 
         print(f"[✅ 翻译完成] 输出文件: {output_path}")
-
         return output_path
+
+    def _com_enhance(self, input_path: str, output_path: str,
+                     source_lang: str, target_lang: str):
+        """COM 增强处理：图表/文本框/SmartArt（仅 Word）"""
+        print(f"[🔍 COM 增强] 检测图表/文本框/SmartArt...")
+        extra_items = extract_extra_texts(input_path)
+        if extra_items:
+            print(f"[🔍 COM 增强] 发现 {len(extra_items)} 个额外元素，翻译中...")
+            extra_texts = [item["text"] for item in extra_items]
+            extra_translations = self.pipeline.translate_batch(
+                extra_texts,
+                source_lang=source_lang,
+                target_lang=target_lang,
+            )
+            for item, trans in zip(extra_items, extra_translations):
+                item["translated"] = trans
+
+            print(f"[📝 COM 写回] 将译文写入图表/文本框...")
+            written = write_extra_texts(output_path, extra_items)
+            print(f"[✅ COM 完成] 成功写回 {written} 个元素")
+        else:
+            print(f"[ℹ️ COM 增强] 未发现需要额外处理的元素")
 
     def update_font_rule(self, source_font: str, target_font: str):
         """更新字体映射规则"""

@@ -2,4 +2,5 @@ volcengine
 python-dotenv
 duckduckgo-search
 python-docx
+python-pptx
 pywin32; sys_platform == "win32"

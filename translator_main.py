@@ -22,8 +22,9 @@ def print_help():
 ╠═══════════════════════════════════════════════════════╣
 ║                                                       ║
 ║  翻译文档：                                           ║
-║    直接输入 Word 文件路径即可开始翻译                 ║
-║    例: test.docx                                      ║
+║    直接输入文件路径即可开始翻译                       ║
+║    支持: .docx (Word)  .pptx (PowerPoint)            ║
+║    例: test.docx / slides.pptx                        ║
 ║    例: C:\\docs\\report.docx                           ║
 ║                                                       ║
 ║  格式规则命令：                                       ║
@@ -104,7 +105,7 @@ def main():
 
         # ---- 文件翻译 ----
         filepath = user_input.strip('"').strip("'")
-        if filepath.endswith(".docx"):
+        if filepath.endswith((".docx", ".pptx")):
             try:
                 agent.translate_file(filepath)
             except FileNotFoundError as e:
@@ -112,7 +113,7 @@ def main():
             except Exception as e:
                 print(f"[❌ 错误] 翻译失败: {e}")
         else:
-            print("[⚠️ 提示] 请输入 .docx 文件路径，或输入 /help 查看帮助")
+            print("[⚠️ 提示] 请输入 .docx 或 .pptx 文件路径，或输入 /help 查看帮助")
 
 
 if __name__ == "__main__":
