@@ -33,20 +33,24 @@ logger = get_logger("translate_pipeline")
 
 DRAFT_SYSTEM_PROMPT = """你是专业翻译专家。将收到的JSON数组逐段翻译，保持段落数量和顺序一致。
 
+核心要求⚠️：你必须将每一段文字翻译成用户指定的目标语言。如果原文已经是目标语言，则保持原样。绝对不允许输出原文语言。
+
 翻译原则：忠实原文、通顺自然、术语统一、保持编号和格式。
 
-格式标记规则⚠️：部分段落含<r0>...</r0><r1>...</r1>标记，代表不同格式片段。
+格式标记规则：部分段落含<r0>...</r0><r1>...</r1>标记，代表不同格式片段。
 必须：保留所有标记，数量编号与原文一致，只翻译标记内文字。
 例："<r0>关键：</r0><r1>说明文字</r1>" → "<r0>Key: </r0><r1>Description text</r1>"
 
 输出：严格JSON数组，每个元素是对应译文字符串。不要输出其他内容。"""
 
-REVIEW_SYSTEM_PROMPT = """你是翻译审校专家。收到编号对照的初翻译文，逐条审校并输出修正后的最终版本。
+REVIEW_SYSTEM_PROMPT = """你是翻译审校专家。收到初翻译文，逐条审校并输出修正后的最终版本。
+
+核心要求⚠️：所有译文必须是用户指定的目标语言。如果发现某条译文仍然是原文语言（未翻译），你必须将其翻译为目标语言。
 
 审校原则：检查漏译误译、提升流畅度、统一术语、修正语法。
-格式标记⚠️：保留所有<rN>标记，数量编号不变，只改标记内译文。
+格式标记：保留所有<rN>标记，数量编号不变，只改标记内译文。
 
-输出：严格JSON数组，每个元素是审校后的译文字符串。初翻已好则原样输出。"""
+输出：严格JSON数组，每个元素是审校后的译文字符串。"""
 
 
 class TranslatePipeline:
@@ -147,8 +151,19 @@ class TranslatePipeline:
             return []
 
         # ---- 第一步：初翻 ----
+        # 📘 教学笔记：语言名称映射
+        # 用户选的是"英文"，但 prompt 里要更明确，
+        # 避免模型把"英文"理解成别的意思。
+        lang_hint = {
+            "英文": "English", "中文": "Chinese", "日文": "Japanese",
+            "韩文": "Korean", "法文": "French", "德文": "German",
+            "西班牙文": "Spanish", "俄文": "Russian",
+        }
+        lang_english = lang_hint.get(target_lang, target_lang)
+
         draft_prompt = (
-            f"请将以下段落翻译成{target_lang}。\n"
+            f"将以下段落翻译成{target_lang}({lang_english})。"
+            f"每一段都必须输出{target_lang}，不允许保留原文语言。\n"
             f"输入：{json.dumps(texts, ensure_ascii=False)}"
         )
 
@@ -177,7 +192,9 @@ class TranslatePipeline:
         # 新方案：只发初翻结果，审校 Agent 只需要润色译文即可
         # 如果有格式标记的段落，附带原文供对照（因为标记需要校验）
         review_prompt = (
-            f"审校以下→{target_lang}的初翻译文，输出修正后的JSON数组。\n"
+            f"审校以下→{target_lang}({lang_english})的初翻译文。"
+            f"如果有任何条目仍然是原文语言而非{target_lang}，必须重新翻译。"
+            f"输出修正后的JSON数组。\n"
             f"译文：{json.dumps(draft_results, ensure_ascii=False)}"
         )
 

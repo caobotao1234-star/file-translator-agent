@@ -15,7 +15,10 @@ from translator.translator_agent import TranslatorAgent
 # =============================================================
 
 
-SUPPORTED_LANGS = ["中文", "英文", "日文", "韩文", "法文", "德文", "西班牙文", "俄文"]
+SUPPORTED_LANGS = [
+    ("中文", "Chinese"), ("英文", "English"), ("日文", "Japanese"), ("韩文", "Korean"),
+    ("法文", "French"), ("德文", "German"), ("西班牙文", "Spanish"), ("俄文", "Russian"),
+]
 
 
 def print_help(target_lang: str = None):
@@ -52,22 +55,20 @@ def print_help(target_lang: str = None):
 def _select_target_lang() -> str:
     """交互式选择目标语言"""
     print("\n[🌐 请选择目标语言]")
-    for i, lang in enumerate(SUPPORTED_LANGS, 1):
-        print(f"  {i}. {lang}")
+    for i, (cn, en) in enumerate(SUPPORTED_LANGS, 1):
+        print(f"  {i}. {cn} ({en})")
     print(f"  或直接输入其他语言名称")
 
     while True:
         choice = input("  请选择 (数字或语言名): ").strip()
         if not choice:
             continue
-        # 数字选择
         if choice.isdigit():
             idx = int(choice) - 1
             if 0 <= idx < len(SUPPORTED_LANGS):
-                return SUPPORTED_LANGS[idx]
+                return SUPPORTED_LANGS[idx][0]
             print("  [⚠️] 序号超出范围，请重新选择")
             continue
-        # 直接输入语言名
         return choice
 
 

@@ -3,8 +3,7 @@ import re
 from pptx import Presentation
 from pptx.util import Pt
 from pptx.enum.shapes import MSO_SHAPE_TYPE
-from pptx.enum.text import MSO_AUTO_SIZE
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional
 from translator.format_engine import FormatEngine
 from core.logger import get_logger
 
@@ -48,8 +47,49 @@ def _remap_run_font(run, format_engine: FormatEngine):
             run.font.name = new_font
 
 
+def _shrink_runs_if_needed(paragraph, original_text: str, translated_text: str):
+    """
+    📘 教学笔记：按长度比例缩小字号
+    auto_size 依赖 PowerPoint 打开时才计算，不可靠。
+    我们直接在写入时计算：如果译文比原文长，就按比例缩小所有 Run 的字号。
+
+    中文字符按 2 个宽度单位计算（一个汉字约等于两个英文字母宽度），
+    这样中→英翻译时的比例更准确。
+
+    设置最小字号下限（6pt），避免缩得太小看不清。
+    """
+    def _visual_len(text: str) -> float:
+        """估算文本的视觉宽度（中文字符算2，其他算1）"""
+        width = 0
+        for ch in text:
+            if '\u4e00' <= ch <= '\u9fff' or '\u3000' <= ch <= '\u303f' or '\uff00' <= ch <= '\uffef':
+                width += 2
+            else:
+                width += 1
+        return width
+
+    # 清理标记后计算
+    clean_original = RUN_TAG_PATTERN.sub(r'\2', original_text)
+    clean_translated = RUN_TAG_PATTERN.sub(r'\2', translated_text)
+
+    orig_len = _visual_len(clean_original)
+    trans_len = _visual_len(clean_translated)
+
+    if orig_len == 0 or trans_len <= orig_len:
+        return  # 没变长，不需要缩
+
+    ratio = orig_len / trans_len  # < 1.0，表示需要缩小
+
+    MIN_FONT_SIZE = Pt(6)
+
+    for run in paragraph.runs:
+        if run.font.size and run.font.size > MIN_FONT_SIZE:
+            new_size = int(run.font.size * ratio)
+            run.font.size = max(new_size, MIN_FONT_SIZE)
+
+
 def _replace_paragraph_text(paragraph, translated_text: str, is_tagged: bool,
-                            format_engine: FormatEngine):
+                            format_engine: FormatEngine, original_text: str = ""):
     """
     替换一个段落的文本（通用逻辑）。
     和 docx_writer 的逻辑基本一致。
@@ -85,6 +125,8 @@ def _replace_paragraph_text(paragraph, translated_text: str, is_tagged: bool,
                 for ri, run in enumerate(original_runs):
                     if run.text and ri not in tagged_indices:
                         run.text = ""
+                # 标记替换成功后，也要缩小字号
+                _shrink_runs_if_needed(paragraph, original_text, translated_text)
                 return
 
         logger.warning("标记解析失败，降级为整段替换")
@@ -95,6 +137,9 @@ def _replace_paragraph_text(paragraph, translated_text: str, is_tagged: bool,
     _remap_run_font(original_runs[0], format_engine)
     for run in original_runs[1:]:
         run.text = ""
+
+    # 替换完成后，按长度比例缩小字号
+    _shrink_runs_if_needed(paragraph, original_text, translated_text)
 
 
 def _resolve_paragraph_and_shape(shapes, key: str):
@@ -190,8 +235,6 @@ def write_pptx(
     prs = Presentation(source_path)
 
     replaced_count = 0
-    # 📘 收集被修改过的非表格形状，后续统一设置 auto_size
-    modified_shapes: Set[int] = set()  # 用 shape 的 id() 去重
 
     for item in parsed_data["items"]:
         key = item["key"]
@@ -211,20 +254,11 @@ def write_pptx(
 
         translated_text = translations[key]
         is_tagged = item.get("tagged_text", False)
+        original_text = item.get("full_text", "")
 
-        _replace_paragraph_text(paragraph, translated_text, is_tagged, format_engine)
+        _replace_paragraph_text(paragraph, translated_text, is_tagged,
+                                format_engine, original_text)
         replaced_count += 1
 
-        # 记录被修改的非表格形状（表格单元格不需要 auto_size）
-        if item["type"] != "table_cell" and shape.has_text_frame:
-            modified_shapes.add(id(shape))
-            # 直接在这里设置，id() 去重保证每个 shape 只设一次也无所谓
-            # 但为了清晰，我们在循环里就设
-            try:
-                shape.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-            except Exception as e:
-                logger.debug(f"设置 auto_size 失败 key={key}: {e}")
-
     prs.save(output_path)
-    logger.info(f"PPT 生成完成: {output_path}（替换了 {replaced_count} 个翻译单元，"
-                f"{len(modified_shapes)} 个形状启用自动缩放）")
+    logger.info(f"PPT 生成完成: {output_path}（替换了 {replaced_count} 个翻译单元）")
