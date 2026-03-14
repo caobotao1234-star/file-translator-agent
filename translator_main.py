@@ -47,7 +47,7 @@ def main():
     agent = TranslatorAgent(
         # draft_model_id 默认用 .env 里的模型
         # review_model_id 不指定时，审校也用同一个模型
-        batch_size=10,
+        batch_size=20,
         debug=True,
     )
 
