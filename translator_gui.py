@@ -22,10 +22,14 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QTextEdit, QProgressBar,
     QFileDialog, QGroupBox, QSpinBox, QSplitter, QListWidget,
-    QListWidgetItem, QAbstractItemView, QStatusBar,
+    QListWidgetItem, QAbstractItemView, QStatusBar, QTabWidget,
+    QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit,
+    QDialog, QDialogButtonBox, QFormLayout, QCheckBox,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMimeData
 from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent, QColor, QIcon
+
+from translator.format_engine import FormatEngine
 
 from config.settings import Config
 from translator.translator_agent import TranslatorAgent
@@ -223,6 +227,55 @@ QLabel#subtitleLabel {
     font-size: 11px;
     color: #6c7086;
 }
+QTabWidget::pane {
+    border: 1px solid #45475a;
+    border-radius: 6px;
+    background-color: #1e1e2e;
+}
+QTabBar::tab {
+    background-color: #313244;
+    color: #a6adc8;
+    border: 1px solid #45475a;
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    padding: 6px 16px;
+    margin-right: 2px;
+}
+QTabBar::tab:selected {
+    background-color: #1e1e2e;
+    color: #89b4fa;
+    font-weight: bold;
+}
+QTableWidget {
+    background-color: #181825;
+    border: 1px solid #45475a;
+    border-radius: 6px;
+    gridline-color: #313244;
+}
+QTableWidget::item {
+    padding: 4px 8px;
+}
+QTableWidget::item:selected {
+    background-color: #313244;
+}
+QHeaderView::section {
+    background-color: #313244;
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    padding: 6px 8px;
+    font-weight: bold;
+}
+QLineEdit {
+    background-color: #313244;
+    border: 1px solid #45475a;
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: #cdd6f4;
+}
+QDialog {
+    background-color: #1e1e2e;
+}
 """
 
 
@@ -268,6 +321,166 @@ class FileListWidget(QListWidget):
 
 
 # =============================================================
+# 格式映射面板（字体 + 样式映射表）
+# =============================================================
+class FormatMappingPanel(QWidget):
+    """
+    📘 教学笔记：格式映射 GUI
+    翻译不只是文字转换，字体也要跟着变。
+    比如中文用"宋体"，翻译成英文后应该用"Times New Roman"。
+    这个面板让用户可视化地编辑这些映射规则。
+    """
+
+    def __init__(self, format_engine: FormatEngine):
+        super().__init__()
+        self.engine = format_engine
+        self._build_ui()
+        self._refresh_tables()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        tabs = QTabWidget()
+        layout.addWidget(tabs)
+
+        # ---- Tab 1: 字体映射 ----
+        font_tab = QWidget()
+        ft_layout = QVBoxLayout(font_tab)
+
+        self.font_table = QTableWidget(0, 2)
+        self.font_table.setHorizontalHeaderLabels(["源字体", "目标字体"])
+        self.font_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.font_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.font_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        ft_layout.addWidget(self.font_table)
+
+        ft_btn_row = QHBoxLayout()
+        self.btn_font_add = QPushButton("+ 添加")
+        self.btn_font_del = QPushButton("- 删除")
+        self.btn_font_save = QPushButton("💾 保存")
+        ft_btn_row.addWidget(self.btn_font_add)
+        ft_btn_row.addWidget(self.btn_font_del)
+        ft_btn_row.addStretch()
+        ft_btn_row.addWidget(self.btn_font_save)
+        ft_layout.addLayout(ft_btn_row)
+
+        tabs.addTab(font_tab, "🔤 字体映射")
+
+        # ---- Tab 2: 样式映射 ----
+        style_tab = QWidget()
+        st_layout = QVBoxLayout(style_tab)
+
+        self.style_table = QTableWidget(0, 3)
+        self.style_table.setHorizontalHeaderLabels(["样式名", "目标字体", "加粗"])
+        self.style_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.style_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.style_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        st_layout.addWidget(self.style_table)
+
+        st_btn_row = QHBoxLayout()
+        self.btn_style_add = QPushButton("+ 添加")
+        self.btn_style_del = QPushButton("- 删除")
+        self.btn_style_save = QPushButton("💾 保存")
+        st_btn_row.addWidget(self.btn_style_add)
+        st_btn_row.addWidget(self.btn_style_del)
+        st_btn_row.addStretch()
+        st_btn_row.addWidget(self.btn_style_save)
+        st_layout.addLayout(st_btn_row)
+
+        tabs.addTab(style_tab, "📐 样式映射")
+
+        # 信号
+        self.btn_font_add.clicked.connect(self._on_font_add)
+        self.btn_font_del.clicked.connect(self._on_font_del)
+        self.btn_font_save.clicked.connect(self._on_font_save)
+        self.btn_style_add.clicked.connect(self._on_style_add)
+        self.btn_style_del.clicked.connect(self._on_style_del)
+        self.btn_style_save.clicked.connect(self._on_style_save)
+
+    def _refresh_tables(self):
+        """从 FormatEngine 刷新表格数据"""
+        # 字体映射
+        self.font_table.setRowCount(0)
+        for src, tgt in self.engine.font_map.items():
+            row = self.font_table.rowCount()
+            self.font_table.insertRow(row)
+            self.font_table.setItem(row, 0, QTableWidgetItem(src))
+            self.font_table.setItem(row, 1, QTableWidgetItem(tgt))
+
+        # 样式映射
+        self.style_table.setRowCount(0)
+        for style_name, rule in self.engine.style_map.items():
+            row = self.style_table.rowCount()
+            self.style_table.insertRow(row)
+            self.style_table.setItem(row, 0, QTableWidgetItem(style_name))
+            self.style_table.setItem(row, 1, QTableWidgetItem(rule.get("font_name", "")))
+            bold_item = QTableWidgetItem("✓" if rule.get("bold") else "")
+            bold_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.style_table.setItem(row, 2, bold_item)
+
+    def _on_font_add(self):
+        row = self.font_table.rowCount()
+        self.font_table.insertRow(row)
+        self.font_table.setItem(row, 0, QTableWidgetItem(""))
+        self.font_table.setItem(row, 1, QTableWidgetItem(""))
+        self.font_table.editItem(self.font_table.item(row, 0))
+
+    def _on_font_del(self):
+        row = self.font_table.currentRow()
+        if row >= 0:
+            self.font_table.removeRow(row)
+
+    def _on_font_save(self):
+        """从表格读取数据，写回 FormatEngine 并持久化"""
+        new_map = {}
+        for row in range(self.font_table.rowCount()):
+            src = (self.font_table.item(row, 0).text() or "").strip()
+            tgt = (self.font_table.item(row, 1).text() or "").strip()
+            if src and tgt:
+                new_map[src] = tgt
+        self.engine.font_map = new_map
+        self.engine._save_user_rules()
+        self._refresh_tables()
+
+    def _on_style_add(self):
+        row = self.style_table.rowCount()
+        self.style_table.insertRow(row)
+        self.style_table.setItem(row, 0, QTableWidgetItem(""))
+        self.style_table.setItem(row, 1, QTableWidgetItem(""))
+        self.style_table.setItem(row, 2, QTableWidgetItem(""))
+        self.style_table.editItem(self.style_table.item(row, 0))
+
+    def _on_style_del(self):
+        row = self.style_table.currentRow()
+        if row >= 0:
+            self.style_table.removeRow(row)
+
+    def _on_style_save(self):
+        """从表格读取数据，写回 FormatEngine 并持久化"""
+        new_map = {}
+        for row in range(self.style_table.rowCount()):
+            name = (self.style_table.item(row, 0).text() or "").strip()
+            font = (self.style_table.item(row, 1).text() or "").strip()
+            bold_text = (self.style_table.item(row, 2).text() or "").strip()
+            if name:
+                rule = {}
+                if font:
+                    rule["font_name"] = font
+                if bold_text in ("✓", "1", "true", "True", "是", "yes"):
+                    rule["bold"] = True
+                if rule:
+                    new_map[name] = rule
+        self.engine.style_map = new_map
+        self.engine._save_user_rules()
+        self._refresh_tables()
+
+    def get_engine(self) -> FormatEngine:
+        return self.engine
+
+
+# =============================================================
 # 主窗口
 # =============================================================
 class MainWindow(QMainWindow):
@@ -279,10 +492,11 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.agent = None
         self.available_models = Config.get_available_models()
+        self.format_engine = FormatEngine()  # 共享格式引擎，GUI 编辑后传给 Agent
 
         self.setWindowTitle("📖 翻译 Agent")
-        self.setMinimumSize(960, 640)
-        self.resize(1100, 720)
+        self.setMinimumSize(1060, 700)
+        self.resize(1200, 780)
 
         self._log_signal.connect(self._append_log)
         self._build_ui()
@@ -388,6 +602,10 @@ class MainWindow(QMainWindow):
 
         left_layout.addWidget(settings_group)
 
+        # 格式映射面板
+        self.format_panel = FormatMappingPanel(self.format_engine)
+        left_layout.addWidget(self.format_panel, 1)
+
         # 操作按钮
         self.btn_start = QPushButton("▶  开始翻译")
         self.btn_start.setFixedHeight(44)
@@ -402,7 +620,6 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         left_layout.addWidget(self.btn_stop)
 
-        left_layout.addStretch()
         splitter.addWidget(left_panel)
 
         # == 右侧面板（日志 + 进度）==
@@ -433,7 +650,7 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.progress_bar)
 
         splitter.addWidget(right_panel)
-        splitter.setSizes([340, 660])
+        splitter.setSizes([400, 660])
 
         # 状态栏
         self.statusBar().showMessage("就绪")
@@ -542,7 +759,7 @@ class MainWindow(QMainWindow):
         self._append_log(f"文件数: {len(files)}", "info")
         self._append_log("─" * 50, "info")
 
-        # 创建 Agent
+        # 创建 Agent（使用 GUI 中编辑的格式引擎）
         try:
             self.agent = TranslatorAgent(
                 draft_model_id=draft_model,
@@ -550,6 +767,10 @@ class MainWindow(QMainWindow):
                 batch_size=batch_size,
                 debug=True,
             )
+            # 📘 教学笔记：共享格式引擎
+            # GUI 里编辑的字体/样式映射表存在 self.format_engine 里，
+            # 这里把它注入到 Agent，这样用户在 GUI 里改的规则立刻生效。
+            self.agent.format_engine = self.format_panel.get_engine()
         except Exception as e:
             self._append_log(f"Agent 初始化失败: {e}", "error")
             return
@@ -609,6 +830,7 @@ class MainWindow(QMainWindow):
         self.lang_combo.setEnabled(not running)
         self.batch_spin.setEnabled(not running)
         self.log_combo.setEnabled(not running)
+        self.format_panel.setEnabled(not running)
 
     def _apply_log_level(self, level_name: str):
         """运行时切换所有 logger 的终端 handler 级别"""
