@@ -564,8 +564,12 @@ class MainWindow(QMainWindow):
         draft_row = QHBoxLayout()
         draft_row.addWidget(QLabel("初翻模型"))
         self.draft_combo = QComboBox()
-        for name, mid in self.available_models.items():
-            self.draft_combo.addItem(f"{name}", mid)
+        default_idx = 0
+        for i, (name, mid) in enumerate(self.available_models.items()):
+            self.draft_combo.addItem(name, mid)
+            if mid == Config.DEFAULT_MODEL_ID:
+                default_idx = i
+        self.draft_combo.setCurrentIndex(default_idx)
         draft_row.addWidget(self.draft_combo, 1)
         sg_layout.addLayout(draft_row)
 
@@ -576,7 +580,7 @@ class MainWindow(QMainWindow):
         self.review_combo.addItem("与初翻相同", "__same__")
         self.review_combo.addItem("跳过审校", "__skip__")
         for name, mid in self.available_models.items():
-            self.review_combo.addItem(f"{name}", mid)
+            self.review_combo.addItem(name, mid)
         review_row.addWidget(self.review_combo, 1)
         sg_layout.addLayout(review_row)
 
