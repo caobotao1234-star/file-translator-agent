@@ -53,6 +53,8 @@ def is_com_available() -> bool:
         import win32com.client
         # 尝试创建 Word 应用对象（不实际启动窗口）
         word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = False
         word.Quit()
         _com_available = True
         logger.info("Office COM 环境检测通过，增强模式可用")

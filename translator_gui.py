@@ -775,22 +775,29 @@ class MainWindow(QMainWindow):
             self._append_log(f"Agent 初始化失败: {e}", "error")
             return
 
-        # 劫持 pipeline 的 on_progress 回调
+        # 📘 教学笔记：跨线程 GUI 更新必须用 Signal
+        # patched_translate_document 在工作线程里执行，
+        # 不能直接操作 progress_bar（Qt 会崩溃/闪退）。
+        # 正确做法：通过 worker.progress_signal 把数据传回主线程。
+
+        # 先创建 worker（后面 patch 要引用它的 signal）
+        self.worker = TranslateWorker(self.agent, files, target_lang)
+
         original_translate_document = self.agent.pipeline.translate_document
+        worker_ref = self.worker  # 闭包捕获，避免 self.worker 被替换
 
         def patched_translate_document(parsed_data, target_lang="英文", on_progress=None):
             def gui_progress(completed, total):
-                self.progress_bar.setMaximum(total)
-                self.progress_bar.setValue(completed)
+                worker_ref.progress_signal.emit(completed, total)
                 if on_progress:
                     on_progress(completed, total)
             return original_translate_document(parsed_data, target_lang, gui_progress)
 
         self.agent.pipeline.translate_document = patched_translate_document
 
-        # 启动工作线程
-        self.worker = TranslateWorker(self.agent, files, target_lang)
+        # 连接信号并启动
         self.worker.log_signal.connect(self._append_log)
+        self.worker.progress_signal.connect(self._on_progress)
         self.worker.finished_signal.connect(self._on_file_done)
         self.worker.error_signal.connect(self._on_file_error)
         self.worker.finished.connect(self._on_all_done)
@@ -812,6 +819,11 @@ class MainWindow(QMainWindow):
 
     def _on_file_error(self, error_msg: str):
         self._append_log(f"❌ 翻译失败: {error_msg}", "error")
+
+    def _on_progress(self, completed: int, total: int):
+        """在主线程中安全更新进度条"""
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(completed)
 
     def _on_all_done(self):
         self._set_running(False)
