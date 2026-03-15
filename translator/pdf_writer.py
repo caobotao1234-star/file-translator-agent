@@ -1,53 +1,56 @@
 # translator/pdf_writer.py
 import fitz  # PyMuPDF
-import re
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from translator.format_engine import FormatEngine
 from core.logger import get_logger
 
 # =============================================================
-# 📘 教学笔记：PDF 文档生成器（Redaction 策略）
+# 📘 教学笔记：PDF 文档生成器（v3 — insert_htmlbox 策略）
 # =============================================================
-# PDF 不像 Word/PPT 那样可以直接修改段落文本。
-# PDF 的文字是"画"上去的，修改需要：
-#   1. 用 Redaction（涂抹）擦掉原文区域
-#   2. 在同一位置重新写入译文
+# PDF 翻译的核心难题：中文紧凑，英文松散。
+# "公司简介" 只需 33pt 宽，"Company Profile" 需要 ~80pt。
 #
-# PyMuPDF 的 Redaction 流程：
-#   page.add_redact_annot(rect, ...) → 标记要擦除的区域
-#   page.apply_redactions()          → 执行擦除（不可逆）
-#   page.insert_textbox(rect, ...)   → 在擦除后的区域写入新文本
+# v1: 用原始 bbox 写入 → 英文放不下，大量空白
+# v2: 扩展写入 rect，但 redaction 仍用原始 bbox
+#     → 相邻块的 redaction 擦掉了扩展区域的文本
+# v3: 改用 insert_htmlbox + scale_low=0
+#     → PyMuPDF 自动缩放文本以适应区域，不会出现"放不下就不显示"
+#     → redaction 和写入都用扩展 rect，避免互相擦除
 #
-# 难点：
-#   - 字体嵌入：PDF 可能用了特殊字体，PyMuPDF 写入时不一定有
-#   - 文本溢出：译文比原文长时需要缩小字号
-#   - 多行文本：需要保持行间距和对齐方式
-#   - 颜色还原：需要把整数颜色转回 RGB 元组
+# insert_htmlbox vs insert_textbox:
+#   - insert_textbox: 放不下就不写（rc < 0），开发者自己处理
+#   - insert_htmlbox: scale_low=0 时自动缩小文本直到放得下
+#     返回 (spare_height, scale)，spare_height=-1 才是真的失败
+#   - insert_htmlbox 还支持 HTML 样式（粗体、颜色等）
 # =============================================================
 
 logger = get_logger("pdf_writer")
 
-# PyMuPDF 内置的通用字体映射
-# PDF 原始字体名 → PyMuPDF 可用的基础字体
-# 📘 教学笔记：PDF 字体困境
-# PDF 文件可能嵌入了任意字体（如"思源黑体""微软雅黑"），
-# 但 PyMuPDF 写入时只能用它内置的基础字体或系统已安装的字体。
-# 对于中文，我们用 "china-s"（简体中文）系列字体。
 FALLBACK_FONT_MAP = {
-    # 中文字体 → PyMuPDF 中文字体标识
-    "SimSun": "china-ss",       # 宋体
-    "SimHei": "china-ss",       # 黑体
+    "SimSun": "china-ss",
+    "SimHei": "china-ss",
     "Microsoft YaHei": "china-ss",
     "KaiTi": "china-ss",
     "FangSong": "china-ss",
-    "DengXian": "china-ss",     # 等线
-    # 英文字体 → PyMuPDF 基础字体
+    "DengXian": "china-ss",
     "Times New Roman": "tiro",
     "Arial": "helv",
     "Calibri": "helv",
     "Helvetica": "helv",
     "Courier": "cour",
     "Courier New": "cour",
+}
+
+
+# 📘 教学笔记：HTML 字体族映射
+# insert_htmlbox 用 CSS font-family，不是 PyMuPDF 内部字体名。
+# CJK 字体需要用 "china-ss" 等 PyMuPDF 内置名，
+# 但 HTML 模式下用 CSS 通用族名更可靠。
+HTML_FONT_FAMILY_MAP = {
+    "china-ss": "sans-serif",
+    "tiro": "serif",
+    "helv": "sans-serif",
+    "cour": "monospace",
 }
 
 
@@ -63,29 +66,15 @@ def _color_hex_to_tuple(hex_color: str) -> tuple:
 
 
 def _resolve_font(font_name: str, has_cjk: bool) -> str:
-    """
-    将 PDF 原始字体名映射为 PyMuPDF 可用的字体。
-
-    📘 教学笔记：字体回退策略
-    1. 先查 FALLBACK_FONT_MAP 精确匹配
-    2. 如果原始字体名包含中文关键词，用中文字体
-    3. 如果文本包含 CJK 字符，用中文字体
-    4. 兜底用 helv（Helvetica）
-    """
-    # 精确匹配
+    """将 PDF 原始字体名映射为 PyMuPDF 可用的字体。"""
     if font_name in FALLBACK_FONT_MAP:
         return FALLBACK_FONT_MAP[font_name]
-
-    # 模糊匹配：字体名中包含关键词
     name_lower = font_name.lower()
     for key, val in FALLBACK_FONT_MAP.items():
         if key.lower() in name_lower:
             return val
-
-    # CJK 内容用中文字体
     if has_cjk:
         return "china-ss"
-
     return "helv"
 
 
@@ -97,27 +86,93 @@ def _has_cjk(text: str) -> bool:
     return False
 
 
-def _calc_fit_fontsize(text: str, rect: fitz.Rect, fontname: str,
-                       base_size: float, min_size: float = 5.0) -> float:
+def _estimate_text_width(text: str, fontsize: float, fontname: str) -> float:
+    """估算文本渲染宽度，取最长行。"""
+    max_width = 0
+    for line in text.split("\n"):
+        if not line.strip():
+            continue
+        try:
+            w = fitz.get_text_length(line, fontname=fontname, fontsize=fontsize)
+        except Exception:
+            w = len(line) * fontsize * 0.6
+        if w > max_width:
+            max_width = w
+    return max_width
+
+
+def _calc_write_rect(
+    text: str, original_rect: fitz.Rect, fontname: str,
+    fontsize: float, page_rect: fitz.Rect,
+) -> fitz.Rect:
     """
-    📘 教学笔记：自动缩小字号以适应矩形区域
-    PyMuPDF 的 insert_textbox 返回值 < 0 表示文本溢出。
-    我们从原始字号开始尝试，每次缩小 0.5pt，直到不溢出或达到下限。
+    📘 教学笔记：计算写入区域（同时用于 redaction 和写入）
+
+    策略：
+    1. 估算译文需要的宽度
+    2. 宽度不够 → 向右扩展（不超出页面）
+    3. 右边放不下 → 向左扩展
+    4. 高度不够 → 向下扩展
+    5. 加 15% 余量，给 insert_htmlbox 的自动缩放留空间
     """
-    size = base_size
-    while size > min_size:
-        # 用临时页面测试是否溢出
-        test_doc = fitz.open()
-        test_page = test_doc.new_page(width=rect.width + 100, height=rect.height + 100)
-        test_rect = fitz.Rect(10, 10, 10 + rect.width, 10 + rect.height)
-        rc = test_page.insert_textbox(
-            test_rect, text, fontsize=size, fontname=fontname,
-        )
-        test_doc.close()
-        if rc >= 0:  # 没溢出
-            return size
-        size -= 0.5
-    return min_size
+    needed_width = _estimate_text_width(text, fontsize, fontname)
+    needed_width *= 1.15  # 15% 余量
+
+    rect = fitz.Rect(original_rect)
+    page_w = page_rect.width
+    page_h = page_rect.height
+
+    # ---- 扩展宽度 ----
+    if needed_width > rect.width:
+        extra = needed_width - rect.width
+        new_x1 = rect.x1 + extra
+        if new_x1 <= page_w - 5:
+            rect.x1 = new_x1
+        else:
+            rect.x1 = page_w - 5
+            remaining = needed_width - (rect.x1 - rect.x0)
+            if remaining > 0:
+                rect.x0 = max(5, rect.x0 - remaining)
+
+    # ---- 扩展高度 ----
+    line_count = text.count("\n") + 1
+    needed_height = max(line_count * fontsize * 1.4, fontsize * 1.5)
+    if needed_height > rect.height:
+        new_y1 = rect.y0 + needed_height
+        rect.y1 = min(new_y1, page_h - 5)
+
+    return rect
+
+
+def _build_html_text(text: str, fontsize: float, font_color: str,
+                     bold: bool, pymupdf_font: str) -> str:
+    """
+    📘 教学笔记：构建 HTML 文本用于 insert_htmlbox
+    
+    insert_htmlbox 接受 HTML 字符串，支持 CSS 样式。
+    我们用内联样式控制字号、颜色、粗体等。
+    换行符 \\n 在 HTML 中无效，需要转为 <br>。
+    特殊字符需要转义（<, >, &）。
+    """
+    # CSS font-family
+    css_family = HTML_FONT_FAMILY_MAP.get(pymupdf_font, "sans-serif")
+
+    # 转义 HTML 特殊字符
+    safe_text = (text
+                 .replace("&", "&amp;")
+                 .replace("<", "&lt;")
+                 .replace(">", "&gt;"))
+    # 换行符 → <br>
+    safe_text = safe_text.replace("\n", "<br>")
+
+    weight = "bold" if bold else "normal"
+
+    return (
+        f'<p style="font-size:{fontsize}pt; color:{font_color}; '
+        f'font-weight:{weight}; font-family:{css_family}; '
+        f'margin:0; padding:0; line-height:1.2;">'
+        f'{safe_text}</p>'
+    )
 
 
 def write_pdf(
@@ -130,14 +185,11 @@ def write_pdf(
     """
     基于原 PDF 生成翻译后的文件。
 
-    策略：逐页处理，对每个已翻译的 Block：
-    1. 用 Redaction 擦除原文区域
-    2. 在同一区域写入译文，保持字体/大小/颜色
-    3. 如果译文溢出，自动缩小字号
-
-    📘 教学笔记：为什么不能一次性 apply_redactions？
-    因为 apply_redactions 会改变页面内容，后续的 search_for 可能失效。
-    所以我们按页处理：先收集该页所有要替换的 Block，一次性 redact，再逐个写入。
+    📘 v3 策略：
+    1. 预计算所有块的扩展 rect
+    2. Redaction 用扩展 rect（确保写入区域被完全清空）
+    3. 写入用 insert_htmlbox + scale_low=0（自动缩放，不会"放不下就消失"）
+    4. 降级方案：insert_htmlbox 失败 → insert_textbox 兜底
     """
     if not source_path:
         raise ValueError("source_path is required")
@@ -145,8 +197,8 @@ def write_pdf(
     logger.info(f"开始生成 PDF: {output_path}")
     doc = fitz.open(source_path)
 
-    # 按页分组
-    page_items = {}
+    # ---- 按页分组 ----
+    page_items: Dict[int, List[dict]] = {}
     for item in parsed_data["items"]:
         key = item["key"]
         if key not in translations:
@@ -157,70 +209,146 @@ def write_pdf(
         page_items[page_idx].append(item)
 
     replaced_count = 0
+    failed_count = 0
 
     for page_idx, items in page_items.items():
         if page_idx >= len(doc):
             continue
         page = doc[page_idx]
+        page_rect = page.rect
 
-        # ---- 第一步：添加 Redaction 标注（擦除原文）----
-        for item in items:
-            bbox = item["bbox"]
-            rect = fitz.Rect(bbox)
-            # 稍微扩大擦除区域，确保完全覆盖
-            rect = rect + (-1, -1, 1, 1)
-            page.add_redact_annot(rect, text="", fill=(1, 1, 1))  # 白色填充
-
-        # 执行擦除
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-
-        # ---- 第二步：写入译文 ----
+        # ---- 预计算：为每个块准备写入信息 ----
+        block_info_list = []
         for item in items:
             key = item["key"]
             translated = translations[key]
             bbox = item["bbox"]
-            rect = fitz.Rect(bbox)
+            original_rect = fitz.Rect(bbox)
             fmt = item["dominant_format"]
 
             font_name = fmt["font_name"]
             font_size = fmt["font_size"]
-            font_color = _color_hex_to_tuple(fmt["font_color"])
+            font_color_hex = fmt["font_color"]
+            font_color_tuple = _color_hex_to_tuple(font_color_hex)
+            bold = fmt.get("bold", False)
 
-            # 通过 FormatEngine 映射字体
             mapped_font = format_engine.resolve_font(font_name)
             display_font = mapped_font or font_name
-
-            # 解析为 PyMuPDF 可用字体
             cjk = _has_cjk(translated)
             pymupdf_font = _resolve_font(display_font, cjk)
 
-            # 自动缩小字号以适应区域
-            fit_size = _calc_fit_fontsize(translated, rect, pymupdf_font, font_size)
+            # 计算扩展写入区域
+            write_rect = _calc_write_rect(
+                translated, original_rect, pymupdf_font, font_size, page_rect
+            )
 
-            # 写入译文
+            block_info_list.append({
+                "key": key,
+                "translated": translated,
+                "original_rect": original_rect,
+                "write_rect": write_rect,
+                "font_size": font_size,
+                "font_color_hex": font_color_hex,
+                "font_color_tuple": font_color_tuple,
+                "bold": bold,
+                "pymupdf_font": pymupdf_font,
+                "cjk": cjk,
+            })
+
+        # ---- 第一步：Redaction（用扩展 rect 擦除）----
+        # 📘 v3 关键：redaction 和写入用同一个 rect
+        # 这样不会出现"A 的写入区域被 B 的 redaction 擦掉"的问题
+        for info in block_info_list:
+            redact_rect = info["write_rect"] + (-1, -1, 1, 1)
+            page.add_redact_annot(redact_rect, text="", fill=(1, 1, 1))
+
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+
+        # ---- 第二步：写入译文（insert_htmlbox 优先）----
+        for info in block_info_list:
+            key = info["key"]
+            translated = info["translated"]
+            write_rect = info["write_rect"]
+            success = False
+
+            # 方案 A：insert_htmlbox（自动缩放，最可靠）
             try:
-                page.insert_textbox(
-                    rect,
-                    translated,
-                    fontsize=fit_size,
-                    fontname=pymupdf_font,
-                    color=font_color,
-                    align=fitz.TEXT_ALIGN_LEFT,
+                html = _build_html_text(
+                    translated, info["font_size"], info["font_color_hex"],
+                    info["bold"], info["pymupdf_font"],
                 )
-                replaced_count += 1
+                result = page.insert_htmlbox(
+                    write_rect, html, scale_low=0, overlay=True
+                )
+                # result = (spare_height, scale)
+                spare_height = result[0] if isinstance(result, tuple) else result
+                if spare_height >= 0:
+                    success = True
+                    if isinstance(result, tuple) and result[1] < 0.5:
+                        logger.debug(
+                            f"文本大幅缩放 key={key}, scale={result[1]:.2f}"
+                        )
+                else:
+                    logger.debug(f"insert_htmlbox 失败 key={key}, spare={spare_height}")
             except Exception as e:
-                logger.warning(f"写入失败 key={key}: {e}，尝试降级写入")
+                logger.debug(f"insert_htmlbox 异常 key={key}: {e}")
+
+            # 方案 B：insert_textbox 降级（如果 htmlbox 失败）
+            if not success:
                 try:
-                    # 降级：用最基础的字体
-                    fallback = "china-ss" if cjk else "helv"
-                    page.insert_textbox(
-                        rect, translated, fontsize=fit_size,
-                        fontname=fallback, color=font_color,
+                    rc = page.insert_textbox(
+                        write_rect, translated,
+                        fontsize=info["font_size"],
+                        fontname=info["pymupdf_font"],
+                        color=info["font_color_tuple"],
+                        align=fitz.TEXT_ALIGN_LEFT,
+                        overlay=True,
                     )
-                    replaced_count += 1
+                    if rc >= 0:
+                        success = True
+                    else:
+                        # 缩小字号再试一次
+                        rc2 = page.insert_textbox(
+                            write_rect, translated,
+                            fontsize=max(4.0, info["font_size"] * 0.5),
+                            fontname=info["pymupdf_font"],
+                            color=info["font_color_tuple"],
+                            align=fitz.TEXT_ALIGN_LEFT,
+                            overlay=True,
+                        )
+                        if rc2 >= 0:
+                            success = True
+                except Exception as e:
+                    logger.debug(f"insert_textbox 降级异常 key={key}: {e}")
+
+            # 方案 C：最后一搏 — 用最基础的字体和最小字号
+            if not success:
+                try:
+                    fallback = "china-ss" if info["cjk"] else "helv"
+                    page.insert_textbox(
+                        write_rect, translated,
+                        fontsize=4.0, fontname=fallback,
+                        color=info["font_color_tuple"],
+                        overlay=True,
+                    )
+                    success = True
                 except Exception as e2:
-                    logger.error(f"降级写入也失败 key={key}: {e2}")
+                    logger.error(f"所有写入方案均失败 key={key}: {e2}")
+
+            if success:
+                replaced_count += 1
+            else:
+                failed_count += 1
+                logger.warning(
+                    f"文本写入失败 key={key}, "
+                    f"rect={write_rect.width:.0f}x{write_rect.height:.0f}, "
+                    f"text={translated[:30]}"
+                )
 
     doc.save(output_path, garbage=4, deflate=True)
     doc.close()
-    logger.info(f"PDF 生成完成: {output_path}（替换了 {replaced_count} 个文本块）")
+
+    if failed_count:
+        logger.warning(f"PDF 生成完成: {output_path}（成功 {replaced_count}，失败 {failed_count}）")
+    else:
+        logger.info(f"PDF 生成完成: {output_path}（成功写入 {replaced_count} 个文本块）")
