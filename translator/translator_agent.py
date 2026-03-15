@@ -14,6 +14,7 @@ from translator.pdf_writer import write_pdf
 from translator.format_engine import FormatEngine
 from translator.translate_pipeline import TranslatePipeline
 from translator.com_engine import is_com_available, extract_extra_texts, write_extra_texts
+from translator.layout_agent import LayoutReviewAgent
 
 # =============================================================
 # 📘 教学笔记：翻译 Agent 主控制器
@@ -44,6 +45,7 @@ class TranslatorAgent:
         self,
         draft_model_id: str = None,
         review_model_id: str = None,
+        vision_model_id: str = None,
         batch_size: int = 10,
         max_workers: int = 1,
         debug: bool = False,
@@ -52,6 +54,7 @@ class TranslatorAgent:
         参数：
             draft_model_id: 初翻模型 ID（默认用 Config 中的模型）
             review_model_id: 审校模型 ID（为 None 则跳过审校）
+            vision_model_id: 排版审校 Vision 模型 ID（为 None 则跳过排版审校）
             batch_size: 每批翻译的段落数
             max_workers: 并行线程数（同时发多少个LLM请求）
             debug: 调试模式
@@ -65,6 +68,18 @@ class TranslatorAgent:
         # 审校模型：如果没有单独指定，默认和初翻用同一个模型
         review_id = review_model_id or draft_model_id or Config.DEFAULT_MODEL_ID
         self.router.register("review", model_id=review_id)
+
+        # 📘 教学笔记：Vision 模型（排版审校）
+        # 多模态模型能"看图"，用于翻译后的排版质量检查。
+        # 如果用户没指定 vision_model_id，跳过排版审校。
+        self.layout_agent = None
+        if vision_model_id:
+            self.router.register("vision", model_id=vision_model_id)
+            self.layout_agent = LayoutReviewAgent(
+                vision_llm=self.router.get("vision"),
+                fix_llm=self.router.get("review"),  # 复用审校模型做译文精简
+            )
+            logger.info(f"排版审校 Agent 已启用 (Vision: {vision_model_id})")
 
         # 初始化翻译流水线（初翻 + 审校双 Agent）
         self.pipeline = TranslatePipeline(
@@ -162,7 +177,7 @@ class TranslatorAgent:
         if was_stopped:
             print(f"[⚠️ 提前停止] 已翻译 {translated_count}/{total_count} 个单元，正在写入已完成部分...")
 
-        # 3. 生成文档（按格式分发）
+        # 3. 生成文档（按格式分发）— 第一次写入
         print(f"[📝 生成文档] 应用格式规则并写入...")
         if ext == ".docx":
             write_docx(parsed_data, translations, output_path, self.format_engine,
@@ -174,11 +189,50 @@ class TranslatorAgent:
             write_pdf(parsed_data, translations, output_path, self.format_engine,
                       source_path=input_path)
 
-        # 4. COM 增强：处理图表/文本框/SmartArt（仅 Word）
+        # 4. 排版审校（Vision 模型看图找问题 → 精简译文 → 重新写入）
+        # 📘 教学笔记：排版审校是"写入→看图→修改→重写"的循环
+        # 第一次写入后，渲染成图片让 Vision 模型审校。
+        # 如果发现问题，精简译文后重新写入（第二次写入）。
+        # 只做一轮审校，避免无限循环和过高成本。
+        if self.layout_agent and not was_stopped:
+            layout_modified = False
+            old_count = len(translations)
+            if ext == ".pdf":
+                # 📘 记录修改前的译文快照，用于判断是否有变化
+                snapshot = dict(translations)
+                translations = self.layout_agent.review_pdf_layout(
+                    source_path=input_path,
+                    translated_path=output_path,
+                    parsed_data=parsed_data,
+                    translations=translations,
+                )
+                layout_modified = any(
+                    translations.get(k) != snapshot.get(k) for k in translations
+                )
+            elif ext == ".pptx":
+                snapshot = dict(translations)
+                translations = self.layout_agent.review_pptx_layout(
+                    source_path=input_path,
+                    translated_path=output_path,
+                    parsed_data=parsed_data,
+                    translations=translations,
+                )
+                layout_modified = any(
+                    translations.get(k) != snapshot.get(k) for k in translations
+                )
+
+            # 📘 如果排版审校修改了译文，需要重新写入
+            if layout_modified:
+                print(f"[📝 重新写入] 应用排版修正后的译文...", flush=True)
+                if ext == ".pptx":
+                    write_pptx(parsed_data, translations, output_path, self.format_engine,
+                               source_path=input_path)
+                else:  # .pdf
+                    write_pdf(parsed_data, translations, output_path, self.format_engine,
+                              source_path=input_path)
+
+        # 5. COM 增强：处理图表/文本框/SmartArt（仅 Word）
         # 📘 教学笔记：PPT 的文本框/SmartArt 已经被 python-pptx 处理了
-        # python-pptx 能遍历所有 Shape（包括文本框、SmartArt），
-        # 不像 python-docx 那样有盲区。所以 PPT 不需要 COM 增强。
-        # COM 增强只用于 Word 的图表标题/坐标轴等 python-docx 搞不定的元素。
         if ext == ".docx" and self.com_enabled and not was_stopped:
             self._com_enhance(input_path, output_path, target_lang)
 

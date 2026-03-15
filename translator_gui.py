@@ -69,10 +69,13 @@ class TranslateWorker(QThread):
         self.target_lang = target_lang
 
     def _emit_token_usage(self):
-        """📘 从 pipeline 的 Agent 池中汇总 token 用量"""
+        """📘 从 pipeline 的 Agent 池中汇总 token 用量（含排版审校）"""
         pipeline = self.agent.pipeline
         draft_t = pipeline.total_draft_tokens
         review_t = pipeline.total_review_tokens
+        # 📘 排版审校 Agent 的 token 也计入审校
+        if self.agent.layout_agent:
+            review_t += self.agent.layout_agent.total_tokens
         self.token_signal.emit(draft_t, review_t, draft_t + review_t)
 
     def run(self):
@@ -647,6 +650,22 @@ class MainWindow(QMainWindow):
         log_row.addWidget(self.log_combo, 1)
         sg_layout.addLayout(log_row)
 
+        # 📘 排版审校开关
+        layout_row = QHBoxLayout()
+        self.layout_check = QCheckBox("排版审校（Vision 模型看图检查）")
+        self.layout_check.setToolTip(
+            "翻译完成后，用多模态 Vision 模型逐页审校排版。\n"
+            "自动发现文字溢出、位置偏移、字号过小等问题并修正。\n"
+            "需要 VISION_MODEL_ID 配置（如 doubao-1.5-vision-pro-32k）。\n"
+            "会增加额外的 API 调用成本。"
+        )
+        vision_id = Config.VISION_MODEL_ID
+        self.layout_check.setEnabled(bool(vision_id))
+        if not vision_id:
+            self.layout_check.setText("排版审校（未配置 Vision 模型）")
+        layout_row.addWidget(self.layout_check)
+        sg_layout.addLayout(layout_row)
+
         left_layout.addWidget(settings_group)
 
         # 格式映射面板
@@ -815,9 +834,14 @@ class MainWindow(QMainWindow):
         log_level = self.log_combo.currentData()
         self._apply_log_level(log_level)
 
+        # 排版审校
+        vision_model = Config.VISION_MODEL_ID if self.layout_check.isChecked() else None
+
         self._append_log(f"初翻模型: {draft_model}", "info")
         self._append_log(f"审校模型: {review_model or '跳过'}", "info")
         self._append_log(f"目标语言: {target_lang}  |  批量: {batch_size}  |  线程: {max_workers}", "info")
+        if vision_model:
+            self._append_log(f"排版审校: {vision_model}", "info")
         self._append_log(f"文件数: {len(files)}", "info")
         self._append_log("─" * 50, "info")
 
@@ -835,6 +859,7 @@ class MainWindow(QMainWindow):
             self.agent = TranslatorAgent(
                 draft_model_id=draft_model,
                 review_model_id=review_model,
+                vision_model_id=vision_model,
                 batch_size=batch_size,
                 max_workers=max_workers,
                 debug=True,
@@ -938,6 +963,7 @@ class MainWindow(QMainWindow):
         self.batch_spin.setEnabled(not running)
         self.worker_spin.setEnabled(not running)
         self.log_combo.setEnabled(not running)
+        self.layout_check.setEnabled(not running and bool(Config.VISION_MODEL_ID))
         self.format_panel.setEnabled(not running)
 
     def _apply_log_level(self, level_name: str):
