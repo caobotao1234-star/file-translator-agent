@@ -30,7 +30,7 @@ def print_help(target_lang: str = None):
 ║                                                       ║
 ║  翻译文档：                                           ║
 ║    直接输入文件路径即可开始翻译                       ║
-║    支持: .docx (Word)  .pptx (PowerPoint)            ║
+║    支持: .docx (Word)  .pptx (PPT)  .pdf           ║
 ║    例: test.docx / slides.pptx                        ║
 ║                                                       ║
 ║  语言设置：                                           ║
@@ -181,7 +181,7 @@ def main():
 
         # ---- 文件翻译 ----
         filepath = user_input.strip('"').strip("'")
-        if filepath.endswith((".docx", ".pptx")):
+        if filepath.endswith((".docx", ".pptx", ".pdf")):
             # 首次翻译时必须先选目标语言
             if target_lang is None:
                 print("[🌐 提示] 首次翻译，请先选择目标语言")
@@ -195,7 +195,7 @@ def main():
             except Exception as e:
                 print(f"[❌ 错误] 翻译失败: {e}")
         else:
-            print("[⚠️ 提示] 请输入 .docx 或 .pptx 文件路径，或输入 /help 查看帮助")
+            print("[⚠️ 提示] 请输入 .docx / .pptx / .pdf 文件路径，或输入 /help 查看帮助")
 
 
 if __name__ == "__main__":

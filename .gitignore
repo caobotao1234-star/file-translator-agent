@@ -5,6 +5,7 @@ translator_config/
 output/
 *.docx
 *.pptx
+*.pdf
 ~$*
 .env
 volcengine/

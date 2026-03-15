@@ -302,7 +302,7 @@ class FileListWidget(QListWidget):
     def dropEvent(self, event: QDropEvent):
         for url in event.mimeData().urls():
             path = url.toLocalFile()
-            if path.lower().endswith(('.docx', '.pptx')):
+            if path.lower().endswith(('.docx', '.pptx', '.pdf')):
                 # 避免重复
                 exists = any(
                     self.item(i).data(Qt.ItemDataRole.UserRole) == path
@@ -516,7 +516,7 @@ class MainWindow(QMainWindow):
         # ---- 顶部标题 ----
         title = QLabel("📖 翻译 Agent")
         title.setObjectName("titleLabel")
-        subtitle = QLabel("拖入 .docx / .pptx 文件，选择语言和模型，一键翻译")
+        subtitle = QLabel("拖入 .docx / .pptx / .pdf 文件，选择语言和模型，一键翻译")
         subtitle.setObjectName("subtitleLabel")
         root_layout.addWidget(title)
         root_layout.addWidget(subtitle)
@@ -710,7 +710,7 @@ class MainWindow(QMainWindow):
     def _on_add_files(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, "选择文档", "",
-            "文档文件 (*.docx *.pptx);;Word (*.docx);;PowerPoint (*.pptx)"
+            "文档文件 (*.docx *.pptx *.pdf);;Word (*.docx);;PowerPoint (*.pptx);;PDF (*.pdf)"
         )
         for path in files:
             exists = any(

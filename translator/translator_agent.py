@@ -9,6 +9,8 @@ from translator.docx_parser import parse_docx
 from translator.docx_writer import write_docx
 from translator.pptx_parser import parse_pptx
 from translator.pptx_writer import write_pptx
+from translator.pdf_parser import parse_pdf
+from translator.pdf_writer import write_pdf
 from translator.format_engine import FormatEngine
 from translator.translate_pipeline import TranslatePipeline
 from translator.com_engine import is_com_available, extract_extra_texts, write_extra_texts
@@ -104,8 +106,8 @@ class TranslatorAgent:
             raise FileNotFoundError(f"文件不存在: {input_path}")
 
         ext = os.path.splitext(input_path)[1].lower()
-        if ext not in (".docx", ".pptx"):
-            raise ValueError(f"不支持的文件格式: {ext}，仅支持 .docx 和 .pptx")
+        if ext not in (".docx", ".pptx", ".pdf"):
+            raise ValueError(f"不支持的文件格式: {ext}，仅支持 .docx、.pptx 和 .pdf")
 
         # 自动生成输出路径（保持原扩展名）
         if output_path is None:
@@ -120,10 +122,14 @@ class TranslatorAgent:
             parsed_data = parse_docx(input_path)
             para_count = sum(1 for i in parsed_data["items"]
                              if i["type"] == "paragraph" and not i.get("is_empty"))
-        else:
+        elif ext == ".pptx":
             parsed_data = parse_pptx(input_path)
             para_count = sum(1 for i in parsed_data["items"]
                              if i["type"] == "slide_text")
+        else:  # .pdf
+            parsed_data = parse_pdf(input_path)
+            para_count = sum(1 for i in parsed_data["items"]
+                             if i["type"] == "pdf_block")
 
         cell_count = sum(1 for i in parsed_data["items"]
                          if i["type"] == "table_cell")
@@ -145,9 +151,12 @@ class TranslatorAgent:
         if ext == ".docx":
             write_docx(parsed_data, translations, output_path, self.format_engine,
                        source_path=input_path)
-        else:
+        elif ext == ".pptx":
             write_pptx(parsed_data, translations, output_path, self.format_engine,
                        source_path=input_path)
+        else:  # .pdf
+            write_pdf(parsed_data, translations, output_path, self.format_engine,
+                      source_path=input_path)
 
         # 4. COM 增强：处理图表/文本框/SmartArt（仅 Word）
         # 📘 教学笔记：PPT 的文本框/SmartArt 已经被 python-pptx 处理了
