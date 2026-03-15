@@ -44,6 +44,18 @@ FALLBACK_FONT_MAP = {
 # 模型偶尔会在 PDF 译文中幻觉生成这些标记。
 _RN_TAG_RE = re.compile(r"</?r\d+>")
 
+# 📘 清理泄漏的角色标签和分隔符
+# translate_pipeline 的 prompt 给 LLM 附加了 <<ROLE:标题>>、<<LIMIT:30>> 等提示，
+# LLM 有时会把这些标签保留在译文中。旧格式 [Body]、[Label] 也要兼容清理。
+_ROLE_TAG_RE = re.compile(
+    r'<<(?:ROLE|LIMIT):[^>]*>>\s*|'
+    r'\[(?:Body|Label|Subtitle|Caption|Title|'
+    r'标题/?口号?|副标题|图注/?标签?|标签|正文|页码|'
+    r'限\d+字符)\]\s*',
+    re.IGNORECASE,
+)
+_SEPARATOR_RE = re.compile(r'%%%+')
+
 
 def _color_hex_to_tuple(hex_color: str) -> tuple:
     """'#ff0000' → (1.0, 0.0, 0.0)"""
@@ -79,13 +91,15 @@ def _has_cjk(text: str) -> bool:
 
 def _clean_rn_tags(text: str) -> str:
     """
-    📘 教学笔记：清理 <rN> 标记
-    PDF 的文本块是纯文本，不像 Word 有 Run 概念。
-    但翻译 prompt 里有 <rN> 格式标记规则（给 Word 用的），
-    模型偶尔会在 PDF 译文中幻觉生成这些标记，如 "<r5>签约仪式</r5>"。
-    这里统一清理掉。
+    📘 教学笔记：清理译文中的标记和标签
+    1. <rN> 标记：PDF 不需要 Run 级别标记，但 LLM 偶尔幻觉生成
+    2. [角色] 标签：prompt 中的角色提示泄漏到译文（如 [Body]、[Label]）
+    3. %%% 分隔符：LLM 幻觉生成的批次分隔符
     """
-    return _RN_TAG_RE.sub("", text)
+    text = _RN_TAG_RE.sub("", text)
+    text = _ROLE_TAG_RE.sub("", text)
+    text = _SEPARATOR_RE.sub("", text)
+    return text.strip()
 
 
 def _build_html_text(text: str, fontsize: float, font_color: str,

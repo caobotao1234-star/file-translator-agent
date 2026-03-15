@@ -1,5 +1,6 @@
 # translator/translate_pipeline.py
 import json
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 from typing import Dict, Any, List, Optional, Tuple
@@ -50,15 +51,18 @@ DRAFT_SYSTEM_PROMPT = """你是专业翻译专家。将收到的JSON数组逐段
 例："<r0>关键：</r0><r1>说明文字</r1>" → "<r0>Key: </r0><r1>Description text</r1>"
 
 排版感知规则：
-- 每段文字可能附带[角色]和[限N字符]提示。
-- [标题/口号]类文字：用简洁有力的表达，优先精简，不要逐字直译。
-- [图注/标签]类文字：极度精简，能省则省。
-- [限N字符]：译文长度尽量不超过N个字符（含空格），超出会导致排版溢出。
-  如果直译超长，请用缩写、精简表达或省略次要修饰词来控制长度。
-  宁可稍微意译也不要超长。
+- 每段文字可能附带 <<ROLE:角色>> 和 <<LIMIT:N>> 提示，这些是给你的参考信息。
+- <<ROLE:标题>> 类文字：用简洁有力的表达，但不要过度缩写，要保持可读性。
+- <<ROLE:图注>> 或 <<ROLE:标签>> 类文字：适当精简，但必须保持完整可读的单词，不要用缩写。
+- <<LIMIT:N>>：译文长度尽量不超过N个字符（含空格），但可读性优先。
+  如果直译超长，请适当精简表达，但绝不要用不常见的缩写。
 - 没有标注的段落按正常翻译处理。
 
-输出：严格JSON数组，每个元素是对应译文字符串。不要输出其他内容。"""
+⚠️ 关键：输出的译文中绝对不要包含 <<ROLE:...>>、<<LIMIT:...>> 等标记。
+这些标记只是给你的提示，不是译文的一部分。也不要输出%%%等分隔符。
+也不要输出 [Body]、[Label]、[Subtitle] 等任何标签。
+
+输出：严格JSON数组，每个元素是纯译文字符串（不含任何标签或标记）。"""
 
 REVIEW_SYSTEM_PROMPT = """你是翻译审校专家。你会收到译文列表（附原文摘要供参考），逐条审校并输出修正后的最终版本。
 
@@ -72,11 +76,15 @@ REVIEW_SYSTEM_PROMPT = """你是翻译审校专家。你会收到译文列表（
 格式标记：保留所有<rN>标记，数量编号不变，只改标记内译文。
 
 排版审校：
-- 如果某条译文附带了[限N字符]提示但明显超长，请精简到限制以内。
-- [标题/口号]类译文应简洁有力，避免冗长。
+- 如果某条译文附带了字符限制提示但明显超长，请适当精简，但保持可读性。
+- 标题类译文应简洁有力，但不要过度缩写成不可读的形式。
 - 保持全文术语一致性（同一个专有名词在不同段落应翻译一致）。
+- 不要使用不常见的缩写（如 Co. Hons, Ind Stds, ServFlow 等），要用完整可读的表达。
 
-输出：严格JSON数组，每个元素是审校后的译文字符串。"""
+⚠️ 关键：输出的译文中绝对不要包含任何标签或标记（如 <<ROLE:...>>、[Body]、[Label] 等）。
+也不要输出%%%等分隔符。只输出纯译文。
+
+输出：严格JSON数组，每个元素是审校后的纯译文字符串。"""
 
 MAX_BATCH_RETRIES = 2
 
@@ -133,8 +141,10 @@ def _classify_text_role(item: dict) -> str:
     if any(kw in style_name for kw in ("title", "heading", "标题")):
         return "title"
 
-    # 规则 2：极短文本 → 标签
-    if char_count <= 8:
+    # 规则 2：极短文本 → 标签（仅限纯数字、页码等）
+    # 📘 v2: 阈值从 8 降到 4，避免把"公司简介"(4字)这种正常短文本标为 label
+    # label 应该只用于页码、编号等极短的非语义文本
+    if char_count <= 4 and not any('\u4e00' <= c <= '\u9fff' for c in clean_text):
         return "label"
 
     # 规则 3：PDF 大字号 + 粗体 + 短文本 → 标题
@@ -169,8 +179,12 @@ def _estimate_max_chars(item: dict, target_lang: str) -> Optional[int]:
     - PDF: 有 text_bbox，可以精确计算可用宽度 / 目标字号
     - PPT/Word: 没有精确 bbox，用原文字符数 × 膨胀系数估算
 
-    中→英膨胀系数约 1.5~2.0（中文1个字≈2个英文字母宽度，
-    但英文单词比中文字多），我们用 1.8 作为安全上限。
+    📘 v2 修正：中→英膨胀系数大幅上调
+    之前用 1.3（标题）/ 1.8（正文），导致 LLM 被迫极度缩写。
+    实际上中文→英文的膨胀比约 2.5~3.5 倍：
+      "公司简介" (4字) → "Company Introduction" (22字符)
+      "装配式建筑" (5字) → "Prefabricated Buildings" (23字符)
+    现在用 3.0（标题）/ 2.5（正文），给 LLM 足够空间写出正常译文。
 
     返回 None 表示不限制（正文段落通常不需要限制）。
     """
@@ -179,9 +193,9 @@ def _estimate_max_chars(item: dict, target_lang: str) -> Optional[int]:
     char_count = len(clean_text)
     item_type = item.get("type", "")
 
-    # 📘 正文段落（>80字符）通常不需要长度限制
+    # 📘 正文段落（>50字符）通常不需要长度限制
     # 因为正文有足够的空间换行，不会溢出
-    if char_count > 80:
+    if char_count > 50:
         return None
 
     # PDF: 用 text_bbox 精确估算
@@ -195,8 +209,8 @@ def _estimate_max_chars(item: dict, target_lang: str) -> Optional[int]:
 
             if is_multiline:
                 # 多行文本：可用面积 / 每字符面积
-                # 英文字符宽度 ≈ 0.5 × 字号，行高 ≈ 1.3 × 字号
-                char_width = font_size * 0.5
+                # 📘 英文字符宽度 ≈ 0.55 × 字号（比 0.5 宽松一点）
+                char_width = font_size * 0.55
                 line_height = font_size * 1.3
                 if char_width > 0 and line_height > 0:
                     chars_per_line = int(width / char_width)
@@ -204,24 +218,26 @@ def _estimate_max_chars(item: dict, target_lang: str) -> Optional[int]:
                     return chars_per_line * num_lines
             else:
                 # 单行文本：可用宽度 / 字符宽度
-                char_width = font_size * 0.5
+                char_width = font_size * 0.55
                 if char_width > 0:
                     return int(width / char_width)
 
     # PPT/Word: 用膨胀系数估算
-    # 📘 中→英膨胀系数 1.8，但标题类要更严格（1.3）
-    # 因为标题空间通常很紧凑
+    # 📘 v2: 大幅上调膨胀系数，避免过度缩写
     role = item.get("text_role", "body")
-    if role in ("title", "subtitle", "caption", "label"):
-        factor = 1.3
+    if role in ("title", "subtitle"):
+        factor = 3.0  # 标题：中文4字 → 英文12字符，合理
+    elif role in ("caption", "label"):
+        factor = 2.5  # 标签：稍紧凑但不至于缩写
     else:
-        factor = 1.8
+        factor = 2.5
 
-    # 只对短文本（<80字符）做限制
+    # 只对短文本做限制
     if target_lang in ("英文", "法文", "德文", "西班牙文"):
         return int(char_count * factor)
 
     return None
+
 
 
 def _build_context_hint(items: List[dict], doc_type: str) -> str:
@@ -268,27 +284,29 @@ def _enrich_text_for_prompt(text: str, item: dict) -> str:
     📘 教学笔记：给翻译文本附加角色和长度提示
 
     在原文前面加上角色标签和长度限制，例如：
-      "[标题][限30字符] 装配式建筑全生态产业链服务商"
-      "[正文] 东方建科代表案例：河南省直青年人才公寓..."
+      "<<ROLE:标题>> <<LIMIT:30>> 装配式建筑全生态产业链服务商"
+      "<<ROLE:正文>> 东方建科代表案例：河南省直青年人才公寓..."
 
-    LLM 会根据这些提示调整翻译风格和长度。
-    提示用中括号包裹，不会和原文混淆。
+    📘 v2: 改用 <<ROLE:...>> 格式代替 [角色] 格式
+    之前用 [标题/口号] 这种方括号格式，LLM 容易把它当成内容的一部分
+    翻译成 [Body]、[Label] 等混入输出。
+    改用 <<...>> 格式更明确是元数据，LLM 不太会保留在输出中。
     """
     role = item.get("text_role", "body")
     max_chars = item.get("max_chars")
 
     role_labels = {
-        "title": "标题/口号",
+        "title": "标题",
         "subtitle": "副标题",
-        "caption": "图注/标签",
+        "caption": "图注",
         "label": "标签",
         "body": "正文",
     }
     label = role_labels.get(role, "正文")
 
-    prefix = f"[{label}]"
+    prefix = f"<<ROLE:{label}>>"
     if max_chars and role != "body":
-        prefix += f"[限{max_chars}字符]"
+        prefix += f" <<LIMIT:{max_chars}>>"
 
     return f"{prefix} {text}"
 
@@ -401,8 +419,26 @@ class TranslatePipeline:
             agent_name="reviewer",
         )
 
+    # 📘 教学笔记：清理 LLM 译文中泄漏的元数据标签
+    # prompt 中给 LLM 的角色提示（如 <<ROLE:标题>>）和长度限制（<<LIMIT:30>>）
+    # 有时会被 LLM 保留在输出中。旧格式 [Body]、[Label] 也要兼容清理。
+    _ROLE_TAG_RE = re.compile(
+        r'<<(?:ROLE|LIMIT):[^>]*>>\s*|'
+        r'\[(?:Body|Label|Subtitle|Caption|Title|'
+        r'标题/?口号?|副标题|图注/?标签?|标签|正文|页码|'
+        r'限\d+字符)\]\s*',
+        re.IGNORECASE,
+    )
+    _SEPARATOR_RE = re.compile(r'%%%+')
+
+    def _clean_translation(self, text: str) -> str:
+        """清理译文中泄漏的角色标签和分隔符"""
+        text = self._ROLE_TAG_RE.sub("", text)
+        text = self._SEPARATOR_RE.sub("", text)
+        return text.strip()
+
     def _parse_json_response(self, response: str) -> Optional[List[str]]:
-        """从 LLM 响应中提取 JSON 数组"""
+        """从 LLM 响应中提取 JSON 数组，并清理泄漏的标签"""
         text = response.strip()
         if text.startswith("```"):
             lines = text.split("\n")
@@ -415,18 +451,18 @@ class TranslatePipeline:
                 cleaned = []
                 for item in result:
                     if isinstance(item, str):
-                        cleaned.append(item)
+                        cleaned.append(self._clean_translation(item))
                     elif isinstance(item, dict):
                         for key in ("译文", "翻译", "translation", "translated",
                                     "审校", "result", "text", "初翻"):
                             if key in item:
-                                cleaned.append(str(item[key]))
+                                cleaned.append(self._clean_translation(str(item[key])))
                                 break
                         else:
                             vals = list(item.values())
-                            cleaned.append(str(vals[-1]) if vals else "")
+                            cleaned.append(self._clean_translation(str(vals[-1])) if vals else "")
                     else:
-                        cleaned.append(str(item))
+                        cleaned.append(self._clean_translation(str(item)))
                 return cleaned
         except json.JSONDecodeError:
             logger.warning(f"JSON 解析失败，原始响应: {text[:200]}...")
