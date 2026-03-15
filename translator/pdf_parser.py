@@ -128,6 +128,50 @@ def _get_dominant_format(spans_info: list) -> Dict[str, Any]:
         "italic": dominant[4],
     }
 
+def _detect_alignment(block_bbox: list, spans_info: list) -> str:
+    """
+    📘 教学笔记：从 span 位置推断文本对齐方式
+
+    PDF 没有"对齐"属性，但可以从文本在 block 内的位置推断：
+    - 文本起始 x 接近 block 左边界 → 左对齐
+    - 文本起始 x 远离左边界，且结束 x 接近右边界 → 右对齐
+    - 文本在 block 中间 → 居中
+
+    对于数字、短文本块尤其重要——它们经常是居中或右对齐的。
+    """
+    if not spans_info:
+        return "left"
+
+    block_x0 = block_bbox[0]
+    block_x1 = block_bbox[2]
+    block_width = block_x1 - block_x0
+    if block_width < 5:
+        return "left"
+
+    # 取所有 span 的 bbox 范围
+    text_x0 = min(s["format"]["bbox"][0] for s in spans_info)
+    text_x1 = max(s["format"]["bbox"][2] for s in spans_info)
+
+    left_margin = text_x0 - block_x0
+    right_margin = block_x1 - text_x1
+    text_width = text_x1 - text_x0
+
+    # 📘 如果文本几乎填满 block，无法判断对齐，默认左对齐
+    if text_width > block_width * 0.85:
+        return "left"
+
+    # 📘 左右边距差异判断
+    margin_diff = abs(left_margin - right_margin)
+    tolerance = block_width * 0.1  # 10% 容差
+
+    if margin_diff < tolerance:
+        return "center"
+    elif left_margin > right_margin + tolerance:
+        return "right"
+    else:
+        return "left"
+
+
 
 def _should_merge(block_a: dict, block_b: dict) -> bool:
     """
@@ -136,7 +180,7 @@ def _should_merge(block_a: dict, block_b: dict) -> bool:
     合并条件（全部满足才合并）：
     1. 字体/字号/颜色/粗体一致
     2. 垂直距离小（紧挨着的行）
-    3. 水平位置有重叠（同一列）
+    3. 水平位置高度重叠（同一列，左边界对齐）
     4. A 的文本不以终止标点结尾
     5. A 不是纯数字/短文本（避免目录页码被合并）
     6. 两个块都不是"短独立块"（如图标文字、标签）
@@ -165,10 +209,22 @@ def _should_merge(block_a: dict, block_b: dict) -> bool:
     if vertical_gap < -2 or vertical_gap > line_height:
         return False
 
-    # 条件 5：水平位置有重叠（同一列）
+    # 📘 条件 5（v3 修复）：左边界对齐 + 水平重叠
+    # 旧逻辑只检查"重叠比例 > 30%"，但这会把不同列的块错误合并。
+    # 例如：左栏 [50,550] 和右栏 [320,570] 的重叠比例很高，但它们不是同一段。
+    #
+    # 新逻辑：
+    #   a) 左边界偏差不能太大（同一段落的续行，左边界应该接近）
+    #   b) 同时保留重叠检查作为辅助
+    x0_diff = abs(bbox_a[0] - bbox_b[0])  # 左边界偏差
+    page_width_estimate = max(bbox_a[2], bbox_b[2])  # 粗略页宽
+    # 左边界偏差超过页宽的 15%，认为不在同一列
+    if x0_diff > page_width_estimate * 0.15:
+        return False
+
+    # 仍然检查水平重叠（防止完全不重叠的情况）
     x_overlap = min(bbox_a[2], bbox_b[2]) - max(bbox_a[0], bbox_b[0])
-    min_width = min(bbox_a[2] - bbox_a[0], bbox_b[2] - bbox_b[0])
-    if min_width > 0 and x_overlap / min_width < 0.3:
+    if x_overlap <= 0:
         return False
 
     # 条件 6：A 的文本不以终止标点结尾
@@ -303,6 +359,7 @@ def parse_pdf(filepath: str) -> Dict[str, Any]:
 
             key = f"pg{page_idx}_b{block_idx}"
             dominant_fmt = _get_dominant_format(spans_info)
+            alignment = _detect_alignment(list(block_bbox), spans_info)
 
             page_items.append({
                 "key": key,
@@ -312,6 +369,7 @@ def parse_pdf(filepath: str) -> Dict[str, Any]:
                 "sub_bboxes": [list(block_bbox)],
                 "spans": spans_info,
                 "dominant_format": dominant_fmt,
+                "alignment": alignment,
                 "is_multiline": is_multiline,
                 "is_empty": False,
             })

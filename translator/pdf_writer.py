@@ -89,10 +89,11 @@ def _clean_rn_tags(text: str) -> str:
 
 
 def _build_html_text(text: str, fontsize: float, font_color: str,
-                     bold: bool) -> str:
+                     bold: bool, align: str = "left") -> str:
     """
     📘 构建 HTML 文本用于 insert_htmlbox。
     换行符 → <br>，特殊字符转义。
+    align: "left" / "center" / "right"
     """
     safe_text = (text
                  .replace("&", "&amp;")
@@ -103,7 +104,7 @@ def _build_html_text(text: str, fontsize: float, font_color: str,
     return (
         f'<p style="font-size:{fontsize}pt; color:{font_color}; '
         f'font-weight:{weight}; font-family:sans-serif; '
-        f'margin:0; padding:0; line-height:1.15;">'
+        f'margin:0; padding:0; line-height:1.15; text-align:{align};">'
         f'{safe_text}</p>'
     )
 
@@ -185,6 +186,7 @@ def write_pdf(
                 "bold": bold,
                 "pymupdf_font": pymupdf_font,
                 "cjk": cjk,
+                "alignment": item.get("alignment", "left"),
             })
 
         # ---- 第一步：Redaction（擦除原文，透明背景）----
@@ -216,6 +218,7 @@ def write_pdf(
                 html = _build_html_text(
                     translated, info["font_size"],
                     info["font_color_hex"], info["bold"],
+                    align=info["alignment"],
                 )
                 result = page.insert_htmlbox(
                     write_rect, html, scale_low=0, overlay=True
@@ -233,13 +236,20 @@ def write_pdf(
 
             # 方案 B：insert_textbox 降级
             if not success:
+                # 📘 对齐方式映射
+                align_map = {
+                    "left": fitz.TEXT_ALIGN_LEFT,
+                    "center": fitz.TEXT_ALIGN_CENTER,
+                    "right": fitz.TEXT_ALIGN_RIGHT,
+                }
+                text_align = align_map.get(info["alignment"], fitz.TEXT_ALIGN_LEFT)
                 try:
                     rc = page.insert_textbox(
                         write_rect, translated,
                         fontsize=info["font_size"],
                         fontname=info["pymupdf_font"],
                         color=info["font_color_tuple"],
-                        align=fitz.TEXT_ALIGN_LEFT,
+                        align=text_align,
                         overlay=True,
                     )
                     if rc >= 0:
@@ -252,7 +262,7 @@ def write_pdf(
                             fontsize=half_size,
                             fontname=info["pymupdf_font"],
                             color=info["font_color_tuple"],
-                            align=fitz.TEXT_ALIGN_LEFT,
+                            align=text_align,
                             overlay=True,
                         )
                         if rc2 >= 0:
