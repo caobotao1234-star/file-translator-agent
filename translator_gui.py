@@ -56,6 +56,7 @@ class TranslateWorker(QThread):
     """
     log_signal = pyqtSignal(str, str)       # (消息, 级别)
     progress_signal = pyqtSignal(int, int)  # (已完成, 总数)
+    token_signal = pyqtSignal(int, int, int)  # (prompt_tokens, completion_tokens, total_tokens)
     finished_signal = pyqtSignal(str)       # 输出文件路径
     error_signal = pyqtSignal(str)          # 错误信息
 
@@ -64,6 +65,32 @@ class TranslateWorker(QThread):
         self.agent = agent
         self.files = files
         self.target_lang = target_lang
+
+    def _emit_token_usage(self):
+        """📘 从 pipeline 的 draft/review Agent 中读取累计 token 用量并发信号"""
+        pipeline = self.agent.pipeline
+        prompt_t = pipeline.draft_agent.total_prompt_tokens
+        comp_t = pipeline.draft_agent.total_completion_tokens
+        total_t = pipeline.draft_agent.total_tokens
+        if pipeline.review_agent:
+            prompt_t += pipeline.review_agent.total_prompt_tokens
+            comp_t += pipeline.review_agent.total_completion_tokens
+            total_t += pipeline.review_agent.total_tokens
+        self.token_signal.emit(prompt_t, comp_t, total_t)
+
+    def run(self):
+        for filepath in self.files:
+            try:
+                self.log_signal.emit(f"开始翻译: {os.path.basename(filepath)}", "info")
+                output = self.agent.translate_file(
+                    filepath,
+                    target_lang=self.target_lang,
+                )
+                self._emit_token_usage()
+                self.finished_signal.emit(output)
+            except Exception as e:
+                self._emit_token_usage()
+                self.error_signal.emit(f"{os.path.basename(filepath)}: {e}")
 
     def run(self):
         for filepath in self.files:
@@ -647,11 +674,17 @@ class MainWindow(QMainWindow):
         log_gl.addLayout(log_btn_row)
         right_layout.addWidget(log_group, 1)
 
-        # 进度条
+        # 进度条 + Token 统计
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("%v / %m 段")
         right_layout.addWidget(self.progress_bar)
+
+        # 📘 教学笔记：Token 用量统计
+        # LLM API 按 token 计费，实时显示用量让用户心里有数。
+        self.token_label = QLabel("Token 用量: —")
+        self.token_label.setStyleSheet("color: #6c7086; font-size: 12px; padding: 2px 4px;")
+        right_layout.addWidget(self.token_label)
 
         splitter.addWidget(right_panel)
         splitter.setSizes([400, 660])
@@ -682,6 +715,14 @@ class MainWindow(QMainWindow):
         handler.setLevel(TRACE)
         logging.getLogger().addHandler(handler)
         logging.getLogger().setLevel(TRACE)
+
+        # 📘 启动时就压制第三方库噪音
+        for name in [
+            "httpcore", "httpcore.http11", "httpcore.connection",
+            "httpx", "volcenginesdkarkruntime", "urllib3",
+            "hpack", "h2", "h11",
+        ]:
+            logging.getLogger(name).setLevel(logging.WARNING)
 
         # 拦截 print
         self._original_stdout = sys.stdout
@@ -763,6 +804,15 @@ class MainWindow(QMainWindow):
         self._append_log(f"文件数: {len(files)}", "info")
         self._append_log("─" * 50, "info")
 
+        # 📘 教学笔记：立即反馈
+        # 先禁用按钮、显示状态，再做耗时的 Agent 初始化。
+        # 用户点击后立刻看到 UI 变化，不会以为没反应。
+        self._set_running(True)
+        self.statusBar().showMessage("正在初始化翻译引擎...")
+        self.progress_bar.setValue(0)
+        self.token_label.setText("Token 用量: —")
+        QApplication.processEvents()  # 强制刷新 UI
+
         # 创建 Agent（使用 GUI 中编辑的格式引擎）
         try:
             self.agent = TranslatorAgent(
@@ -777,6 +827,8 @@ class MainWindow(QMainWindow):
             self.agent.format_engine = self.format_panel.get_engine()
         except Exception as e:
             self._append_log(f"Agent 初始化失败: {e}", "error")
+            self._set_running(False)
+            self.statusBar().showMessage("初始化失败")
             return
 
         # 📘 教学笔记：跨线程 GUI 更新必须用 Signal
@@ -793,6 +845,8 @@ class MainWindow(QMainWindow):
         def patched_translate_document(parsed_data, target_lang="英文", on_progress=None):
             def gui_progress(completed, total):
                 worker_ref.progress_signal.emit(completed, total)
+                # 📘 每批翻译完成后更新 token 用量
+                worker_ref._emit_token_usage()
                 if on_progress:
                     on_progress(completed, total)
             return original_translate_document(parsed_data, target_lang, gui_progress)
@@ -802,14 +856,13 @@ class MainWindow(QMainWindow):
         # 连接信号并启动
         self.worker.log_signal.connect(self._append_log)
         self.worker.progress_signal.connect(self._on_progress)
+        self.worker.token_signal.connect(self._on_token_update)
         self.worker.finished_signal.connect(self._on_file_done)
         self.worker.error_signal.connect(self._on_file_error)
         self.worker.finished.connect(self._on_all_done)
         self.worker.start()
 
-        self._set_running(True)
         self.statusBar().showMessage("翻译中...")
-        self.progress_bar.setValue(0)
 
     def _on_stop(self):
         if self.worker and self.worker.isRunning():
@@ -828,6 +881,12 @@ class MainWindow(QMainWindow):
         """在主线程中安全更新进度条"""
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(completed)
+
+    def _on_token_update(self, prompt_tokens: int, completion_tokens: int, total_tokens: int):
+        """📘 在主线程中安全更新 Token 用量显示"""
+        self.token_label.setText(
+            f"Token 用量: {total_tokens:,}  (输入 {prompt_tokens:,} + 输出 {completion_tokens:,})"
+        )
 
     def _on_all_done(self):
         self._set_running(False)
@@ -849,7 +908,7 @@ class MainWindow(QMainWindow):
         self.format_panel.setEnabled(not running)
 
     def _apply_log_level(self, level_name: str):
-        """运行时切换所有 logger 的终端 handler 级别"""
+        """运行时切换日志级别，同时压制第三方库的噪音日志"""
         level_map = {"TRACE": TRACE, "DEBUG": logging.DEBUG, "INFO": logging.INFO}
         level = level_map.get(level_name, logging.INFO)
         for name in list(logging.Logger.manager.loggerDict):
@@ -859,6 +918,18 @@ class MainWindow(QMainWindow):
             for h in lgr.handlers:
                 if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
                     h.setLevel(level)
+
+        # 📘 教学笔记：压制第三方库噪音
+        # httpcore、httpx、volcengine SDK 在 DEBUG 级别会输出大量 HTTP 连接细节
+        # （TCP 握手、TLS 协商、keep-alive 等），完全淹没我们自己的日志。
+        # 强制把它们设为 WARNING，只让我们自己的 logger 输出 DEBUG。
+        noisy_loggers = [
+            "httpcore", "httpcore.http11", "httpcore.connection",
+            "httpx", "volcenginesdkarkruntime", "urllib3",
+            "hpack", "h2", "h11",
+        ]
+        for name in noisy_loggers:
+            logging.getLogger(name).setLevel(logging.WARNING)
 
     def closeEvent(self, event):
         """关闭窗口时恢复 stdout"""
