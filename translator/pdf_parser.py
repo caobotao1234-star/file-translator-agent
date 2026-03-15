@@ -313,6 +313,108 @@ def _merge_items(items: List[dict]) -> List[dict]:
     return merged
 
 
+def _split_wide_block(block: dict, block_idx: int, page_idx: int) -> List[dict]:
+    """
+    📘 教学笔记：水平拆分宽 Block
+
+    PyMuPDF 经常把同一行高度的不相邻文本归到同一个 block。
+    例如页面左边的"集团简介"和右边的"领导关怀&战略合作"
+    会变成一个 block，bbox 横跨整页。
+
+    检测方法：分析 block 内所有 span 的 x 坐标，
+    如果存在大间隙（> 3 倍字号），就在间隙处拆分。
+
+    返回拆分后的多个"伪 block"字典列表。
+    如果不需要拆分，返回 [block]（原样）。
+    """
+    lines = block.get("lines", [])
+    if not lines:
+        return [block]
+
+    # 收集所有 span 及其 x 坐标
+    all_spans_with_x = []
+    for line in lines:
+        for span in line.get("spans", []):
+            text = span.get("text", "").strip()
+            if not text:
+                continue
+            sb = span.get("bbox", [0, 0, 0, 0])
+            font_size = span.get("size", 12)
+            all_spans_with_x.append({
+                "span": span,
+                "x0": sb[0],
+                "x1": sb[2],
+                "y0": sb[1],
+                "y1": sb[3],
+                "font_size": font_size,
+            })
+
+    if len(all_spans_with_x) < 2:
+        return [block]
+
+    # 按 x0 排序，找最大间隙
+    sorted_spans = sorted(all_spans_with_x, key=lambda s: s["x0"])
+    avg_font_size = sum(s["font_size"] for s in sorted_spans) / len(sorted_spans)
+    gap_threshold = avg_font_size * 3  # 3 倍字号以上的间隙认为是分隔
+
+    # 找所有大间隙的位置
+    split_points = []
+    for i in range(1, len(sorted_spans)):
+        gap = sorted_spans[i]["x0"] - sorted_spans[i - 1]["x1"]
+        if gap > gap_threshold:
+            split_points.append(i)
+
+    if not split_points:
+        return [block]
+
+    # 按间隙拆分 span 组
+    groups = []
+    prev = 0
+    for sp in split_points:
+        groups.append(sorted_spans[prev:sp])
+        prev = sp
+    groups.append(sorted_spans[prev:])
+
+    # 为每组构建伪 block
+    result_blocks = []
+    for gi, group in enumerate(groups):
+        if not group:
+            continue
+        # 构建这组 span 的 bbox
+        g_x0 = min(s["x0"] for s in group)
+        g_y0 = min(s["y0"] for s in group)
+        g_x1 = max(s["x1"] for s in group)
+        g_y1 = max(s["y1"] for s in group)
+
+        # 筛选属于这组的 lines 和 spans
+        group_x_range = (g_x0 - 1, g_x1 + 1)
+        new_lines = []
+        for line in lines:
+            new_spans = []
+            for span in line.get("spans", []):
+                sb = span.get("bbox", [0, 0, 0, 0])
+                # span 的中心 x 在这组范围内
+                span_cx = (sb[0] + sb[2]) / 2
+                if group_x_range[0] <= span_cx <= group_x_range[1]:
+                    new_spans.append(span)
+            if new_spans:
+                new_lines.append({"spans": new_spans})
+
+        if new_lines:
+            new_block = dict(block)
+            new_block["lines"] = new_lines
+            new_block["bbox"] = (g_x0, g_y0, g_x1, g_y1)
+            result_blocks.append(new_block)
+
+    if len(result_blocks) > 1:
+        logger.debug(
+            f"拆分宽 Block pg{page_idx}_b{block_idx}: "
+            f"1 → {len(result_blocks)} 个子块"
+        )
+
+    return result_blocks if result_blocks else [block]
+
+
 def parse_pdf(filepath: str) -> Dict[str, Any]:
     """
     解析 PDF 文档，返回所有翻译单元。
@@ -344,51 +446,62 @@ def parse_pdf(filepath: str) -> Dict[str, Any]:
                 skipped_header_footer += 1
                 continue
 
-            full_text, spans_info, is_multiline = _merge_block_text(block)
-            clean_text = full_text.strip()
+            # 📘 v3: 水平拆分宽 Block
+            # PyMuPDF 会把同一行高度的不相邻文本归到同一个 block，
+            # 导致左右两组独立文本被当成一个翻译单元。
+            # 先拆分，再逐个处理。
+            sub_blocks = _split_wide_block(block, block_idx, page_idx)
 
-            if not clean_text or len(clean_text) < MIN_TEXT_LENGTH:
-                skipped_short += 1
-                continue
+            for sub_idx, sub_block in enumerate(sub_blocks):
+                sub_bbox = sub_block.get("bbox", [0, 0, 0, 0])
 
-            # 📘 跳过面积太小的块（可能是图标/Logo 内嵌文字）
-            block_w = block_bbox[2] - block_bbox[0]
-            block_h = block_bbox[3] - block_bbox[1]
-            if block_w * block_h < MIN_BLOCK_AREA:
-                skipped_short += 1
-                continue
+                full_text, spans_info, is_multiline = _merge_block_text(sub_block)
+                clean_text = full_text.strip()
 
-            key = f"pg{page_idx}_b{block_idx}"
-            dominant_fmt = _get_dominant_format(spans_info)
-            alignment = _detect_alignment(list(block_bbox), spans_info)
+                if not clean_text or len(clean_text) < MIN_TEXT_LENGTH:
+                    skipped_short += 1
+                    continue
 
-            # 📘 教学笔记：text_bbox — 文本实际占据的精确区域
-            # block bbox 是 PyMuPDF 给的整个块边界，有时比文本实际区域宽很多。
-            # text_bbox 从所有 span 的 bbox 计算得出，是文本真正占据的矩形。
-            # Writer 用 text_bbox 写入，确保译文出现在原文的精确位置。
-            if spans_info:
-                text_bbox = [
-                    min(s["format"]["bbox"][0] for s in spans_info),
-                    min(s["format"]["bbox"][1] for s in spans_info),
-                    max(s["format"]["bbox"][2] for s in spans_info),
-                    max(s["format"]["bbox"][3] for s in spans_info),
-                ]
-            else:
-                text_bbox = list(block_bbox)
+                # 📘 跳过面积太小的块（可能是图标/Logo 内嵌文字）
+                block_w = sub_bbox[2] - sub_bbox[0]
+                block_h = sub_bbox[3] - sub_bbox[1]
+                if block_w * block_h < MIN_BLOCK_AREA:
+                    skipped_short += 1
+                    continue
 
-            page_items.append({
-                "key": key,
-                "type": "pdf_block",
-                "full_text": clean_text,
-                "bbox": list(block_bbox),
-                "text_bbox": text_bbox,
-                "sub_bboxes": [list(block_bbox)],
-                "spans": spans_info,
-                "dominant_format": dominant_fmt,
-                "alignment": alignment,
-                "is_multiline": is_multiline,
-                "is_empty": False,
-            })
+                # 拆分后的 key 带子索引，避免重复
+                if len(sub_blocks) > 1:
+                    key = f"pg{page_idx}_b{block_idx}s{sub_idx}"
+                else:
+                    key = f"pg{page_idx}_b{block_idx}"
+
+                dominant_fmt = _get_dominant_format(spans_info)
+                alignment = _detect_alignment(list(sub_bbox), spans_info)
+
+                # 📘 text_bbox — 文本实际占据的精确区域
+                if spans_info:
+                    text_bbox = [
+                        min(s["format"]["bbox"][0] for s in spans_info),
+                        min(s["format"]["bbox"][1] for s in spans_info),
+                        max(s["format"]["bbox"][2] for s in spans_info),
+                        max(s["format"]["bbox"][3] for s in spans_info),
+                    ]
+                else:
+                    text_bbox = list(sub_bbox)
+
+                page_items.append({
+                    "key": key,
+                    "type": "pdf_block",
+                    "full_text": clean_text,
+                    "bbox": list(sub_bbox),
+                    "text_bbox": text_bbox,
+                    "sub_bboxes": [list(sub_bbox)],
+                    "spans": spans_info,
+                    "dominant_format": dominant_fmt,
+                    "alignment": alignment,
+                    "is_multiline": is_multiline,
+                    "is_empty": False,
+                })
 
         # 📘 在每页内部做合并（不跨页合并）
         merged_page_items = _merge_items(page_items)
