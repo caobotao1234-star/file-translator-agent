@@ -56,7 +56,9 @@ class TranslateWorker(QThread):
     """
     log_signal = pyqtSignal(str, str)       # (消息, 级别)
     progress_signal = pyqtSignal(int, int)  # (已完成, 总数)
-    token_signal = pyqtSignal(int, int, int)  # (prompt_tokens, completion_tokens, total_tokens)
+    # 📘 v2: 拆分初翻/审校 token 用量
+    # (draft_tokens, review_tokens, total_tokens)
+    token_signal = pyqtSignal(int, int, int)
     finished_signal = pyqtSignal(str)       # 输出文件路径
     error_signal = pyqtSignal(str)          # 错误信息
 
@@ -67,16 +69,13 @@ class TranslateWorker(QThread):
         self.target_lang = target_lang
 
     def _emit_token_usage(self):
-        """📘 从 pipeline 的 draft/review Agent 中读取累计 token 用量并发信号"""
+        """📘 从 pipeline 的 draft/review Agent 中分别读取 token 用量"""
         pipeline = self.agent.pipeline
-        prompt_t = pipeline.draft_agent.total_prompt_tokens
-        comp_t = pipeline.draft_agent.total_completion_tokens
-        total_t = pipeline.draft_agent.total_tokens
+        draft_t = pipeline.draft_agent.total_tokens
+        review_t = 0
         if pipeline.review_agent:
-            prompt_t += pipeline.review_agent.total_prompt_tokens
-            comp_t += pipeline.review_agent.total_completion_tokens
-            total_t += pipeline.review_agent.total_tokens
-        self.token_signal.emit(prompt_t, comp_t, total_t)
+            review_t = pipeline.review_agent.total_tokens
+        self.token_signal.emit(draft_t, review_t, draft_t + review_t)
 
     def run(self):
         for filepath in self.files:
@@ -90,18 +89,6 @@ class TranslateWorker(QThread):
                 self.finished_signal.emit(output)
             except Exception as e:
                 self._emit_token_usage()
-                self.error_signal.emit(f"{os.path.basename(filepath)}: {e}")
-
-    def run(self):
-        for filepath in self.files:
-            try:
-                self.log_signal.emit(f"开始翻译: {os.path.basename(filepath)}", "info")
-                output = self.agent.translate_file(
-                    filepath,
-                    target_lang=self.target_lang,
-                )
-                self.finished_signal.emit(output)
-            except Exception as e:
                 self.error_signal.emit(f"{os.path.basename(filepath)}: {e}")
 
 
@@ -882,10 +869,10 @@ class MainWindow(QMainWindow):
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(completed)
 
-    def _on_token_update(self, prompt_tokens: int, completion_tokens: int, total_tokens: int):
-        """📘 在主线程中安全更新 Token 用量显示"""
+    def _on_token_update(self, draft_tokens: int, review_tokens: int, total_tokens: int):
+        """📘 在主线程中安全更新 Token 用量显示（初翻/审校分开）"""
         self.token_label.setText(
-            f"Token 用量: {total_tokens:,}  (输入 {prompt_tokens:,} + 输出 {completion_tokens:,})"
+            f"Token: {total_tokens:,}  (初翻 {draft_tokens:,} + 审校 {review_tokens:,})"
         )
 
     def _on_all_done(self):
