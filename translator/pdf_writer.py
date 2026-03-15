@@ -160,6 +160,11 @@ def write_pdf(
 
             bbox = item["bbox"]
             rect = fitz.Rect(bbox)
+            # 📘 text_bbox: 文本实际占据的精确区域（从 span bbox 计算）
+            # 用 text_bbox 写入，确保译文出现在原文的精确位置，
+            # 而不是 block bbox 的左上角（block bbox 可能比文本区域宽很多）。
+            text_bbox = item.get("text_bbox", bbox)
+            text_rect = fitz.Rect(text_bbox)
             # 📘 sub_bboxes: 合并块的所有原始子块 bbox
             # 单独块只有一个，合并块有多个。Redaction 需要逐个擦除。
             sub_bboxes = item.get("sub_bboxes", [bbox])
@@ -179,6 +184,7 @@ def write_pdf(
                 "key": key,
                 "translated": translated,
                 "rect": rect,
+                "text_rect": text_rect,
                 "sub_bboxes": sub_bboxes,
                 "font_size": font_size,
                 "font_color_hex": font_color_hex,
@@ -206,12 +212,13 @@ def write_pdf(
         for info in block_info_list:
             key = info["key"]
             translated = info["translated"]
-            rect = info["rect"]
+            text_rect = info["text_rect"]
             success = False
 
-            # 📘 写入区域 = 原始 bbox + 微小余量
-            # 不扩展！宁可缩小字号，也不破坏排版
-            write_rect = rect + (-0.5, -0.5, 0.5, 0.5)
+            # 📘 写入区域 = text_bbox（文本实际区域）+ 微小余量
+            # 用 text_rect 而不是 rect（block bbox），确保文本写在原文的精确位置。
+            # 这样右侧文本不会跑到左边，图片说明不会错位。
+            write_rect = text_rect + (-0.5, -0.5, 0.5, 0.5)
 
             # 方案 A：insert_htmlbox（自动缩放，最可靠）
             try:
@@ -290,7 +297,7 @@ def write_pdf(
                 failed_count += 1
                 logger.warning(
                     f"文本写入失败 key={key}, "
-                    f"rect={rect.width:.0f}x{rect.height:.0f}, "
+                    f"rect={text_rect.width:.0f}x{text_rect.height:.0f}, "
                     f"text={translated[:30]}"
                 )
 

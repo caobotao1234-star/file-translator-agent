@@ -177,13 +177,15 @@ def _should_merge(block_a: dict, block_b: dict) -> bool:
     """
     📘 教学笔记：判断两个相邻 Block 是否应该合并为同一段落。
 
+    v4 修复：更严格的合并条件，防止跨列合并。
+    
     合并条件（全部满足才合并）：
     1. 字体/字号/颜色/粗体一致
     2. 垂直距离小（紧挨着的行）
-    3. 水平位置高度重叠（同一列，左边界对齐）
+    3. 左边界对齐（绝对偏差 < 字号的 3 倍，约一个缩进）
     4. A 的文本不以终止标点结尾
-    5. A 不是纯数字/短文本（避免目录页码被合并）
-    6. 两个块都不是"短独立块"（如图标文字、标签）
+    5. A 不是纯数字/短文本
+    6. 宽度差异不能太大
     """
     fmt_a = block_a["dominant_format"]
     fmt_b = block_b["dominant_format"]
@@ -209,32 +211,25 @@ def _should_merge(block_a: dict, block_b: dict) -> bool:
     if vertical_gap < -2 or vertical_gap > line_height:
         return False
 
-    # 📘 条件 5（v3 修复）：左边界对齐 + 水平重叠
-    # 旧逻辑只检查"重叠比例 > 30%"，但这会把不同列的块错误合并。
-    # 例如：左栏 [50,550] 和右栏 [320,570] 的重叠比例很高，但它们不是同一段。
-    #
-    # 新逻辑：
-    #   a) 左边界偏差不能太大（同一段落的续行，左边界应该接近）
-    #   b) 同时保留重叠检查作为辅助
-    x0_diff = abs(bbox_a[0] - bbox_b[0])  # 左边界偏差
-    page_width_estimate = max(bbox_a[2], bbox_b[2])  # 粗略页宽
-    # 左边界偏差超过页宽的 15%，认为不在同一列
-    if x0_diff > page_width_estimate * 0.15:
-        return False
-
-    # 仍然检查水平重叠（防止完全不重叠的情况）
-    x_overlap = min(bbox_a[2], bbox_b[2]) - max(bbox_a[0], bbox_b[0])
-    if x_overlap <= 0:
+    # 📘 条件 5（v4 修复）：左边界严格对齐
+    # 同一段落的续行，左边界应该非常接近（最多差一个缩进）。
+    # 用绝对值而不是页宽百分比，因为百分比对双栏布局太宽松。
+    # 3 倍字号 ≈ 一个段落缩进的距离，足够容纳首行缩进。
+    x0_diff = abs(bbox_a[0] - bbox_b[0])
+    max_x0_diff = fmt_a["font_size"] * 3
+    if x0_diff > max_x0_diff:
         return False
 
     # 条件 6：A 的文本不以终止标点结尾
+    # 📘 v4 例外：如果 B 很短（< 10 字符），可能是段落末尾的"孤儿行"
+    # （如 "原梦！"），这种情况即使 A 以句号结尾也应该合并。
     text_a = block_a["full_text"].rstrip()
-    if text_a and text_a[-1] in "。！？.!?；;：:）)】」》":
+    text_b = block_b["full_text"].strip()
+    b_is_orphan = len(text_b.replace(" ", "").replace("\n", "")) < 10
+    if text_a and text_a[-1] in "。！？.!?；;：:）)】」》" and not b_is_orphan:
         return False
 
     # 📘 条件 7：A 不是纯数字/短独立文本
-    # 目录页的 "02" "03" 是独立数字块，不应该和后面的标题合并。
-    # 判断：文本去掉空白后长度 <= 4 且主要是数字/标点
     stripped_a = text_a.replace(" ", "").replace("\n", "")
     if len(stripped_a) <= 4:
         digit_count = sum(1 for c in stripped_a if c.isdigit() or c in ".%-")
@@ -242,13 +237,11 @@ def _should_merge(block_a: dict, block_b: dict) -> bool:
             return False
 
     # 📘 条件 8：两个块的宽度差异不能太大
-    # 如果 A 很窄（如数字 "02"）而 B 很宽（如 "公司简介"），
-    # 说明它们是并排的独立元素，不是同一段落的续行。
     width_a = bbox_a[2] - bbox_a[0]
     width_b = bbox_b[2] - bbox_b[0]
     if min(width_a, width_b) > 0:
         width_ratio = max(width_a, width_b) / min(width_a, width_b)
-        if width_ratio > 5:
+        if width_ratio > 3:
             return False
 
     return True
@@ -288,6 +281,14 @@ def _merge_items(items: List[dict]) -> List[dict]:
                 min(prev["bbox"][1], current["bbox"][1]),
                 max(prev["bbox"][2], current["bbox"][2]),
                 max(prev["bbox"][3], current["bbox"][3]),
+            ]
+
+            # 合并 text_bbox（取并集）
+            prev["text_bbox"] = [
+                min(prev["text_bbox"][0], current.get("text_bbox", current["bbox"])[0]),
+                min(prev["text_bbox"][1], current.get("text_bbox", current["bbox"])[1]),
+                max(prev["text_bbox"][2], current.get("text_bbox", current["bbox"])[2]),
+                max(prev["text_bbox"][3], current.get("text_bbox", current["bbox"])[3]),
             ]
 
             # 记录子块 bbox
@@ -361,11 +362,26 @@ def parse_pdf(filepath: str) -> Dict[str, Any]:
             dominant_fmt = _get_dominant_format(spans_info)
             alignment = _detect_alignment(list(block_bbox), spans_info)
 
+            # 📘 教学笔记：text_bbox — 文本实际占据的精确区域
+            # block bbox 是 PyMuPDF 给的整个块边界，有时比文本实际区域宽很多。
+            # text_bbox 从所有 span 的 bbox 计算得出，是文本真正占据的矩形。
+            # Writer 用 text_bbox 写入，确保译文出现在原文的精确位置。
+            if spans_info:
+                text_bbox = [
+                    min(s["format"]["bbox"][0] for s in spans_info),
+                    min(s["format"]["bbox"][1] for s in spans_info),
+                    max(s["format"]["bbox"][2] for s in spans_info),
+                    max(s["format"]["bbox"][3] for s in spans_info),
+                ]
+            else:
+                text_bbox = list(block_bbox)
+
             page_items.append({
                 "key": key,
                 "type": "pdf_block",
                 "full_text": clean_text,
                 "bbox": list(block_bbox),
+                "text_bbox": text_bbox,
                 "sub_bboxes": [list(block_bbox)],
                 "spans": spans_info,
                 "dominant_format": dominant_fmt,
