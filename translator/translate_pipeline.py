@@ -1,5 +1,6 @@
 # translator/translate_pipeline.py
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Dict, Any, List, Optional, Tuple
 from core.agent import BaseAgent
@@ -74,8 +75,28 @@ class TranslatePipeline:
         self.draft_llm = draft_llm
         self.review_llm = review_llm
 
+        # 📘 教学笔记：优雅停止机制
+        # _stop_event 是一个线程安全的标志位。
+        # GUI 点"停止"时 set() 它，pipeline 在每个 batch 之间检查。
+        # 比 QThread.terminate() 安全得多——terminate 是强杀线程，
+        # 会导致已翻译的内容全部丢失。优雅停止则保留已完成的部分。
+        self._stop_event = threading.Event()
+
         self.draft_agent = self._make_draft_agent()
         self.review_agent = self._make_review_agent()
+
+    def request_stop(self):
+        """请求停止翻译（线程安全，可从任意线程调用）"""
+        self._stop_event.set()
+        logger.info("收到停止请求，将在当前批次完成后停止")
+
+    def reset_stop(self):
+        """重置停止标志（下次翻译前调用）"""
+        self._stop_event.clear()
+
+    @property
+    def is_stopped(self) -> bool:
+        return self._stop_event.is_set()
 
     def _make_draft_agent(self) -> BaseAgent:
         return BaseAgent(
@@ -340,6 +361,7 @@ class TranslatePipeline:
 
         translations = {}
         completed = 0
+        stopped_early = False
 
         # 📘 流水线核心：用线程池跑审校，主线程跑初翻
         # max_workers=1 因为审校只有一个 agent，不能并发多个审校
@@ -358,6 +380,12 @@ class TranslatePipeline:
                 # 审校失败，用初翻结果（已经在 translations 里了）
 
         for batch_idx, (batch_keys, batch_texts) in enumerate(batches):
+            # 📘 优雅停止检查点：每个 batch 开始前检查
+            if self._stop_event.is_set():
+                logger.info(f"用户请求停止，已完成 {completed}/{total}，跳过剩余批次")
+                stopped_early = True
+                break
+
             logger.info(f"翻译进度: {completed}/{total}")
 
             # ---- 初翻当前 batch ----
@@ -374,7 +402,7 @@ class TranslatePipeline:
                 pending_review = None
 
             # ---- 提交当前 batch 的审校到后台线程 ----
-            if self.review_agent is not None:
+            if self.review_agent is not None and not self._stop_event.is_set():
                 future = executor.submit(
                     self._review_batch,
                     batch_texts, draft_results, target_lang, lang_english,
@@ -388,9 +416,19 @@ class TranslatePipeline:
         # ---- 收集最后一批的审校结果 ----
         if pending_review is not None:
             prev_future, prev_keys, prev_texts = pending_review
-            _collect_review(prev_future, prev_keys, prev_texts)
+            if self._stop_event.is_set():
+                # 停止时不等审校，取消 future（如果还没开始）
+                prev_future.cancel()
+                # 如果已经在跑了，cancel() 不会中断它，但我们不等了
+                # 初翻结果已经在 translations 里作为兜底
+                logger.info("停止请求：跳过最后一批审校，使用初翻结果")
+            else:
+                _collect_review(prev_future, prev_keys, prev_texts)
 
-        executor.shutdown(wait=False)
+        executor.shutdown(wait=not self._stop_event.is_set())
 
-        logger.info(f"文档翻译完成: {total} 个翻译单元")
+        if stopped_early:
+            logger.info(f"文档翻译被中断: 已完成 {len(translations)}/{total} 个翻译单元")
+        else:
+            logger.info(f"文档翻译完成: {total} 个翻译单元")
         return translations

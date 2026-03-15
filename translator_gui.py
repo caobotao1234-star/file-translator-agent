@@ -79,6 +79,9 @@ class TranslateWorker(QThread):
 
     def run(self):
         for filepath in self.files:
+            # 📘 优雅停止：如果上一个文件翻译时被停止了，不再处理后续文件
+            if self.agent.pipeline.is_stopped:
+                break
             try:
                 self.log_signal.emit(f"开始翻译: {os.path.basename(filepath)}", "info")
                 output = self.agent.translate_file(
@@ -852,11 +855,18 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("翻译中...")
 
     def _on_stop(self):
-        if self.worker and self.worker.isRunning():
-            self.worker.terminate()
-            self._append_log("用户手动停止翻译", "warning")
-            self._set_running(False)
-            self.statusBar().showMessage("已停止")
+        """
+        📘 教学笔记：优雅停止 vs 强杀
+        旧方案：self.worker.terminate() — 直接杀线程，已翻译内容全部丢失。
+        新方案：设置 pipeline 的停止标志，让翻译循环在当前 batch 完成后自然退出，
+        然后 worker.run() 正常走到写入步骤，把已翻译的部分写入文件。
+        用户不会丢失任何已完成的翻译。
+        """
+        if self.worker and self.worker.isRunning() and self.agent:
+            self.agent.pipeline.request_stop()
+            self.btn_stop.setEnabled(False)  # 防止重复点击
+            self._append_log("正在停止...当前批次完成后将写入已翻译内容", "warning")
+            self.statusBar().showMessage("正在停止...")
 
     def _on_file_done(self, output_path: str):
         self._append_log(f"✅ 翻译完成: {output_path}", "info")
@@ -877,9 +887,16 @@ class MainWindow(QMainWindow):
 
     def _on_all_done(self):
         self._set_running(False)
-        self.statusBar().showMessage("全部完成")
-        self._append_log("═" * 50, "info")
-        self._append_log("🎉 所有文件翻译完成", "info")
+        # 📘 判断是正常完成还是提前停止
+        was_stopped = self.agent and self.agent.pipeline.is_stopped
+        if was_stopped:
+            self.statusBar().showMessage("已停止（部分翻译已写入）")
+            self._append_log("═" * 50, "info")
+            self._append_log("⚠️ 翻译已停止，已完成部分已写入文件", "warning")
+        else:
+            self.statusBar().showMessage("全部完成")
+            self._append_log("═" * 50, "info")
+            self._append_log("🎉 所有文件翻译完成", "info")
 
     def _set_running(self, running: bool):
         self.btn_start.setEnabled(not running)
@@ -922,8 +939,9 @@ class MainWindow(QMainWindow):
         """关闭窗口时恢复 stdout"""
         sys.stdout = self._original_stdout
         if self.worker and self.worker.isRunning():
-            self.worker.terminate()
-            self.worker.wait(2000)
+            if self.agent:
+                self.agent.pipeline.request_stop()
+            self.worker.wait(5000)
         event.accept()
 
 

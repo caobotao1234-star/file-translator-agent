@@ -140,11 +140,24 @@ class TranslatorAgent:
         def on_progress(completed, total):
             print(f"[🔄 翻译进度] {completed}/{total}", flush=True)
 
+        # 📘 教学笔记：优雅停止 — 重置停止标志
+        # 每次翻译开始前清除上次的停止标志，否则上次停止后再点开始会立刻停止。
+        self.pipeline.reset_stop()
+
         translations = self.pipeline.translate_document(
             parsed_data,
             target_lang=target_lang,
             on_progress=on_progress,
         )
+
+        # 📘 教学笔记：部分写入
+        # 即使用户中途停止，translations 里也有已完成的部分。
+        # 未翻译的段落不会出现在 translations 字典里，
+        # writer 会保留原文（因为找不到对应的 key）。
+        was_stopped = self.pipeline.is_stopped
+        translated_count = len(translations)
+        if was_stopped:
+            print(f"[⚠️ 提前停止] 已翻译 {translated_count}/{total_count} 个单元，正在写入已完成部分...")
 
         # 3. 生成文档（按格式分发）
         print(f"[📝 生成文档] 应用格式规则并写入...")
@@ -163,10 +176,10 @@ class TranslatorAgent:
         # python-pptx 能遍历所有 Shape（包括文本框、SmartArt），
         # 不像 python-docx 那样有盲区。所以 PPT 不需要 COM 增强。
         # COM 增强只用于 Word 的图表标题/坐标轴等 python-docx 搞不定的元素。
-        if ext == ".docx" and self.com_enabled:
+        if ext == ".docx" and self.com_enabled and not was_stopped:
             self._com_enhance(input_path, output_path, target_lang)
 
-        print(f"[✅ 翻译完成] 输出文件: {output_path}")
+        print(f"[{'⚠️ 部分翻译' if was_stopped else '✅ 翻译完成'}] 输出文件: {output_path}")
         return output_path
 
     def _com_enhance(self, input_path: str, output_path: str, target_lang: str):
