@@ -51,16 +51,17 @@ DRAFT_SYSTEM_PROMPT = """你是专业翻译专家。将收到的JSON数组逐段
 
 输出：严格JSON数组，每个元素是对应译文字符串。不要输出其他内容。"""
 
-REVIEW_SYSTEM_PROMPT = """你是翻译审校专家。收到初翻译文，逐条审校并输出修正后的最终版本。
+REVIEW_SYSTEM_PROMPT = """你是翻译审校专家。你会收到原文和初翻译文的对照列表，逐条审校并输出修正后的最终版本。
 
 核心要求⚠️：
-1. 输入N个元素，输出必须恰好N个元素，一一对应，不允许合并或拆分。
-2. 所有译文必须是用户指定的目标语言。如果发现某条译文仍然是原文语言（未翻译），你必须将其翻译为目标语言。
+1. 输入N对(原文,译文)，输出必须恰好N个元素的JSON数组，一一对应，不允许合并或拆分。
+2. 逐条对照原文检查译文：是否漏译、误译、错位、语义偏差。
+3. 所有译文必须是用户指定的目标语言。如果发现某条译文仍然是原文语言（未翻译），你必须将其翻译为目标语言。
 
-审校原则：检查漏译误译、提升流畅度、统一术语、修正语法。
+审校原则：对照原文检查漏译误译、纠正错位、提升流畅度、统一术语、修正语法。
 格式标记：保留所有<rN>标记，数量编号不变，只改标记内译文。
 
-输出：严格JSON数组，每个元素是审校后的译文字符串。"""
+输出：严格JSON数组，每个元素是审校后的译文字符串（不要输出原文）。"""
 
 
 # 📘 教学笔记：最大重试次数
@@ -263,20 +264,28 @@ class TranslatePipeline:
             logger.debug("跳过审校（未配置审校 Agent）")
             return results
 
+        # 📘 教学笔记：原文+译文对照审校
+        # 旧方案只发译文，审校 Agent 只能做润色，发现不了错位和漏译。
+        # 新方案发送 [{"原文": "...", "译文": "..."}] 的配对格式，
+        # 让审校 Agent 能真正对照原文检查每一条译文是否准确。
+        # token 消耗会增加，但审校质量大幅提升，值得。
+        pairs = [
+            {"原文": src, "译文": tgt}
+            for src, tgt in zip(texts, results)
+        ]
+        n = len(pairs)
         review_prompt = (
-            f"审校以下{len(results)}条→{target_lang}({lang_english})的初翻译文。"
-            f"必须输出恰好{len(results)}个元素的JSON数组。"
-            f"如果有任何条目仍然是原文语言而非{target_lang}，必须重新翻译。"
-            f"输出修正后的JSON数组。\n"
-            f"译文：{json.dumps(results, ensure_ascii=False)}"
+            f"以下是{n}对(原文→{target_lang}({lang_english}))的翻译对照。"
+            f"逐条对照原文审校译文，输出恰好{n}个元素的JSON数组（只含修正后的译文）。\n"
+            f"对照表：{json.dumps(pairs, ensure_ascii=False)}"
         )
 
         print(f"  [🔍 审校中] 对照原文检查译文质量...", flush=True)
-        logger.debug(f"审校请求: {len(results)} 段")
+        logger.debug(f"审校请求: {n} 段（原文+译文对照）")
         review_results = self._call_llm_translate(self.review_agent, review_prompt)
 
-        if review_results and len(review_results) == len(results):
-            logger.debug(f"审校输出摘要: {[t[:30] for t in review_results[:3]]}{'...' if len(review_results) > 3 else ''}")
+        if review_results and len(review_results) == n:
+            logger.debug(f"审校输出摘要: {[t[:30] for t in review_results[:3]]}{'...' if n > 3 else ''}")
             print(f"  [✅ 审校完成]", flush=True)
             return review_results
         else:
