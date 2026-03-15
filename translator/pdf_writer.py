@@ -159,6 +159,9 @@ def write_pdf(
 
             bbox = item["bbox"]
             rect = fitz.Rect(bbox)
+            # 📘 sub_bboxes: 合并块的所有原始子块 bbox
+            # 单独块只有一个，合并块有多个。Redaction 需要逐个擦除。
+            sub_bboxes = item.get("sub_bboxes", [bbox])
             fmt = item["dominant_format"]
 
             font_name = fmt["font_name"]
@@ -175,6 +178,7 @@ def write_pdf(
                 "key": key,
                 "translated": translated,
                 "rect": rect,
+                "sub_bboxes": sub_bboxes,
                 "font_size": font_size,
                 "font_color_hex": font_color_hex,
                 "font_color_tuple": _color_hex_to_tuple(font_color_hex),
@@ -185,11 +189,11 @@ def write_pdf(
 
         # ---- 第一步：Redaction（擦除原文，透明背景）----
         # 📘 v4 关键：fill=False → 透明背景
-        # 之前 fill=(1,1,1) 会在图片/彩色背景上产生白色方块
-        # fill=False 只删除文字，不填充任何颜色，保持原始背景
+        # 📘 v4.1：合并块需要逐个擦除所有子块的原始 bbox
         for info in block_info_list:
-            redact_rect = info["rect"] + (-1, -1, 1, 1)
-            page.add_redact_annot(redact_rect, text="", fill=False)
+            for sub_bbox in info["sub_bboxes"]:
+                redact_rect = fitz.Rect(sub_bbox) + (-1, -1, 1, 1)
+                page.add_redact_annot(redact_rect, text="", fill=False)
 
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
