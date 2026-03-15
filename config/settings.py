@@ -36,3 +36,21 @@ class Config:
         if default and default not in models.values():
             models[default] = default
         return models if models else {default: default}
+
+    @staticmethod
+    def get_vision_models() -> dict:
+        """
+        📘 解析 .env 中的 VISION_MODELS，返回支持多模态的模型列表。
+        格式同 AVAILABLE_MODELS。
+        """
+        raw = os.getenv("VISION_MODELS", "")
+        models = {}
+        if raw.strip():
+            for pair in raw.split(","):
+                pair = pair.strip()
+                if "=" in pair:
+                    name, model_id = pair.split("=", 1)
+                    models[name.strip()] = model_id.strip()
+                elif pair:
+                    models[pair] = pair
+        return models

@@ -650,20 +650,20 @@ class MainWindow(QMainWindow):
         log_row.addWidget(self.log_combo, 1)
         sg_layout.addLayout(log_row)
 
-        # 📘 排版审校开关
+        # 📘 排版审校（Vision 模型下拉框）
         layout_row = QHBoxLayout()
-        self.layout_check = QCheckBox("排版审校（Vision 模型看图检查）")
-        self.layout_check.setToolTip(
+        layout_row.addWidget(QLabel("排版审校"))
+        self.vision_combo = QComboBox()
+        self.vision_combo.setToolTip(
             "翻译完成后，用多模态 Vision 模型逐页审校排版。\n"
             "自动发现文字溢出、位置偏移、字号过小等问题并修正。\n"
-            "需要 VISION_MODEL_ID 配置（如 doubao-1.5-vision-pro-32k）。\n"
             "会增加额外的 API 调用成本。"
         )
-        vision_id = Config.VISION_MODEL_ID
-        self.layout_check.setEnabled(bool(vision_id))
-        if not vision_id:
-            self.layout_check.setText("排版审校（未配置 Vision 模型）")
-        layout_row.addWidget(self.layout_check)
+        self.vision_combo.addItem("关闭", "__off__")
+        vision_models = Config.get_vision_models()
+        for name, mid in vision_models.items():
+            self.vision_combo.addItem(f"✅ {name}", mid)
+        layout_row.addWidget(self.vision_combo, 1)
         sg_layout.addLayout(layout_row)
 
         left_layout.addWidget(settings_group)
@@ -835,7 +835,8 @@ class MainWindow(QMainWindow):
         self._apply_log_level(log_level)
 
         # 排版审校
-        vision_model = Config.VISION_MODEL_ID if self.layout_check.isChecked() else None
+        vision_choice = self.vision_combo.currentData()
+        vision_model = None if vision_choice == "__off__" else vision_choice
 
         self._append_log(f"初翻模型: {draft_model}", "info")
         self._append_log(f"审校模型: {review_model or '跳过'}", "info")
@@ -963,7 +964,7 @@ class MainWindow(QMainWindow):
         self.batch_spin.setEnabled(not running)
         self.worker_spin.setEnabled(not running)
         self.log_combo.setEnabled(not running)
-        self.layout_check.setEnabled(not running and bool(Config.VISION_MODEL_ID))
+        self.vision_combo.setEnabled(not running)
         self.format_panel.setEnabled(not running)
 
     def _apply_log_level(self, level_name: str):
