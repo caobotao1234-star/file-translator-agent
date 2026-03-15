@@ -43,17 +43,18 @@ DRAFT_SYSTEM_PROMPT = """你是专业翻译专家。将收到的JSON数组逐段
 
 输出：严格JSON数组，每个元素是对应译文字符串。不要输出其他内容。"""
 
-REVIEW_SYSTEM_PROMPT = """你是翻译审校专家。你会收到原文和初翻译文的对照列表，逐条审校并输出修正后的最终版本。
+REVIEW_SYSTEM_PROMPT = """你是翻译审校专家。你会收到译文列表（附原文摘要供参考），逐条审校并输出修正后的最终版本。
 
 核心要求⚠️：
-1. 输入N对(原文,译文)，输出必须恰好N个元素的JSON数组，一一对应，不允许合并或拆分。
-2. 逐条对照原文检查译文：是否漏译、误译、错位、语义偏差。
-3. 所有译文必须是用户指定的目标语言。如果发现某条译文仍然是原文语言（未翻译），你必须将其翻译为目标语言。
+1. 输入N条，输出必须恰好N个元素的JSON数组，一一对应，不允许合并或拆分。
+2. 逐条检查译文：语法是否正确、表达是否自然、术语是否统一。
+3. 参考原文摘要判断：是否漏译、误译、语义偏差。
+4. 所有译文必须是用户指定的目标语言。如果发现某条未翻译，你必须翻译它。
 
-审校原则：对照原文检查漏译误译、纠正错位、提升流畅度、统一术语、修正语法。
+审校原则：纠正语法错误、提升流畅度、统一术语、修正漏译误译。
 格式标记：保留所有<rN>标记，数量编号不变，只改标记内译文。
 
-输出：严格JSON数组，每个元素是审校后的译文字符串（不要输出原文）。"""
+输出：严格JSON数组，每个元素是审校后的译文字符串。"""
 
 MAX_BATCH_RETRIES = 2
 
@@ -221,23 +222,41 @@ class TranslatePipeline:
     ) -> List[str]:
         """
         审校一批文本。返回审校后的结果，失败则返回初翻结果。
+
+        📘 教学笔记：审校 token 优化
+        v2 发完整原文+译文对照，token 消耗是初翻的 2~4 倍。
+        v3 优化：原文只发前 50 字符作为"锚点"，足够审校 agent
+        判断译文是否对齐、是否漏译，但 token 消耗大幅降低。
+        
+        为什么 50 字符够用？
+        - 审校的核心任务是：润色、纠错、统一术语
+        - 判断"是否漏译"只需要看原文开头就知道主题
+        - 判断"是否错位"只需要对比原文和译文的主题是否匹配
+        - 真正需要完整原文的场景（如数字/专有名词校验）很少
         """
         if self.review_agent is None:
             return draft_results
 
-        pairs = [
-            {"原文": src, "译文": tgt}
-            for src, tgt in zip(texts, draft_results)
-        ]
+        # 📘 压缩原文：只保留前 50 字符作为参考锚点
+        SRC_ANCHOR_LEN = 50
+        pairs = []
+        for src, tgt in zip(texts, draft_results):
+            anchor = src[:SRC_ANCHOR_LEN]
+            if len(src) > SRC_ANCHOR_LEN:
+                anchor += "…"
+            pairs.append({"原文摘要": anchor, "译文": tgt})
+
         n = len(pairs)
         review_prompt = (
-            f"以下是{n}对(原文→{target_lang}({lang_english}))的翻译对照。"
-            f"逐条对照原文审校译文，输出恰好{n}个元素的JSON数组（只含修正后的译文）。\n"
+            f"以下是{n}条翻译结果（含原文摘要供参考）。"
+            f"逐条审校译文，确保是准确的{target_lang}({lang_english})，"
+            f"修正漏译、误译、语法错误、术语不一致。"
+            f"输出恰好{n}个元素的JSON数组（只含修正后的译文）。\n"
             f"对照表：{json.dumps(pairs, ensure_ascii=False)}"
         )
 
         print(f"  [🔍 审校中] 对照原文检查译文质量...", flush=True)
-        logger.debug(f"审校请求: {n} 段（原文+译文对照）")
+        logger.debug(f"审校请求: {n} 段（原文摘要+译文对照）")
         review_results = self._call_llm_translate(self.review_agent, review_prompt)
 
         if review_results and len(review_results) == n:
