@@ -129,18 +129,22 @@ def write_pdf(
     output_path: str,
     format_engine: FormatEngine,
     source_path: str = None,
+    layout_overrides: Dict[str, dict] = None,
 ):
     """
     基于原 PDF 生成翻译后的文件。
 
-    📘 v4 策略：
+    📘 v4.2 策略：
     1. Redaction 用原始 bbox + fill=False（透明，不产生白底）
     2. 写入严格用原始 bbox（不扩展，保持排版）
     3. insert_htmlbox + scale_low=0 自动缩小字号适配
-    4. 清理 <rN> 标记
+    4. 清理 <rN> 标记和泄漏的角色标签
+    5. 支持 layout_overrides：排版审校 Agent 可以指定字号覆盖
     """
     if not source_path:
         raise ValueError("source_path is required")
+    if layout_overrides is None:
+        layout_overrides = {}
 
     logger.info(f"开始生成 PDF: {output_path}")
     doc = fitz.open(source_path)
@@ -188,6 +192,12 @@ def write_pdf(
             font_size = fmt["font_size"]
             font_color_hex = fmt["font_color"]
             bold = fmt.get("bold", False)
+
+            # 📘 v4.2: 排版审校 Agent 可以覆盖字号
+            override = layout_overrides.get(key, {})
+            if "fontsize" in override:
+                font_size = override["fontsize"]
+                logger.debug(f"应用字号覆盖 key={key}: {fmt['font_size']}pt → {font_size}pt")
 
             mapped_font = format_engine.resolve_font(font_name)
             display_font = mapped_font or font_name

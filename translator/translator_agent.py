@@ -189,47 +189,49 @@ class TranslatorAgent:
             write_pdf(parsed_data, translations, output_path, self.format_engine,
                       source_path=input_path)
 
-        # 4. 排版审校（Vision 模型看图找问题 → 精简译文 → 重新写入）
-        # 📘 教学笔记：排版审校是"写入→看图→修改→重写"的循环
-        # 第一次写入后，渲染成图片让 Vision 模型审校。
-        # 如果发现问题，精简译文后重新写入（第二次写入）。
-        # 只做一轮审校，避免无限循环和过高成本。
+        # 4. 排版审校（Vision 模型看图+数据 → 下达调整指令 → 重新写入）
+        # 📘 教学笔记：排版审校 v2
+        # Vision 模型同时接收图片和结构化数据（bbox、字号、可用空间），
+        # 可以下达两种指令：精简译文（shorten）和调整字号（resize）。
+        # 返回 layout_overrides 字典，writer 写入时按指令调整字号。
         if self.layout_agent and not was_stopped:
+            layout_overrides = {}
             layout_modified = False
-            old_count = len(translations)
+
             if ext == ".pdf":
-                # 📘 记录修改前的译文快照，用于判断是否有变化
                 snapshot = dict(translations)
-                translations = self.layout_agent.review_pdf_layout(
+                translations, layout_overrides = self.layout_agent.review_pdf_layout(
                     source_path=input_path,
                     translated_path=output_path,
                     parsed_data=parsed_data,
                     translations=translations,
                 )
-                layout_modified = any(
-                    translations.get(k) != snapshot.get(k) for k in translations
+                layout_modified = (
+                    bool(layout_overrides)
+                    or any(translations.get(k) != snapshot.get(k) for k in translations)
                 )
             elif ext == ".pptx":
                 snapshot = dict(translations)
-                translations = self.layout_agent.review_pptx_layout(
+                translations, layout_overrides = self.layout_agent.review_pptx_layout(
                     source_path=input_path,
                     translated_path=output_path,
                     parsed_data=parsed_data,
                     translations=translations,
                 )
-                layout_modified = any(
-                    translations.get(k) != snapshot.get(k) for k in translations
+                layout_modified = (
+                    bool(layout_overrides)
+                    or any(translations.get(k) != snapshot.get(k) for k in translations)
                 )
 
-            # 📘 如果排版审校修改了译文，需要重新写入
+            # 📘 如果排版审校有任何修改（译文或字号），重新写入
             if layout_modified:
-                print(f"[📝 重新写入] 应用排版修正后的译文...", flush=True)
+                print(f"[📝 重新写入] 应用排版修正...", flush=True)
                 if ext == ".pptx":
                     write_pptx(parsed_data, translations, output_path, self.format_engine,
                                source_path=input_path)
                 else:  # .pdf
                     write_pdf(parsed_data, translations, output_path, self.format_engine,
-                              source_path=input_path)
+                              source_path=input_path, layout_overrides=layout_overrides)
 
         # 5. COM 增强：处理图表/文本框/SmartArt（仅 Word）
         # 📘 教学笔记：PPT 的文本框/SmartArt 已经被 python-pptx 处理了

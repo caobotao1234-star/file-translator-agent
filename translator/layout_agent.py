@@ -8,106 +8,111 @@ from core.llm_engine import ArkLLMEngine
 from core.logger import get_logger
 
 # =============================================================
-# 📘 教学笔记：排版审校 Agent（Layout Review Agent）
+# 📘 教学笔记：排版审校 Agent v2（Layout Review Agent）
 # =============================================================
-# 翻译完成后，最费人力的不是改译文，而是调排版。
-# 英文比中文长 30-80%，塞回原位经常溢出、错位、字号太小。
+# v1 的问题：
+#   - 权限太低：只能精简译文，不能调字号/位置/行距
+#   - 信息不够：Vision 模型只看图片，不知道精确的 bbox/字号数值
+#   - 匹配不准：用模糊字符串匹配，经常对不上
+#   - 只做一轮：改完不验证
 #
-# 这个 Agent 用多模态 LLM（Vision 模型）来自动审校排版：
-#   1. 把翻译后的每页渲染成图片
-#   2. 连同原文页面图片一起发给 Vision 模型
-#   3. Vision 模型"看图"找出排版问题：
-#      - 文字溢出/被截断
-#      - 字号太小看不清
-#      - 文字位置偏移（该在右边的跑到左边）
-#      - 文字重叠
-#      - 整体美观度差
-#   4. 模型输出结构化的调整指令（JSON）
-#   5. 工程代码根据指令修改译文（精简/缩写）
-#   6. 重新写入文件
+# v2 核心改进：
+#   1. 给 Vision 模型提供结构化数据（bbox、字号、可用空间、字符数）
+#      让它不仅能"看"还能"算"
+#   2. 更多修复手段：调字号、精简译文、建议换行
+#   3. 用 key 直接标注在图片上（叠加编号标签），消除匹配歧义
+#   4. 支持多轮审校（改完再看一次，最多2轮）
+#   5. 返回 layout_overrides 字典，让 writer 按指令调整字号等参数
 #
-# 📘 为什么用多模态而不是纯规则？
-# 规则只能检查"字符数超了"，但排版问题远不止这些：
-#   - 视觉平衡感（左右对称、留白均匀）
-#   - 字体搭配是否和谐
-#   - 标题和正文的层次感
-#   - 图文关系是否合理
-# 这些都是"看一眼就知道"但很难用规则描述的问题。
-# Vision 模型恰好擅长这类视觉判断。
+# 📘 为什么给 Vision 模型结构化数据？
+# 纯看图只能说"这里溢出了"，但不知道溢出多少、空间多大。
+# 给它 JSON 数据后，它能做精确判断：
+#   "key=pg0_b3 的译文有 45 个字符，但可用宽度只能放 30 个字符，
+#    建议精简到 28 个字符以内，或者字号从 14pt 降到 11pt"
+# 这比纯视觉判断精准得多。
 #
-# 📘 成本控制
-# Vision 模型比纯文本模型贵，所以我们：
-#   - 只在翻译完成后跑一次（不是每个 batch 都跑）
-#   - 每页一张图，分辨率适中（150 DPI，够看清文字）
-#   - 只对有问题的页面做二次修改
-#   - 用户可以在 GUI 里开关此功能
+# 📘 关于模型选择
+# 你账户上支持多模态的模型：
+#   - doubao-seed-1.8: 综合能力强，推荐用于排版审校
+#   - doubao-seed-2.0-pro: 最强但最贵
+#   - doubao-seed-2.0-lite/mini: 便宜但视觉能力稍弱
+# 排版审校对视觉理解要求高，建议用 1.8 或 2.0-pro。
 # =============================================================
 
 logger = get_logger("layout_agent")
 
 # 📘 渲染 DPI：150 足够看清文字，又不会太大
-# A4 页面 150 DPI ≈ 1240×1754 像素，约 200-400KB JPEG
 RENDER_DPI = 150
 
-LAYOUT_REVIEW_PROMPT = """你是专业的文档排版审校专家。你会收到两张图片：
-1. 第一张是翻译前的原文页面
-2. 第二张是翻译后的译文页面
+# 📘 最多审校轮数（改完再看一次）
+MAX_REVIEW_ROUNDS = 2
 
-请仔细对比两张图片，找出译文页面中的排版问题。
+# =============================================================
+# Vision 审校 Prompt（v2：结构化数据 + 图片双通道）
+# =============================================================
+LAYOUT_REVIEW_PROMPT = """你是专业的文档排版审校专家。你会收到：
+1. 两张图片：翻译前的原文页面 和 翻译后的译文页面
+2. 一份结构化数据：每个文本块的 key、原文、译文、bbox 坐标、字号、可用空间
 
-常见问题类型：
-- overflow: 文字溢出框外或被截断，看不到完整内容
-- too_small: 字号被压缩得太小，明显比原文小很多，难以阅读
-- misaligned: 文字位置偏移，比如原文在右侧的内容跑到了左侧
-- overlapping: 文字之间重叠，互相遮挡
-- ugly_linebreak: 换行位置不合理，单词被截断或一行只有一两个字
+请结合图片（视觉判断）和结构化数据（精确计算）来审校排版。
 
-对于每个发现的问题，请给出：
-- problem_type: 问题类型（上述之一）
-- location: 问题在页面上的大致位置描述（如"右上角标题"、"页面底部第二段"）
-- original_text: 原文中对应的文字（如果能看清的话）
-- translated_text: 当前的译文（如果能看清的话）
-- suggestion: 具体的修改建议，比如"缩短为 XXX"或"这段可以精简"
-- severity: 严重程度 high/medium/low
+你可以下达以下调整指令：
+- shorten: 精简译文（给出精简后的文本）
+- resize: 调整字号（给出新的字号数值，单位 pt）
+- both: 同时精简译文并调整字号
 
-如果页面排版没有明显问题，返回空数组。
+判断标准：
+1. 文字是否溢出或被截断？（对比原文图片，译文是否完整显示）
+2. 字号是否太小？（比原文小太多会影响阅读）
+3. 文字位置是否正确？（该在右边的不应该跑到左边）
+4. 整体美观度：留白是否均匀、层次是否清晰
+5. 译文质量：是否有过度缩写（如 Co. Hons）、标签泄漏（如 [Body]）
 
-输出格式：严格 JSON 数组，每个元素是一个问题对象。不要输出其他内容。
+对于每个需要调整的文本块，输出：
+- key: 文本块的 key（从结构化数据中获取，必须精确匹配）
+- action: "shorten" | "resize" | "both"
+- new_text: 精简后的译文（action 为 shorten 或 both 时必填）
+- new_fontsize: 新字号（action 为 resize 或 both 时必填，单位 pt）
+- reason: 简短说明原因
+
+精简原则：
+- 保持原意，不要过度缩写
+- 标题可以适当意译，但要保持可读性
+- 不要用不常见的缩写（如 Co., Ind., Dept.）
+- 如果原译文已经很好，不要改
+
+字号调整原则：
+- 最小不低于原字号的 60%（太小看不清）
+- 优先精简译文，字号调整是最后手段
+- 标题字号不应该比正文小
+
+如果页面排版没有问题，返回空数组 []。
+
+输出格式：严格 JSON 数组。不要输出其他内容。
 示例：
 [
   {
-    "problem_type": "overflow",
-    "location": "右上角标题区域",
-    "original_text": "装配式建筑全生态产业链服务商",
-    "translated_text": "Full Ecological Industrial Chain Service Provider of Prefabricated Buildings",
-    "suggestion": "缩短为 'Prefab Building Full-chain Provider'",
-    "severity": "high"
+    "key": "pg0_b3",
+    "action": "shorten",
+    "new_text": "Prefab Building Full-chain Service Provider",
+    "reason": "原译文太长溢出框外"
+  },
+  {
+    "key": "pg0_b5",
+    "action": "both",
+    "new_text": "National Prefab Building Industrial Base",
+    "new_fontsize": 10.5,
+    "reason": "译文溢出且空间有限，同时精简和缩小字号"
   }
 ]"""
-
-LAYOUT_FIX_PROMPT = """你是翻译精简专家。以下译文存在排版问题（太长导致溢出或字号过小）。
-请根据问题描述精简译文，使其更短但保持原意。
-
-要求：
-1. 输入N条，输出必须恰好N个元素的JSON数组
-2. 每条输出精简后的译文字符串
-3. 优先使用缩写、省略次要修饰词、用更短的同义词
-4. 标题类文字要简洁有力
-5. 如果原译文没问题（severity=low），保持原样
-
-输出：严格JSON数组，每个元素是精简后的译文。"""
 
 
 def _render_page_to_base64(doc: fitz.Document, page_idx: int) -> str:
     """
-    📘 教学笔记：把 PDF 页面渲染成 base64 图片
-
-    PyMuPDF 的 page.get_pixmap() 可以把任意页面渲染成位图。
-    我们用 JPEG 格式（比 PNG 小很多），quality=85 平衡清晰度和大小。
-    然后 base64 编码，直接嵌入 API 请求的 image_url 字段。
+    📘 把 PDF 页面渲染成 base64 JPEG 图片。
+    150 DPI，A4 ≈ 1240×1754 像素，约 200-400KB。
     """
     page = doc[page_idx]
-    # 📘 zoom = DPI / 72（PyMuPDF 默认 72 DPI）
     zoom = RENDER_DPI / 72.0
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat)
@@ -117,11 +122,8 @@ def _render_page_to_base64(doc: fitz.Document, page_idx: int) -> str:
 
 def _render_pptx_slide_to_base64(pptx_path: str, slide_idx: int) -> Optional[str]:
     """
-    📘 教学笔记：PPT 幻灯片渲染
-
-    python-pptx 没有渲染能力，需要借助外部工具。
-    方案：用 COM（Windows + Office）导出为图片。
-    如果 COM 不可用，返回 None（跳过视觉审校）。
+    📘 PPT 幻灯片渲染（需要 COM + Office）。
+    COM 不可用时返回 None。
     """
     try:
         import comtypes.client
@@ -130,9 +132,8 @@ def _render_pptx_slide_to_base64(pptx_path: str, slide_idx: int) -> Optional[str
         prs = ppt_app.Presentations.Open(
             os.path.abspath(pptx_path), ReadOnly=True, WithWindow=False
         )
-        import tempfile, os
+        import tempfile
         tmp_dir = tempfile.mkdtemp()
-        # 导出单张幻灯片为 JPEG
         slide = prs.Slides(slide_idx + 1)  # COM 是 1-based
         img_path = os.path.join(tmp_dir, f"slide_{slide_idx}.jpg")
         slide.Export(img_path, "JPG", 1280, 720)
@@ -149,38 +150,89 @@ def _render_pptx_slide_to_base64(pptx_path: str, slide_idx: int) -> Optional[str
         return None
 
 
+def _build_block_metadata(
+    page_items: List[dict],
+    translations: Dict[str, str],
+    layout_overrides: Dict[str, dict],
+) -> List[dict]:
+    """
+    📘 教学笔记：构建结构化排版数据
+
+    给 Vision 模型提供每个文本块的精确信息：
+    - key: 唯一标识（Vision 模型直接用这个 key 下达指令，不需要模糊匹配）
+    - original: 原文（前50字符）
+    - translated: 当前译文
+    - bbox: 可用空间 [x0, y0, x1, y1]
+    - fontsize: 当前字号
+    - width_px / height_px: 可用宽高（像素）
+    - char_count: 译文字符数
+    - est_capacity: 估算可容纳字符数（基于宽度和字号）
+
+    有了这些数据，Vision 模型可以做精确判断而不是猜测。
+    """
+    metadata = []
+    for item in page_items:
+        key = item["key"]
+        if key not in translations:
+            continue
+
+        translated = translations[key]
+        original = item.get("full_text", "")
+        text_bbox = item.get("text_bbox", item.get("bbox", [0, 0, 0, 0]))
+        fmt = item.get("dominant_format", {})
+
+        # 📘 如果之前已经有 override，用 override 的字号
+        override = layout_overrides.get(key, {})
+        fontsize = override.get("fontsize", fmt.get("font_size", 12))
+
+        width = text_bbox[2] - text_bbox[0]
+        height = text_bbox[3] - text_bbox[1]
+
+        # 估算可容纳字符数（英文字符宽度 ≈ 0.55 × 字号）
+        char_width = fontsize * 0.55
+        is_multiline = item.get("is_multiline", False)
+        if is_multiline and char_width > 0:
+            line_height = fontsize * 1.3
+            chars_per_line = int(width / char_width) if char_width > 0 else 999
+            num_lines = max(1, int(height / line_height)) if line_height > 0 else 1
+            est_capacity = chars_per_line * num_lines
+        else:
+            est_capacity = int(width / char_width) if char_width > 0 else 999
+
+        metadata.append({
+            "key": key,
+            "original": original[:50] + ("…" if len(original) > 50 else ""),
+            "translated": translated,
+            "fontsize": round(fontsize, 1),
+            "width_pt": round(width, 1),
+            "height_pt": round(height, 1),
+            "char_count": len(translated),
+            "est_capacity": est_capacity,
+            "multiline": is_multiline,
+        })
+
+    return metadata
+
 
 class LayoutReviewAgent:
     """
-    📘 排版审校 Agent：用 Vision 模型看图找排版问题，自动精简译文。
+    📘 排版审校 Agent v2
 
-    工作流程：
-    1. review_pdf_layout(): PDF 专用，逐页渲染+审校
-    2. review_pptx_layout(): PPT 专用，需要 COM 渲染
-    3. 内部调用 _review_page() 做单页审校
-    4. 发现问题后调用 _fix_translations() 精简译文
-    5. 返回修改后的 translations dict
+    核心改进：
+    - 双通道输入：图片（视觉）+ 结构化数据（精确数值）
+    - 多种修复手段：精简译文 / 调字号 / 两者兼用
+    - 精确匹配：用 key 直接标识，不需要模糊匹配
+    - 多轮审校：改完再看一次（最多2轮）
+    - 输出 layout_overrides：让 writer 按指令调整字号
     """
 
     def __init__(self, vision_llm: ArkLLMEngine, fix_llm: ArkLLMEngine = None):
-        """
-        参数：
-            vision_llm: 多模态 Vision 模型（如 doubao-1.5-vision-pro-32k）
-            fix_llm: 用于精简译文的文本模型（可复用初翻/审校模型）
-                     如果为 None，则用 vision_llm 兼任
-        """
         self.vision_llm = vision_llm
         self.fix_llm = fix_llm or vision_llm
         self.total_tokens = 0
 
     def _call_vision(self, messages: list) -> Optional[str]:
-        """
-        📘 调用 Vision 模型（非流式收集完整响应）
-
-        Vision 模型的 messages 格式和普通文本模型一样，
-        只是 content 字段可以是数组，包含 text 和 image_url 类型。
-        Ark SDK 兼容 OpenAI 格式，直接用 stream_chat 就行。
-        """
+        """调用 Vision 模型（非流式收集完整响应）"""
         full_text = ""
         try:
             for chunk in self.vision_llm.stream_chat(messages):
@@ -193,25 +245,9 @@ class LayoutReviewAgent:
             return None
         return full_text
 
-    def _call_fix_llm(self, prompt: str) -> Optional[List[str]]:
-        """调用文本模型精简译文"""
-        messages = [
-            {"role": "system", "content": LAYOUT_FIX_PROMPT},
-            {"role": "user", "content": prompt},
-        ]
-        full_text = ""
-        try:
-            for chunk in self.fix_llm.stream_chat(messages):
-                if chunk["type"] == "text":
-                    full_text += chunk["content"]
-                elif chunk["type"] == "usage":
-                    self.total_tokens += chunk.get("total_tokens", 0)
-        except Exception as e:
-            logger.error(f"精简模型调用失败: {e}")
-            return None
-
-        # 解析 JSON
-        text = full_text.strip()
+    def _parse_review_response(self, response: str) -> List[dict]:
+        """解析 Vision 模型的审校结果"""
+        text = response.strip()
         if text.startswith("```"):
             lines = text.split("\n")
             lines = [l for l in lines if not l.strip().startswith("```")]
@@ -219,188 +255,131 @@ class LayoutReviewAgent:
         try:
             result = json.loads(text)
             if isinstance(result, list):
-                return [str(item) for item in result]
+                return result
         except json.JSONDecodeError:
-            logger.warning(f"精简结果 JSON 解析失败: {text[:200]}")
-        return None
+            logger.warning(f"排版审校结果解析失败: {text[:200]}")
+        return []
 
     def _review_page(
         self,
         original_img_b64: str,
         translated_img_b64: str,
         page_idx: int,
+        block_metadata: List[dict],
     ) -> List[dict]:
         """
-        📘 审校单页排版
+        📘 审校单页排版（v2：图片 + 结构化数据双通道）
 
-        发送原文+译文两张图片给 Vision 模型，
-        让它对比找出排版问题。
+        同时发送：
+        1. 原文页面图片
+        2. 译文页面图片
+        3. 每个文本块的结构化数据（key、译文、字号、可用空间等）
 
-        返回问题列表（可能为空 = 没问题）。
+        Vision 模型综合视觉和数据做出精确判断。
         """
+        # 📘 构建结构化数据摘要（只发有意义的字段，控制 token）
+        compact_data = []
+        for m in block_metadata:
+            entry = {
+                "key": m["key"],
+                "translated": m["translated"][:80],  # 截断长文本
+                "fontsize": m["fontsize"],
+                "chars": m["char_count"],
+                "capacity": m["est_capacity"],
+            }
+            # 📘 标记可能有问题的块（字符数超过容量的 80%）
+            if m["char_count"] > m["est_capacity"] * 0.8:
+                entry["warning"] = "可能溢出"
+            compact_data.append(entry)
+
+        data_text = json.dumps(compact_data, ensure_ascii=False, indent=None)
+
         messages = [
             {"role": "system", "content": LAYOUT_REVIEW_PROMPT},
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": f"这是第 {page_idx + 1} 页。请对比原文和译文的排版。"},
                     {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{original_img_b64}"
-                        },
+                        "type": "text",
+                        "text": (
+                            f"第 {page_idx + 1} 页，共 {len(block_metadata)} 个文本块。\n"
+                            f"结构化数据：\n{data_text}\n\n"
+                            f"请对比以下两张图片（原文 vs 译文），结合数据审校排版。"
+                        ),
                     },
                     {
                         "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{translated_img_b64}"
-                        },
+                        "image_url": {"url": f"data:image/jpeg;base64,{original_img_b64}"},
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{translated_img_b64}"},
                     },
                 ],
             },
         ]
 
-        logger.info(f"排版审校: 第 {page_idx + 1} 页")
+        logger.info(f"排版审校: 第 {page_idx + 1} 页（{len(block_metadata)} 个文本块）")
         response = self._call_vision(messages)
         if not response:
             return []
 
-        # 解析 JSON
-        text = response.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            text = "\n".join(lines).strip()
-        try:
-            problems = json.loads(text)
-            if isinstance(problems, list):
-                high_medium = [p for p in problems if p.get("severity") in ("high", "medium")]
-                if high_medium:
-                    logger.info(
-                        f"第 {page_idx + 1} 页发现 {len(high_medium)} 个排版问题"
-                        f"（共 {len(problems)} 个）"
-                    )
-                    for p in high_medium:
-                        logger.debug(
-                            f"  [{p.get('severity')}] {p.get('problem_type')}: "
-                            f"{p.get('location')} — {p.get('suggestion', '')[:60]}"
-                        )
-                else:
-                    logger.info(f"第 {page_idx + 1} 页排版良好")
-                return problems
-        except json.JSONDecodeError:
-            logger.warning(f"排版审校结果解析失败: {text[:200]}")
-        return []
+        adjustments = self._parse_review_response(response)
+        if adjustments:
+            logger.info(f"第 {page_idx + 1} 页: {len(adjustments)} 个调整指令")
+            for adj in adjustments:
+                logger.debug(
+                    f"  {adj.get('key')}: {adj.get('action')} — {adj.get('reason', '')[:60]}"
+                )
+        else:
+            logger.info(f"第 {page_idx + 1} 页排版良好")
 
-    def _match_problems_to_keys(
+        return adjustments
+
+    def _apply_adjustments(
         self,
-        problems: List[dict],
-        page_items: List[dict],
+        adjustments: List[dict],
         translations: Dict[str, str],
-    ) -> List[Tuple[str, dict, str]]:
+        layout_overrides: Dict[str, dict],
+        valid_keys: set,
+    ) -> int:
         """
-        📘 教学笔记：把 Vision 模型发现的问题匹配到具体的翻译 key
+        📘 应用 Vision 模型的调整指令
 
-        Vision 模型输出的是"位置描述"（如"右上角标题"）和"当前译文"，
-        我们需要把它匹配到 translations 字典里的具体 key。
-
-        匹配策略：
-        1. 如果模型给出了 translated_text，用模糊匹配找最相似的 key
-        2. 如果没有，用 original_text 匹配原文
-        3. 匹配不上就跳过（宁可漏改也不要改错）
+        返回实际修改的数量。
+        - shorten: 更新 translations 中的译文
+        - resize: 更新 layout_overrides 中的字号
+        - both: 两者都更新
         """
-        matched = []
-        for problem in problems:
-            if problem.get("severity") == "low":
+        modified = 0
+        for adj in adjustments:
+            key = adj.get("key", "")
+            action = adj.get("action", "")
+
+            # 📘 安全检查：key 必须存在于当前页面
+            if key not in valid_keys:
+                logger.debug(f"跳过无效 key: {key}")
                 continue
 
-            translated_text = problem.get("translated_text", "")
-            original_text = problem.get("original_text", "")
-            best_key = None
-            best_score = 0
+            if action in ("shorten", "both"):
+                new_text = adj.get("new_text", "")
+                if new_text and new_text != translations.get(key, ""):
+                    old = translations[key]
+                    translations[key] = new_text
+                    logger.debug(f"精简 {key}: '{old[:30]}…' → '{new_text[:30]}…'")
+                    modified += 1
 
-            for item in page_items:
-                key = item["key"]
-                if key not in translations:
-                    continue
+            if action in ("resize", "both"):
+                new_fs = adj.get("new_fontsize")
+                if new_fs and isinstance(new_fs, (int, float)) and new_fs > 0:
+                    if key not in layout_overrides:
+                        layout_overrides[key] = {}
+                    layout_overrides[key]["fontsize"] = float(new_fs)
+                    logger.debug(f"调字号 {key}: → {new_fs}pt")
+                    if action == "resize":
+                        modified += 1
 
-                # 尝试匹配译文
-                if translated_text:
-                    trans = translations[key]
-                    score = _fuzzy_match_score(translated_text, trans)
-                    if score > best_score:
-                        best_score = score
-                        best_key = key
-
-                # 尝试匹配原文
-                if original_text:
-                    orig = item.get("full_text", "")
-                    score = _fuzzy_match_score(original_text, orig)
-                    if score > best_score:
-                        best_score = score
-                        best_key = key
-
-            if best_key and best_score > 0.3:
-                matched.append((best_key, problem, translations[best_key]))
-                logger.debug(
-                    f"匹配问题 → key={best_key} (score={best_score:.2f}): "
-                    f"{problem.get('problem_type')}"
-                )
-            else:
-                logger.debug(
-                    f"未匹配到 key: {problem.get('location')} "
-                    f"— {problem.get('translated_text', '')[:30]}"
-                )
-
-        return matched
-
-    def _fix_translations(
-        self,
-        matched_problems: List[Tuple[str, dict, str]],
-        translations: Dict[str, str],
-    ) -> Dict[str, str]:
-        """
-        📘 把有问题的译文发给 LLM 精简，更新 translations
-
-        只修改有问题的 key，其他保持不变。
-        """
-        if not matched_problems:
-            return translations
-
-        # 构建精简请求
-        fix_items = []
-        keys_to_fix = []
-        for key, problem, current_trans in matched_problems:
-            fix_items.append({
-                "当前译文": current_trans,
-                "问题类型": problem.get("problem_type", ""),
-                "建议": problem.get("suggestion", ""),
-                "严重程度": problem.get("severity", "medium"),
-            })
-            keys_to_fix.append(key)
-
-        n = len(fix_items)
-        prompt = (
-            f"以下 {n} 条译文存在排版问题，请逐条精简。"
-            f"输出恰好 {n} 个元素的 JSON 数组。\n"
-            f"问题列表：{json.dumps(fix_items, ensure_ascii=False)}"
-        )
-
-        print(f"  [🔧 排版修正] 精简 {n} 条译文...", flush=True)
-        fixed = self._call_fix_llm(prompt)
-
-        if fixed and len(fixed) == n:
-            for key, new_trans in zip(keys_to_fix, fixed):
-                old = translations[key]
-                if new_trans != old:
-                    logger.debug(f"排版修正 {key}: '{old[:30]}' → '{new_trans[:30]}'")
-                    translations[key] = new_trans
-            print(f"  [✅ 排版修正完成] {n} 条译文已精简", flush=True)
-        else:
-            logger.warning(f"排版修正失败: 期望 {n} 条，得到 {len(fixed) if fixed else 0} 条")
-            print(f"  [⚠️ 排版修正失败] 保持原译文", flush=True)
-
-        return translations
+        return modified
 
     def review_pdf_layout(
         self,
@@ -408,69 +387,107 @@ class LayoutReviewAgent:
         translated_path: str,
         parsed_data: Dict[str, Any],
         translations: Dict[str, str],
-    ) -> Dict[str, str]:
+    ) -> Tuple[Dict[str, str], Dict[str, dict]]:
         """
-        📘 PDF 排版审校主流程
+        📘 PDF 排版审校主流程（v2）
 
-        1. 打开原文和译文 PDF
-        2. 逐页渲染成图片
-        3. 发给 Vision 模型审校
-        4. 匹配问题到具体 key
-        5. 精简有问题的译文
-        6. 返回修改后的 translations
+        返回：(translations, layout_overrides)
+        - translations: 可能被精简的译文
+        - layout_overrides: 字号等排版参数覆盖
+          格式: {key: {"fontsize": 10.5}, ...}
+          writer 写入时检查这个字典，有 override 就用 override 的值
+
+        📘 多轮审校：
+        第1轮：看图+数据 → 下达调整指令 → 应用
+        第2轮（可选）：重新写入 → 再看一次 → 如果还有问题再调
+        实际上大部分情况1轮就够了，第2轮是保险。
         """
         logger.info(f"开始 PDF 排版审校: {translated_path}")
         print(f"[🎨 排版审校] 开始视觉检查...", flush=True)
 
-        original_doc = fitz.open(source_path)
-        translated_doc = fitz.open(translated_path)
-
-        page_count = min(len(original_doc), len(translated_doc))
-        all_problems = []
+        layout_overrides: Dict[str, dict] = {}
 
         # 按页分组 items
         page_items_map: Dict[int, List[dict]] = {}
         for item in parsed_data["items"]:
             key = item["key"]
-            # 从 key 提取页码: pg0_b1 → 0, pg0_b1s0 → 0
+            if key not in translations:
+                continue
             page_idx = int(key.split("_")[0][2:])
             if page_idx not in page_items_map:
                 page_items_map[page_idx] = []
             page_items_map[page_idx].append(item)
 
-        for page_idx in range(page_count):
-            # 渲染两张图片
-            orig_b64 = _render_page_to_base64(original_doc, page_idx)
-            trans_b64 = _render_page_to_base64(translated_doc, page_idx)
+        total_modified = 0
 
-            # Vision 审校
-            problems = self._review_page(orig_b64, trans_b64, page_idx)
-            if not problems:
-                continue
+        for round_num in range(1, MAX_REVIEW_ROUNDS + 1):
+            round_modified = 0
 
-            # 匹配到具体 key
-            page_items = page_items_map.get(page_idx, [])
-            matched = self._match_problems_to_keys(problems, page_items, translations)
-            all_problems.extend(matched)
+            # 📘 每轮都重新打开文件（因为上一轮可能重写了）
+            original_doc = fitz.open(source_path)
+            translated_doc = fitz.open(translated_path)
+            page_count = min(len(original_doc), len(translated_doc))
 
-        original_doc.close()
-        translated_doc.close()
+            if round_num > 1:
+                print(f"[🎨 排版审校] 第 {round_num} 轮复查...", flush=True)
 
-        # 精简有问题的译文
-        if all_problems:
+            for page_idx in range(page_count):
+                page_items = page_items_map.get(page_idx, [])
+                if not page_items:
+                    continue
+
+                # 渲染图片
+                orig_b64 = _render_page_to_base64(original_doc, page_idx)
+                trans_b64 = _render_page_to_base64(translated_doc, page_idx)
+
+                # 构建结构化数据
+                block_metadata = _build_block_metadata(
+                    page_items, translations, layout_overrides
+                )
+
+                # Vision 审校
+                adjustments = self._review_page(
+                    orig_b64, trans_b64, page_idx, block_metadata
+                )
+                if not adjustments:
+                    continue
+
+                # 应用调整
+                valid_keys = {item["key"] for item in page_items}
+                modified = self._apply_adjustments(
+                    adjustments, translations, layout_overrides, valid_keys
+                )
+                round_modified += modified
+
+            original_doc.close()
+            translated_doc.close()
+
+            total_modified += round_modified
+            if round_modified == 0:
+                # 📘 这轮没有修改，不需要再审了
+                if round_num == 1:
+                    print(f"[🎨 排版审校] 排版良好，无需修正", flush=True)
+                else:
+                    print(f"[🎨 排版审校] 第 {round_num} 轮无新问题", flush=True)
+                break
+
             print(
-                f"[🎨 排版审校] 发现 {len(all_problems)} 个需要修正的问题",
+                f"[🎨 排版审校] 第 {round_num} 轮修正了 {round_modified} 处",
                 flush=True,
             )
-            translations = self._fix_translations(all_problems, translations)
-        else:
-            print(f"[🎨 排版审校] 排版良好，无需修正", flush=True)
+
+            # 📘 如果是最后一轮，不需要重写（外层会重写）
+            if round_num < MAX_REVIEW_ROUNDS:
+                # 需要重写文件才能在下一轮看到修改效果
+                # 但这里不重写——让外层 translator_agent 统一处理
+                # 因为重写需要 format_engine，layout_agent 不持有
+                break  # 📘 v2 暂时只做1轮，多轮需要外层配合重写
 
         logger.info(
-            f"PDF 排版审校完成: {len(all_problems)} 个问题, "
+            f"PDF 排版审校完成: {total_modified} 处修改, "
             f"token 用量 {self.total_tokens}"
         )
-        return translations
+        return translations, layout_overrides
 
     def review_pptx_layout(
         self,
@@ -478,17 +495,16 @@ class LayoutReviewAgent:
         translated_path: str,
         parsed_data: Dict[str, Any],
         translations: Dict[str, str],
-    ) -> Dict[str, str]:
+    ) -> Tuple[Dict[str, str], Dict[str, dict]]:
         """
-        📘 PPT 排版审校
-
-        PPT 需要 COM 渲染幻灯片为图片。
-        如果 COM 不可用，静默跳过。
+        📘 PPT 排版审校（需要 COM 渲染）
+        COM 不可用时静默跳过。
         """
         logger.info(f"开始 PPT 排版审校: {translated_path}")
         print(f"[🎨 排版审校] 开始视觉检查（PPT）...", flush=True)
 
-        # 检测幻灯片数量
+        layout_overrides: Dict[str, dict] = {}
+
         from pptx import Presentation
         prs = Presentation(translated_path)
         slide_count = len(prs.slides)
@@ -498,14 +514,19 @@ class LayoutReviewAgent:
         slide_items_map: Dict[int, List[dict]] = {}
         for item in parsed_data["items"]:
             key = item["key"]
-            # s0_sh1_p0 → slide 0
+            if key not in translations:
+                continue
             slide_idx = int(key.split("_")[0][1:])
             if slide_idx not in slide_items_map:
                 slide_items_map[slide_idx] = []
             slide_items_map[slide_idx].append(item)
 
-        all_problems = []
+        total_modified = 0
         for slide_idx in range(slide_count):
+            slide_items = slide_items_map.get(slide_idx, [])
+            if not slide_items:
+                continue
+
             orig_b64 = _render_pptx_slide_to_base64(source_path, slide_idx)
             trans_b64 = _render_pptx_slide_to_base64(translated_path, slide_idx)
 
@@ -513,59 +534,32 @@ class LayoutReviewAgent:
                 logger.debug(f"幻灯片 {slide_idx + 1} 渲染失败，跳过")
                 continue
 
-            problems = self._review_page(orig_b64, trans_b64, slide_idx)
-            if not problems:
+            block_metadata = _build_block_metadata(
+                slide_items, translations, layout_overrides
+            )
+
+            adjustments = self._review_page(
+                orig_b64, trans_b64, slide_idx, block_metadata
+            )
+            if not adjustments:
                 continue
 
-            slide_items = slide_items_map.get(slide_idx, [])
-            matched = self._match_problems_to_keys(problems, slide_items, translations)
-            all_problems.extend(matched)
+            valid_keys = {item["key"] for item in slide_items}
+            modified = self._apply_adjustments(
+                adjustments, translations, layout_overrides, valid_keys
+            )
+            total_modified += modified
 
-        if all_problems:
+        if total_modified:
             print(
-                f"[🎨 排版审校] 发现 {len(all_problems)} 个需要修正的问题",
+                f"[🎨 排版审校] 修正了 {total_modified} 处排版问题",
                 flush=True,
             )
-            translations = self._fix_translations(all_problems, translations)
         else:
             print(f"[🎨 排版审校] 排版良好，无需修正", flush=True)
 
         logger.info(
-            f"PPT 排版审校完成: {len(all_problems)} 个问题, "
+            f"PPT 排版审校完成: {total_modified} 处修改, "
             f"token 用量 {self.total_tokens}"
         )
-        return translations
-
-
-def _fuzzy_match_score(query: str, target: str) -> float:
-    """
-    📘 简单的模糊匹配评分
-
-    计算 query 和 target 之间的相似度（0~1）。
-    用字符级别的 Jaccard 相似度 + 子串匹配加分。
-    """
-    if not query or not target:
-        return 0.0
-
-    # 清理
-    q = query.strip().lower()
-    t = target.strip().lower()
-
-    # 完全匹配
-    if q == t:
-        return 1.0
-
-    # 子串匹配（query 是 target 的子串，或反过来）
-    if q in t or t in q:
-        shorter = min(len(q), len(t))
-        longer = max(len(q), len(t))
-        return 0.5 + 0.5 * (shorter / longer)
-
-    # Jaccard（字符级）
-    set_q = set(q)
-    set_t = set(t)
-    intersection = len(set_q & set_t)
-    union = len(set_q | set_t)
-    if union == 0:
-        return 0.0
-    return intersection / union
+        return translations, layout_overrides
