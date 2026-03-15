@@ -39,7 +39,9 @@ logging.addLevelName(TRACE, "TRACE")
 
 def _trace(self, message, *args, **kwargs):
     if self.isEnabledFor(TRACE):
-        self._log(TRACE, message, *args, **kwargs)
+        # 📘 注意：Logger._log() 的签名是 _log(level, msg, args, ...)
+        # 第三个参数 args 是一个元组（不是 *args 展开），必须显式传递。
+        self._log(TRACE, message, args, **kwargs)
 
 
 # 给 Logger 类挂上 trace 方法，这样所有 logger 实例都能用 logger.trace(...)
