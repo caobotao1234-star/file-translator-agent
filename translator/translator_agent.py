@@ -45,6 +45,7 @@ class TranslatorAgent:
         draft_model_id: str = None,
         review_model_id: str = None,
         batch_size: int = 10,
+        max_workers: int = 1,
         debug: bool = False,
     ):
         """
@@ -52,6 +53,7 @@ class TranslatorAgent:
             draft_model_id: 初翻模型 ID（默认用 Config 中的模型）
             review_model_id: 审校模型 ID（为 None 则跳过审校）
             batch_size: 每批翻译的段落数
+            max_workers: 并行线程数（同时发多少个LLM请求）
             debug: 调试模式
         """
         self.debug = debug
@@ -69,6 +71,7 @@ class TranslatorAgent:
             draft_llm=self.router.get("draft"),
             review_llm=self.router.get("review"),
             batch_size=batch_size,
+            max_workers=max_workers,
             debug=debug,
         )
 

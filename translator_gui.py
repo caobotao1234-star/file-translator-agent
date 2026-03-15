@@ -69,12 +69,10 @@ class TranslateWorker(QThread):
         self.target_lang = target_lang
 
     def _emit_token_usage(self):
-        """📘 从 pipeline 的 draft/review Agent 中分别读取 token 用量"""
+        """📘 从 pipeline 的 Agent 池中汇总 token 用量"""
         pipeline = self.agent.pipeline
-        draft_t = pipeline.draft_agent.total_tokens
-        review_t = 0
-        if pipeline.review_agent:
-            review_t = pipeline.review_agent.total_tokens
+        draft_t = pipeline.total_draft_tokens
+        review_t = pipeline.total_review_tokens
         self.token_signal.emit(draft_t, review_t, draft_t + review_t)
 
     def run(self):
@@ -625,6 +623,20 @@ class MainWindow(QMainWindow):
         batch_row.addWidget(self.batch_spin, 1)
         sg_layout.addLayout(batch_row)
 
+        # 并行线程数
+        worker_row = QHBoxLayout()
+        worker_row.addWidget(QLabel("并行线程"))
+        self.worker_spin = QSpinBox()
+        self.worker_spin.setRange(1, 10)
+        self.worker_spin.setValue(1)
+        self.worker_spin.setSuffix(" 线程")
+        self.worker_spin.setToolTip(
+            "同时发多少个LLM请求。\n"
+            "1=串行，3~5=推荐，>5可能触发API限流"
+        )
+        worker_row.addWidget(self.worker_spin, 1)
+        sg_layout.addLayout(worker_row)
+
         # 日志级别
         log_row = QHBoxLayout()
         log_row.addWidget(QLabel("日志级别"))
@@ -789,6 +801,7 @@ class MainWindow(QMainWindow):
         draft_model = self.draft_combo.currentData()
         review_choice = self.review_combo.currentData()
         batch_size = self.batch_spin.value()
+        max_workers = self.worker_spin.value()
 
         # 确定审校模型
         if review_choice == "__skip__":
@@ -804,7 +817,7 @@ class MainWindow(QMainWindow):
 
         self._append_log(f"初翻模型: {draft_model}", "info")
         self._append_log(f"审校模型: {review_model or '跳过'}", "info")
-        self._append_log(f"目标语言: {target_lang}  |  批量: {batch_size}", "info")
+        self._append_log(f"目标语言: {target_lang}  |  批量: {batch_size}  |  线程: {max_workers}", "info")
         self._append_log(f"文件数: {len(files)}", "info")
         self._append_log("─" * 50, "info")
 
@@ -823,6 +836,7 @@ class MainWindow(QMainWindow):
                 draft_model_id=draft_model,
                 review_model_id=review_model,
                 batch_size=batch_size,
+                max_workers=max_workers,
                 debug=True,
             )
             # 📘 教学笔记：共享格式引擎
@@ -922,6 +936,7 @@ class MainWindow(QMainWindow):
         self.review_combo.setEnabled(not running)
         self.lang_combo.setEnabled(not running)
         self.batch_spin.setEnabled(not running)
+        self.worker_spin.setEnabled(not running)
         self.log_combo.setEnabled(not running)
         self.format_panel.setEnabled(not running)
 

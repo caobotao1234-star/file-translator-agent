@@ -1,7 +1,7 @@
 # translator/translate_pipeline.py
 import json
 import threading
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 from typing import Dict, Any, List, Optional, Tuple
 from core.agent import BaseAgent
 from core.llm_engine import ArkLLMEngine
@@ -9,22 +9,29 @@ from core.agent_config import AgentConfig
 from core.logger import get_logger
 
 # =============================================================
-# 📘 教学笔记：翻译流水线（Translation Pipeline v3 — 流水线并行）
+# 📘 教学笔记：翻译流水线（Translation Pipeline v4 — 多线程并行）
 # =============================================================
-# 高质量翻译流程：初翻 → 审校
+# v1~v2: 串行 → B1初翻→B1审校→B2初翻→B2审校
+# v3: 流水线 → [B1审校∥B2初翻]，2路并行
+# v4: 全并行 → N个线程同时跑，分两阶段：
+#   阶段1: 所有batch的初翻并行（N路同时发LLM请求）
+#   阶段2: 所有batch的审校并行（N路同时发LLM请求）
 #
-# v1~v2 是串行的：
-#   batch1 初翻 → batch1 审校 → batch2 初翻 → batch2 审校 → ...
-#   审校等待时间完全浪费。
+# 📘 为什么能多线程并行调LLM？
+# LLM调用本质是HTTP请求（I/O密集型），Python的GIL只限制CPU密集型并行。
+# 5个线程同时发5个HTTP请求，服务端会并行处理，完全没问题。
 #
-# v3 改为流水线并行（Pipeline Parallelism）：
-#   batch1 初翻 → [batch1 审校 + batch2 初翻] → [batch2 审校 + batch3 初翻] → ...
+# 📘 为什么每个线程需要独立的Agent？
+# _call_llm_translate会操作agent.memory（清空消息），
+# 多线程共享同一个Agent会互相覆盖memory。
+# 所以每个worker线程用自己的Agent实例，但共享同一个LLM engine
+# （HTTP client是线程安全的）。
 #
-# 原理：初翻和审校用不同的 Agent（不同的 LLM 引擎实例），
-# 它们之间没有共享状态，可以安全地在不同线程中并行执行。
-# 审校 batch N 的同时，初翻 batch N+1 已经在跑了。
-#
-# 效果：审校的耗时几乎被完全隐藏，总时间 ≈ 只有初翻的时间。
+# 📘 为什么分两阶段而不是初翻完一个立刻审校？
+# 分阶段更简单、更可控：
+#   - 阶段1全部完成后，所有初翻结果都在内存里
+#   - 阶段2可以安全地读取初翻结果，不需要复杂的依赖管理
+#   - 进度报告更清晰（初翻50%→100%→审校50%→100%）
 # =============================================================
 
 logger = get_logger("translate_pipeline")
@@ -61,29 +68,69 @@ MAX_BATCH_RETRIES = 2
 
 
 class TranslatePipeline:
-    """翻译流水线：初翻 → 审校，流水线并行。"""
+    """
+    翻译流水线：初翻 → 审校，多线程并行。
+
+    📘 教学笔记：max_workers 控制并行度
+    - max_workers=1: 串行（兼容模式，适合调试）
+    - max_workers=2: 等同于 v3 流水线（初翻+审校各1线程）
+    - max_workers=3~5: 推荐值，多batch并行，速度提升明显
+    - max_workers>5: 可能触发API限流，视服务端配额而定
+    """
 
     def __init__(
         self,
         draft_llm: ArkLLMEngine,
         review_llm: ArkLLMEngine = None,
         batch_size: int = 10,
+        max_workers: int = 1,
         debug: bool = False,
     ):
         self.batch_size = batch_size
+        self.max_workers = max(1, max_workers)
         self.debug = debug
         self.draft_llm = draft_llm
         self.review_llm = review_llm
 
         # 📘 教学笔记：优雅停止机制
-        # _stop_event 是一个线程安全的标志位。
-        # GUI 点"停止"时 set() 它，pipeline 在每个 batch 之间检查。
-        # 比 QThread.terminate() 安全得多——terminate 是强杀线程，
-        # 会导致已翻译的内容全部丢失。优雅停止则保留已完成的部分。
         self._stop_event = threading.Event()
 
+        # 📘 教学笔记：Agent 池
+        # 每个worker线程需要独立的Agent实例（memory不是线程安全的）。
+        # 但它们共享同一个LLM engine（HTTP client是线程安全的）。
+        # draft_agent / review_agent 保留为"主Agent"，用于token统计汇总。
         self.draft_agent = self._make_draft_agent()
         self.review_agent = self._make_review_agent()
+
+        # 额外的worker Agent（多线程时使用）
+        self._draft_pool: List[BaseAgent] = [self.draft_agent]
+        self._review_pool: List[BaseAgent] = [self.review_agent] if self.review_agent else []
+        for _ in range(self.max_workers - 1):
+            self._draft_pool.append(self._make_draft_agent())
+            if self.review_llm:
+                self._review_pool.append(self._make_review_agent())
+
+        # 📘 线程安全的Agent分配：用锁保护的索引
+        self._draft_lock = threading.Lock()
+        self._draft_idx = 0
+        self._review_lock = threading.Lock()
+        self._review_idx = 0
+
+    def _acquire_draft_agent(self) -> BaseAgent:
+        """线程安全地获取一个draft Agent"""
+        with self._draft_lock:
+            agent = self._draft_pool[self._draft_idx % len(self._draft_pool)]
+            self._draft_idx += 1
+            return agent
+
+    def _acquire_review_agent(self) -> Optional[BaseAgent]:
+        """线程安全地获取一个review Agent"""
+        if not self._review_pool:
+            return None
+        with self._review_lock:
+            agent = self._review_pool[self._review_idx % len(self._review_pool)]
+            self._review_idx += 1
+            return agent
 
     def request_stop(self):
         """请求停止翻译（线程安全，可从任意线程调用）"""
@@ -97,6 +144,16 @@ class TranslatePipeline:
     @property
     def is_stopped(self) -> bool:
         return self._stop_event.is_set()
+
+    @property
+    def total_draft_tokens(self) -> int:
+        """汇总所有draft Agent的token用量"""
+        return sum(a.total_tokens for a in self._draft_pool)
+
+    @property
+    def total_review_tokens(self) -> int:
+        """汇总所有review Agent的token用量"""
+        return sum(a.total_tokens for a in self._review_pool)
 
     def _make_draft_agent(self) -> BaseAgent:
         return BaseAgent(
@@ -161,17 +218,25 @@ class TranslatePipeline:
         texts: List[str],
         target_lang: str,
         lang_english: str,
+        agent: BaseAgent = None,
     ) -> List[str]:
         """
         初翻一批文本，带智能重试。返回长度 == len(texts) 的结果列表。
+        agent: 指定使用的Agent实例（多线程时每个线程用不同的Agent）
         """
         if not texts:
             return []
+
+        if agent is None:
+            agent = self._acquire_draft_agent()
 
         results = list(texts)  # 原文兜底
         pending_indices = list(range(len(texts)))
 
         for attempt in range(1 + MAX_BATCH_RETRIES):
+            if self._stop_event.is_set():
+                break
+
             pending_texts = [texts[i] for i in pending_indices]
             count = len(pending_texts)
 
@@ -190,7 +255,7 @@ class TranslatePipeline:
                 f"输入：{json.dumps(pending_texts, ensure_ascii=False)}"
             )
 
-            draft_results = self._call_llm_translate(self.draft_agent, draft_prompt)
+            draft_results = self._call_llm_translate(agent, draft_prompt)
 
             if draft_results and len(draft_results) == count:
                 for idx, translated in zip(pending_indices, draft_results):
@@ -203,7 +268,6 @@ class TranslatePipeline:
             if draft_results:
                 got = len(draft_results)
                 logger.warning(f"初翻结果数量不匹配: 期望 {count}，得到 {got}")
-
                 if got > count:
                     if attempt < MAX_BATCH_RETRIES:
                         logger.info(f"返回多了 {got}>{count}，整批重试")
@@ -240,25 +304,20 @@ class TranslatePipeline:
         draft_results: List[str],
         target_lang: str,
         lang_english: str,
+        agent: BaseAgent = None,
     ) -> List[str]:
         """
         审校一批文本。返回审校后的结果，失败则返回初翻结果。
 
         📘 教学笔记：审校 token 优化
-        v2 发完整原文+译文对照，token 消耗是初翻的 2~4 倍。
-        v3 优化：原文只发前 50 字符作为"锚点"，足够审校 agent
+        原文只发前 50 字符作为"锚点"，足够审校 agent
         判断译文是否对齐、是否漏译，但 token 消耗大幅降低。
-        
-        为什么 50 字符够用？
-        - 审校的核心任务是：润色、纠错、统一术语
-        - 判断"是否漏译"只需要看原文开头就知道主题
-        - 判断"是否错位"只需要对比原文和译文的主题是否匹配
-        - 真正需要完整原文的场景（如数字/专有名词校验）很少
         """
-        if self.review_agent is None:
+        if agent is None:
+            agent = self._acquire_review_agent()
+        if agent is None:
             return draft_results
 
-        # 📘 压缩原文：只保留前 50 字符作为参考锚点
         SRC_ANCHOR_LEN = 50
         pairs = []
         for src, tgt in zip(texts, draft_results):
@@ -278,7 +337,7 @@ class TranslatePipeline:
 
         print(f"  [🔍 审校中] 对照原文检查译文质量...", flush=True)
         logger.debug(f"审校请求: {n} 段（原文摘要+译文对照）")
-        review_results = self._call_llm_translate(self.review_agent, review_prompt)
+        review_results = self._call_llm_translate(agent, review_prompt)
 
         if review_results and len(review_results) == n:
             logger.debug(f"审校输出摘要: {[t[:30] for t in review_results[:3]]}{'...' if n > 3 else ''}")
@@ -318,21 +377,20 @@ class TranslatePipeline:
         on_progress=None,
     ) -> Dict[str, str]:
         """
-        翻译整个文档（流水线并行版）。
+        翻译整个文档（v4 多线程并行版）。
 
-        📘 教学笔记：流水线并行（Pipeline Parallelism）
-        
-        串行流程（v2）：
-          B1初翻 → B1审校 → B2初翻 → B2审校 → B3初翻 → B3审校
-          总时间 = N × (初翻时间 + 审校时间)
+        📘 教学笔记：两阶段多线程并行
 
-        流水线并行（v3）：
-          B1初翻 → [B1审校 ∥ B2初翻] → [B2审校 ∥ B3初翻] → B3审校
-          总时间 ≈ N × 初翻时间 + 1 × 审校时间
-          （审校时间几乎被完全隐藏，只有最后一批需要单独等审校）
+        阶段1 — 初翻（N路并行）：
+          线程1: B1初翻    线程2: B2初翻    线程3: B3初翻 ...
+          所有batch同时发LLM请求，服务端并行处理。
 
-        实现：用 ThreadPoolExecutor 在后台线程跑审校，
-        主线程继续跑下一批初翻。审校结果通过 Future 收集。
+        阶段2 — 审校（N路并行）：
+          线程1: B1审校    线程2: B2审校    线程3: B3审校 ...
+
+        总时间 ≈ ceil(batch数/N) × (单batch初翻 + 单batch审校)
+        对比v3: N × 单batch初翻 + 单batch审校
+        当N=5、4个batch时: v4≈1轮初翻+1轮审校, v3≈4轮初翻+1轮审校
         """
         to_translate = []
         for item in parsed_data["items"]:
@@ -342,7 +400,8 @@ class TranslatePipeline:
                 to_translate.append((item["key"], item["full_text"]))
 
         total = len(to_translate)
-        logger.info(f"开始翻译文档: {total} 个翻译单元，batch_size={self.batch_size}")
+        workers = self.max_workers
+        logger.info(f"开始翻译文档: {total} 个翻译单元, batch_size={self.batch_size}, workers={workers}")
 
         lang_hint = {
             "英文": "English", "中文": "Chinese", "日文": "Japanese",
@@ -359,73 +418,94 @@ class TranslatePipeline:
             batch_texts = [text for _, text in batch]
             batches.append((batch_keys, batch_texts))
 
+        num_batches = len(batches)
         translations = {}
-        completed = 0
+        draft_results_map: Dict[int, List[str]] = {}  # batch_idx -> draft results
         stopped_early = False
 
-        # 📘 流水线核心：用线程池跑审校，主线程跑初翻
-        # max_workers=1 因为审校只有一个 agent，不能并发多个审校
-        executor = ThreadPoolExecutor(max_workers=1)
-        pending_review: Optional[Tuple[Future, List[str], List[str]]] = None
-        # pending_review = (future, batch_keys, batch_texts)
+        # ============================================================
+        # 阶段1：初翻（多线程并行）
+        # ============================================================
+        print(f"  [🚀 阶段1] 初翻 {num_batches} 个批次（{workers} 线程并行）", flush=True)
+        completed_draft = 0
 
-        def _collect_review(future: Future, keys: List[str], texts: List[str]):
-            """收集审校结果并写入 translations"""
-            try:
-                reviewed = future.result()  # 阻塞等待审校完成
-                for j, key in enumerate(keys):
-                    translations[key] = reviewed[j] if j < len(reviewed) else texts[j]
-            except Exception as e:
-                logger.error(f"审校线程异常: {e}")
-                # 审校失败，用初翻结果（已经在 translations 里了）
-
-        for batch_idx, (batch_keys, batch_texts) in enumerate(batches):
-            # 📘 优雅停止检查点：每个 batch 开始前检查
-            if self._stop_event.is_set():
-                logger.info(f"用户请求停止，已完成 {completed}/{total}，跳过剩余批次")
-                stopped_early = True
-                break
-
-            logger.info(f"翻译进度: {completed}/{total}")
-
-            # ---- 初翻当前 batch ----
-            draft_results = self._draft_batch(batch_texts, target_lang, lang_english)
-
-            # 先把初翻结果写入（作为兜底，审校完成后会覆盖）
-            for j, key in enumerate(batch_keys):
-                translations[key] = draft_results[j] if j < len(draft_results) else batch_texts[j]
-
-            # ---- 收集上一批的审校结果（如果有）----
-            if pending_review is not None:
-                prev_future, prev_keys, prev_texts = pending_review
-                _collect_review(prev_future, prev_keys, prev_texts)
-                pending_review = None
-
-            # ---- 提交当前 batch 的审校到后台线程 ----
-            if self.review_agent is not None and not self._stop_event.is_set():
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            # 提交所有初翻任务
+            future_to_idx: Dict[Future, int] = {}
+            for batch_idx, (batch_keys, batch_texts) in enumerate(batches):
+                if self._stop_event.is_set():
+                    stopped_early = True
+                    break
+                agent = self._acquire_draft_agent()
                 future = executor.submit(
-                    self._review_batch,
-                    batch_texts, draft_results, target_lang, lang_english,
+                    self._draft_batch, batch_texts, target_lang, lang_english, agent,
                 )
-                pending_review = (future, batch_keys, batch_texts)
+                future_to_idx[future] = batch_idx
 
-            completed += len(batch_texts)
-            if on_progress:
-                on_progress(completed, total)
+            # 收集初翻结果（按完成顺序）
+            for future in as_completed(future_to_idx):
+                if self._stop_event.is_set():
+                    stopped_early = True
+                    break
+                batch_idx = future_to_idx[future]
+                batch_keys, batch_texts = batches[batch_idx]
+                try:
+                    draft_results = future.result()
+                    draft_results_map[batch_idx] = draft_results
+                    # 先写入初翻结果作为兜底
+                    for j, key in enumerate(batch_keys):
+                        translations[key] = draft_results[j] if j < len(draft_results) else batch_texts[j]
+                except Exception as e:
+                    logger.error(f"初翻批次 {batch_idx} 异常: {e}")
+                    # 异常时用原文兜底
+                    for j, key in enumerate(batch_keys):
+                        translations[key] = batch_texts[j]
+                    draft_results_map[batch_idx] = list(batch_texts)
 
-        # ---- 收集最后一批的审校结果 ----
-        if pending_review is not None:
-            prev_future, prev_keys, prev_texts = pending_review
-            if self._stop_event.is_set():
-                # 停止时不等审校，取消 future（如果还没开始）
-                prev_future.cancel()
-                # 如果已经在跑了，cancel() 不会中断它，但我们不等了
-                # 初翻结果已经在 translations 里作为兜底
-                logger.info("停止请求：跳过最后一批审校，使用初翻结果")
-            else:
-                _collect_review(prev_future, prev_keys, prev_texts)
+                completed_draft += len(batch_keys)
+                if on_progress:
+                    on_progress(completed_draft, total)
 
-        executor.shutdown(wait=not self._stop_event.is_set())
+        if stopped_early and not translations:
+            logger.info("用户在初翻阶段停止，无翻译结果")
+            return translations
+
+        # ============================================================
+        # 阶段2：审校（多线程并行）
+        # ============================================================
+        if self.review_agent is not None and not self._stop_event.is_set():
+            completed_batches = sorted(draft_results_map.keys())
+            review_count = len(completed_batches)
+            print(f"  [🚀 阶段2] 审校 {review_count} 个批次（{workers} 线程并行）", flush=True)
+
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_idx: Dict[Future, int] = {}
+                for batch_idx in completed_batches:
+                    if self._stop_event.is_set():
+                        stopped_early = True
+                        break
+                    batch_keys, batch_texts = batches[batch_idx]
+                    draft_results = draft_results_map[batch_idx]
+                    agent = self._acquire_review_agent()
+                    future = executor.submit(
+                        self._review_batch,
+                        batch_texts, draft_results, target_lang, lang_english, agent,
+                    )
+                    future_to_idx[future] = batch_idx
+
+                for future in as_completed(future_to_idx):
+                    if self._stop_event.is_set():
+                        stopped_early = True
+                        break
+                    batch_idx = future_to_idx[future]
+                    batch_keys, batch_texts = batches[batch_idx]
+                    try:
+                        reviewed = future.result()
+                        for j, key in enumerate(batch_keys):
+                            translations[key] = reviewed[j] if j < len(reviewed) else translations.get(key, batch_texts[j])
+                    except Exception as e:
+                        logger.error(f"审校批次 {batch_idx} 异常: {e}")
+                        # 审校失败，保留初翻结果（已在translations里）
 
         if stopped_early:
             logger.info(f"文档翻译被中断: 已完成 {len(translations)}/{total} 个翻译单元")
