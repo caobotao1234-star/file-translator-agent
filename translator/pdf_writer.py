@@ -195,7 +195,10 @@ def write_pdf(
                 redact_rect = fitz.Rect(sub_bbox) + (-1, -1, 1, 1)
                 page.add_redact_annot(redact_rect, text="", fill=False)
 
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+        page.apply_redactions(
+            images=fitz.PDF_REDACT_IMAGE_NONE,
+            graphics=fitz.PDF_REDACT_LINE_ART_NONE,  # 📘 不删除矢量图形（保护图标/线条）
+        )
 
         # ---- 第二步：写入译文（严格原位）----
         for info in block_info_list:

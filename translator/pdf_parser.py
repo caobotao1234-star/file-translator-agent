@@ -38,6 +38,9 @@ logger = get_logger("pdf_parser")
 
 HEADER_FOOTER_RATIO = 0.06
 MIN_TEXT_LENGTH = 2
+# 📘 太小的文本块可能是图标/Logo 内嵌文字，跳过
+# 面积 < 此阈值（pt²）的块不翻译
+MIN_BLOCK_AREA = 100  # 约 10x10 pt
 
 
 def _extract_span_format(span: dict) -> Dict[str, Any]:
@@ -130,17 +133,13 @@ def _should_merge(block_a: dict, block_b: dict) -> bool:
     """
     📘 教学笔记：判断两个相邻 Block 是否应该合并为同一段落。
 
-    PDF 把同一段话按行拆成多个 Block 是常见现象。
-    判断依据：
-    1. 字体/字号/颜色一致（同一段落格式通常一致）
-    2. 垂直距离小（B 的顶部紧接 A 的底部，间距 < 行高 * 1.5）
-    3. 水平位置有重叠（同一列的文字，x 范围有交集）
-    4. A 的文本不以句号/问号/感叹号等结尾（结尾标点说明是完整句子）
-
-    不合并的情况：
-    - 标题和正文（字号不同）
-    - 不同列的文字（x 范围无交集）
-    - 两段独立的话（A 以句号结尾）
+    合并条件（全部满足才合并）：
+    1. 字体/字号/颜色/粗体一致
+    2. 垂直距离小（紧挨着的行）
+    3. 水平位置有重叠（同一列）
+    4. A 的文本不以终止标点结尾
+    5. A 不是纯数字/短文本（避免目录页码被合并）
+    6. 两个块都不是"短独立块"（如图标文字、标签）
     """
     fmt_a = block_a["dominant_format"]
     fmt_b = block_b["dominant_format"]
@@ -164,21 +163,37 @@ def _should_merge(block_a: dict, block_b: dict) -> bool:
     line_height = fmt_a["font_size"] * 1.5
     vertical_gap = bbox_b[1] - bbox_a[3]  # B.y0 - A.y1
     if vertical_gap < -2 or vertical_gap > line_height:
-        # 负值太大说明 B 在 A 上面（不是"下一行"）
-        # 正值太大说明间距太远（不是同一段）
         return False
 
     # 条件 5：水平位置有重叠（同一列）
     x_overlap = min(bbox_a[2], bbox_b[2]) - max(bbox_a[0], bbox_b[0])
     min_width = min(bbox_a[2] - bbox_a[0], bbox_b[2] - bbox_b[0])
     if min_width > 0 and x_overlap / min_width < 0.3:
-        # 水平重叠不到 30%，说明不在同一列
         return False
 
     # 条件 6：A 的文本不以终止标点结尾
     text_a = block_a["full_text"].rstrip()
     if text_a and text_a[-1] in "。！？.!?；;：:）)】」》":
         return False
+
+    # 📘 条件 7：A 不是纯数字/短独立文本
+    # 目录页的 "02" "03" 是独立数字块，不应该和后面的标题合并。
+    # 判断：文本去掉空白后长度 <= 4 且主要是数字/标点
+    stripped_a = text_a.replace(" ", "").replace("\n", "")
+    if len(stripped_a) <= 4:
+        digit_count = sum(1 for c in stripped_a if c.isdigit() or c in ".%-")
+        if digit_count >= len(stripped_a) * 0.5:
+            return False
+
+    # 📘 条件 8：两个块的宽度差异不能太大
+    # 如果 A 很窄（如数字 "02"）而 B 很宽（如 "公司简介"），
+    # 说明它们是并排的独立元素，不是同一段落的续行。
+    width_a = bbox_a[2] - bbox_a[0]
+    width_b = bbox_b[2] - bbox_b[0]
+    if min(width_a, width_b) > 0:
+        width_ratio = max(width_a, width_b) / min(width_a, width_b)
+        if width_ratio > 5:
+            return False
 
     return True
 
@@ -276,6 +291,13 @@ def parse_pdf(filepath: str) -> Dict[str, Any]:
             clean_text = full_text.strip()
 
             if not clean_text or len(clean_text) < MIN_TEXT_LENGTH:
+                skipped_short += 1
+                continue
+
+            # 📘 跳过面积太小的块（可能是图标/Logo 内嵌文字）
+            block_w = block_bbox[2] - block_bbox[0]
+            block_h = block_bbox[3] - block_bbox[1]
+            if block_w * block_h < MIN_BLOCK_AREA:
                 skipped_short += 1
                 continue
 
