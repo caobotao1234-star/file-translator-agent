@@ -1,7 +1,6 @@
 __pycache__/
 chat_history/
 logs/
-translator_config/
 output/
 *.docx
 *.pptx

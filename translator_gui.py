@@ -631,7 +631,7 @@ class MainWindow(QMainWindow):
         worker_row.addWidget(QLabel("并行线程"))
         self.worker_spin = QSpinBox()
         self.worker_spin.setRange(1, 10)
-        self.worker_spin.setValue(1)
+        self.worker_spin.setValue(5)
         self.worker_spin.setSuffix(" 线程")
         self.worker_spin.setToolTip(
             "同时发多少个LLM请求。\n"
