@@ -49,6 +49,15 @@ DRAFT_SYSTEM_PROMPT = """你是专业翻译专家。将收到的JSON数组逐段
 必须：保留所有标记，数量编号与原文一致，只翻译标记内文字。
 例："<r0>关键：</r0><r1>说明文字</r1>" → "<r0>Key: </r0><r1>Description text</r1>"
 
+排版感知规则：
+- 每段文字可能附带[角色]和[限N字符]提示。
+- [标题/口号]类文字：用简洁有力的表达，优先精简，不要逐字直译。
+- [图注/标签]类文字：极度精简，能省则省。
+- [限N字符]：译文长度尽量不超过N个字符（含空格），超出会导致排版溢出。
+  如果直译超长，请用缩写、精简表达或省略次要修饰词来控制长度。
+  宁可稍微意译也不要超长。
+- 没有标注的段落按正常翻译处理。
+
 输出：严格JSON数组，每个元素是对应译文字符串。不要输出其他内容。"""
 
 REVIEW_SYSTEM_PROMPT = """你是翻译审校专家。你会收到译文列表（附原文摘要供参考），逐条审校并输出修正后的最终版本。
@@ -62,9 +71,226 @@ REVIEW_SYSTEM_PROMPT = """你是翻译审校专家。你会收到译文列表（
 审校原则：纠正语法错误、提升流畅度、统一术语、修正漏译误译。
 格式标记：保留所有<rN>标记，数量编号不变，只改标记内译文。
 
+排版审校：
+- 如果某条译文附带了[限N字符]提示但明显超长，请精简到限制以内。
+- [标题/口号]类译文应简洁有力，避免冗长。
+- 保持全文术语一致性（同一个专有名词在不同段落应翻译一致）。
+
 输出：严格JSON数组，每个元素是审校后的译文字符串。"""
 
 MAX_BATCH_RETRIES = 2
+
+# =============================================================
+# 📘 教学笔记：上下文感知翻译（Context-Aware Translation）
+# =============================================================
+# 之前的翻译是"盲翻"——LLM 只看到一批纯文本，不知道：
+#   - 这段文字是标题还是正文？
+#   - 它在页面上占多大空间？译文能放得下吗？
+#   - 整个文档是什么类型？（宣传册 vs 技术文档 vs 合同）
+#
+# 上下文感知的核心改进：
+#   1. 文本角色标注：parser 给每个 item 标记 text_role
+#      (title/subtitle/caption/label/body)
+#   2. 长度约束：根据原文占据的空间估算译文最大字符数
+#      中→英通常膨胀 1.5~2 倍，但空间不变，所以需要控制长度
+#   3. 页面上下文：告诉 LLM 这批文字来自哪一页、文档类型
+#
+# 这些信息通过 prompt 传递给 LLM，不需要新 Agent，
+# 只是让现有的初翻/审校 Agent 做出更好的决策。
+# =============================================================
+
+
+def _classify_text_role(item: dict) -> str:
+    """
+    📘 教学笔记：自动分类文本角色
+
+    根据 item 的元数据推断它在文档中的角色：
+    - title: 大字号、粗体、短文本 → 标题/口号
+    - subtitle: 中等字号、较短 → 副标题
+    - caption: 在图片附近的短文本 → 图注/标签
+    - label: 极短文本（<10字符）→ 标签/编号
+    - body: 其他 → 正文
+
+    分类结果用于 prompt 中的角色提示，让 LLM 调整翻译风格。
+    """
+    text = item.get("full_text", "")
+    clean_text = text.replace("\n", "").strip()
+    char_count = len(clean_text)
+
+    # 获取格式信息
+    fmt = item.get("dominant_format", {})
+    font_size = fmt.get("font_size", 12)
+    bold = fmt.get("bold", False)
+
+    # PPT/Word 的样式名也是线索
+    style_name = ""
+    if "style" in item:
+        style_name = (item["style"].get("style_name") or "").lower()
+
+    item_type = item.get("type", "")
+
+    # 规则 1：样式名包含 title/heading → 标题
+    if any(kw in style_name for kw in ("title", "heading", "标题")):
+        return "title"
+
+    # 规则 2：极短文本 → 标签
+    if char_count <= 8:
+        return "label"
+
+    # 规则 3：PDF 大字号 + 粗体 + 短文本 → 标题
+    if item_type == "pdf_block":
+        if font_size >= 16 and char_count < 30:
+            return "title"
+        if font_size >= 14 and bold and char_count < 50:
+            return "title"
+        if font_size >= 12 and char_count < 20:
+            return "caption"
+
+    # 规则 4：PPT 短文本通常是标题/标签
+    if item_type == "slide_text":
+        if char_count < 20:
+            return "caption"
+        if char_count < 40 and bold:
+            return "title"
+
+    # 规则 5：短文本（10~30字符）→ 副标题/图注
+    if char_count <= 30:
+        return "subtitle"
+
+    return "body"
+
+
+def _estimate_max_chars(item: dict, target_lang: str) -> Optional[int]:
+    """
+    📘 教学笔记：估算译文最大字符数
+
+    根据原文在页面上占据的空间，估算目标语言译文的最大字符数。
+    核心逻辑：
+    - PDF: 有 text_bbox，可以精确计算可用宽度 / 目标字号
+    - PPT/Word: 没有精确 bbox，用原文字符数 × 膨胀系数估算
+
+    中→英膨胀系数约 1.5~2.0（中文1个字≈2个英文字母宽度，
+    但英文单词比中文字多），我们用 1.8 作为安全上限。
+
+    返回 None 表示不限制（正文段落通常不需要限制）。
+    """
+    text = item.get("full_text", "")
+    clean_text = text.replace("\n", "").strip()
+    char_count = len(clean_text)
+    item_type = item.get("type", "")
+
+    # 📘 正文段落（>80字符）通常不需要长度限制
+    # 因为正文有足够的空间换行，不会溢出
+    if char_count > 80:
+        return None
+
+    # PDF: 用 text_bbox 精确估算
+    if item_type == "pdf_block":
+        text_bbox = item.get("text_bbox", item.get("bbox"))
+        if text_bbox:
+            width = text_bbox[2] - text_bbox[0]
+            height = text_bbox[3] - text_bbox[1]
+            font_size = item.get("dominant_format", {}).get("font_size", 12)
+            is_multiline = item.get("is_multiline", False)
+
+            if is_multiline:
+                # 多行文本：可用面积 / 每字符面积
+                # 英文字符宽度 ≈ 0.5 × 字号，行高 ≈ 1.3 × 字号
+                char_width = font_size * 0.5
+                line_height = font_size * 1.3
+                if char_width > 0 and line_height > 0:
+                    chars_per_line = int(width / char_width)
+                    num_lines = max(1, int(height / line_height))
+                    return chars_per_line * num_lines
+            else:
+                # 单行文本：可用宽度 / 字符宽度
+                char_width = font_size * 0.5
+                if char_width > 0:
+                    return int(width / char_width)
+
+    # PPT/Word: 用膨胀系数估算
+    # 📘 中→英膨胀系数 1.8，但标题类要更严格（1.3）
+    # 因为标题空间通常很紧凑
+    role = item.get("text_role", "body")
+    if role in ("title", "subtitle", "caption", "label"):
+        factor = 1.3
+    else:
+        factor = 1.8
+
+    # 只对短文本（<80字符）做限制
+    if target_lang in ("英文", "法文", "德文", "西班牙文"):
+        return int(char_count * factor)
+
+    return None
+
+
+def _build_context_hint(items: List[dict], doc_type: str) -> str:
+    """
+    📘 教学笔记：构建页面上下文提示
+
+    给 LLM 一段简短的上下文描述，帮助它理解这批文字的来源：
+    - 文档类型（PDF宣传册/PPT演示/Word文档）
+    - 当前页码/幻灯片号
+    - 这批文字的角色分布（几个标题、几个正文等）
+
+    这段提示加在翻译 prompt 的开头，不影响 JSON 输出格式。
+    """
+    doc_type_names = {
+        "pdf_block": "PDF文档（可能是宣传册/手册）",
+        "slide_text": "PPT演示文稿",
+        "paragraph": "Word文档",
+        "table_cell": "表格",
+    }
+
+    # 统计角色分布
+    role_counts = {}
+    pages = set()
+    for item in items:
+        role = item.get("text_role", "body")
+        role_counts[role] = role_counts.get(role, 0) + 1
+        key = item.get("key", "")
+        if key.startswith("pg"):
+            # PDF: pg0_b1 → page 0
+            pages.add(key.split("_")[0])
+        elif key.startswith("s"):
+            # PPT: s0_sh1_p0 → slide 0
+            pages.add(key.split("_")[0])
+
+    type_name = doc_type_names.get(doc_type, "文档")
+    role_desc = "、".join(f"{v}个{k}" for k, v in role_counts.items())
+    page_desc = f"（来自 {', '.join(sorted(pages))}）" if pages else ""
+
+    return f"[文档类型: {type_name}] [本批内容{page_desc}: {role_desc}]"
+
+
+def _enrich_text_for_prompt(text: str, item: dict) -> str:
+    """
+    📘 教学笔记：给翻译文本附加角色和长度提示
+
+    在原文前面加上角色标签和长度限制，例如：
+      "[标题][限30字符] 装配式建筑全生态产业链服务商"
+      "[正文] 东方建科代表案例：河南省直青年人才公寓..."
+
+    LLM 会根据这些提示调整翻译风格和长度。
+    提示用中括号包裹，不会和原文混淆。
+    """
+    role = item.get("text_role", "body")
+    max_chars = item.get("max_chars")
+
+    role_labels = {
+        "title": "标题/口号",
+        "subtitle": "副标题",
+        "caption": "图注/标签",
+        "label": "标签",
+        "body": "正文",
+    }
+    label = role_labels.get(role, "正文")
+
+    prefix = f"[{label}]"
+    if max_chars and role != "body":
+        prefix += f"[限{max_chars}字符]"
+
+    return f"{prefix} {text}"
 
 
 class TranslatePipeline:
@@ -219,16 +445,35 @@ class TranslatePipeline:
         target_lang: str,
         lang_english: str,
         agent: BaseAgent = None,
+        items: List[dict] = None,
     ) -> List[str]:
         """
         初翻一批文本，带智能重试。返回长度 == len(texts) 的结果列表。
         agent: 指定使用的Agent实例（多线程时每个线程用不同的Agent）
+        items: 对应的 parsed item 列表（用于上下文感知翻译）
         """
         if not texts:
             return []
 
         if agent is None:
             agent = self._acquire_draft_agent()
+
+        results = list(texts)  # 原文兜底
+        pending_indices = list(range(len(texts)))
+
+        # 📘 教学笔记：构建上下文感知的翻译输入
+        # 如果有 items 元数据，给每段文本附加角色和长度提示。
+        # LLM 看到的输入从 "装配式建筑" 变成 "[标题][限30字符] 装配式建筑"，
+        # 这样它就知道要用简洁的翻译风格，并控制长度。
+        has_context = items is not None and len(items) == len(texts)
+        if has_context:
+            enriched_texts = [_enrich_text_for_prompt(t, it) for t, it in zip(texts, items)]
+            # 构建页面上下文提示
+            doc_type = items[0].get("type", "paragraph") if items else "paragraph"
+            context_hint = _build_context_hint(items, doc_type)
+        else:
+            enriched_texts = texts
+            context_hint = ""
 
         results = list(texts)  # 原文兜底
         pending_indices = list(range(len(texts)))
@@ -252,8 +497,12 @@ class TranslatePipeline:
                 f"将以下{count}个段落翻译成{target_lang}({lang_english})。"
                 f"必须输出恰好{count}个元素的JSON数组，一一对应。"
                 f"每一段都必须输出{target_lang}，不允许保留原文语言。\n"
-                f"输入：{json.dumps(pending_texts, ensure_ascii=False)}"
             )
+            if context_hint:
+                draft_prompt += f"{context_hint}\n"
+            # 📘 用 enriched_texts（带角色/长度提示）而不是原始 texts
+            prompt_texts = [enriched_texts[i] for i in pending_indices] if has_context else pending_texts
+            draft_prompt += f"输入：{json.dumps(prompt_texts, ensure_ascii=False)}"
 
             draft_results = self._call_llm_translate(agent, draft_prompt)
 
@@ -305,13 +554,15 @@ class TranslatePipeline:
         target_lang: str,
         lang_english: str,
         agent: BaseAgent = None,
+        items: List[dict] = None,
     ) -> List[str]:
         """
         审校一批文本。返回审校后的结果，失败则返回初翻结果。
 
-        📘 教学笔记：审校 token 优化
+        📘 教学笔记：审校 token 优化 + 上下文感知
         原文只发前 50 字符作为"锚点"，足够审校 agent
         判断译文是否对齐、是否漏译，但 token 消耗大幅降低。
+        新增：附带角色和长度提示，让审校也能控制译文长度。
         """
         if agent is None:
             agent = self._acquire_review_agent()
@@ -319,12 +570,23 @@ class TranslatePipeline:
             return draft_results
 
         SRC_ANCHOR_LEN = 50
+        has_context = items is not None and len(items) == len(texts)
         pairs = []
-        for src, tgt in zip(texts, draft_results):
+        for idx, (src, tgt) in enumerate(zip(texts, draft_results)):
             anchor = src[:SRC_ANCHOR_LEN]
             if len(src) > SRC_ANCHOR_LEN:
                 anchor += "…"
-            pairs.append({"原文摘要": anchor, "译文": tgt})
+            pair = {"原文摘要": anchor, "译文": tgt}
+            # 📘 附加角色和长度提示给审校
+            if has_context:
+                item = items[idx]
+                role = item.get("text_role", "body")
+                max_chars = item.get("max_chars")
+                if role != "body":
+                    pair["角色"] = role
+                if max_chars and role != "body":
+                    pair["限字符"] = max_chars
+            pairs.append(pair)
 
         n = len(pairs)
         review_prompt = (
@@ -392,12 +654,36 @@ class TranslatePipeline:
         对比v3: N × 单batch初翻 + 单batch审校
         当N=5、4个batch时: v4≈1轮初翻+1轮审校, v3≈4轮初翻+1轮审校
         """
+        # 📘 教学笔记：上下文感知预处理
+        # 在翻译前，给每个 item 标注文本角色和长度约束。
+        # 这些元数据会被 _enrich_text_for_prompt 用来构建增强 prompt。
+        for item in parsed_data["items"]:
+            if item.get("is_empty"):
+                continue
+            if not item.get("text_role"):
+                item["text_role"] = _classify_text_role(item)
+            if item.get("max_chars") is None:
+                item["max_chars"] = _estimate_max_chars(item, target_lang)
+
+        # 📘 TRACE 日志：显示角色分类结果
+        role_stats = {}
+        for item in parsed_data["items"]:
+            if item.get("is_empty"):
+                continue
+            role = item.get("text_role", "body")
+            role_stats[role] = role_stats.get(role, 0) + 1
+        if role_stats:
+            logger.log(5, f"文本角色分类: {role_stats}")  # TRACE level = 5
+
         to_translate = []
+        # 📘 保存 item 引用，后续构建 prompt 时需要元数据
+        item_map: Dict[str, dict] = {}
         for item in parsed_data["items"]:
             if item.get("is_empty"):
                 continue
             if item.get("full_text"):
                 to_translate.append((item["key"], item["full_text"]))
+                item_map[item["key"]] = item
 
         total = len(to_translate)
         workers = self.max_workers
@@ -411,12 +697,13 @@ class TranslatePipeline:
         lang_english = lang_hint.get(target_lang, target_lang)
 
         # 切分所有 batch
-        batches: List[Tuple[List[str], List[str]]] = []  # (keys, texts)
+        batches: List[Tuple[List[str], List[str], List[dict]]] = []  # (keys, texts, items)
         for i in range(0, total, self.batch_size):
             batch = to_translate[i:i + self.batch_size]
             batch_keys = [key for key, _ in batch]
             batch_texts = [text for _, text in batch]
-            batches.append((batch_keys, batch_texts))
+            batch_items = [item_map[key] for key in batch_keys]
+            batches.append((batch_keys, batch_texts, batch_items))
 
         num_batches = len(batches)
         translations = {}
@@ -432,13 +719,14 @@ class TranslatePipeline:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             # 提交所有初翻任务
             future_to_idx: Dict[Future, int] = {}
-            for batch_idx, (batch_keys, batch_texts) in enumerate(batches):
+            for batch_idx, (batch_keys, batch_texts, batch_items) in enumerate(batches):
                 if self._stop_event.is_set():
                     stopped_early = True
                     break
                 agent = self._acquire_draft_agent()
                 future = executor.submit(
                     self._draft_batch, batch_texts, target_lang, lang_english, agent,
+                    batch_items,
                 )
                 future_to_idx[future] = batch_idx
 
@@ -448,7 +736,7 @@ class TranslatePipeline:
                     stopped_early = True
                     break
                 batch_idx = future_to_idx[future]
-                batch_keys, batch_texts = batches[batch_idx]
+                batch_keys, batch_texts, batch_items = batches[batch_idx]
                 try:
                     draft_results = future.result()
                     draft_results_map[batch_idx] = draft_results
@@ -484,12 +772,13 @@ class TranslatePipeline:
                     if self._stop_event.is_set():
                         stopped_early = True
                         break
-                    batch_keys, batch_texts = batches[batch_idx]
+                    batch_keys, batch_texts, batch_items = batches[batch_idx]
                     draft_results = draft_results_map[batch_idx]
                     agent = self._acquire_review_agent()
                     future = executor.submit(
                         self._review_batch,
                         batch_texts, draft_results, target_lang, lang_english, agent,
+                        batch_items,
                     )
                     future_to_idx[future] = batch_idx
 
@@ -498,7 +787,7 @@ class TranslatePipeline:
                         stopped_early = True
                         break
                     batch_idx = future_to_idx[future]
-                    batch_keys, batch_texts = batches[batch_idx]
+                    batch_keys, batch_texts, batch_items = batches[batch_idx]
                     try:
                         reviewed = future.result()
                         for j, key in enumerate(batch_keys):
