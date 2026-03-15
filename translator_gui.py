@@ -912,13 +912,30 @@ class MainWindow(QMainWindow):
         self.format_panel.setEnabled(not running)
 
     def _apply_log_level(self, level_name: str):
-        """运行时切换日志级别，同时压制第三方库的噪音日志"""
+        """
+        运行时切换日志级别，同时压制第三方库的噪音日志。
+
+        📘 教学笔记：为什么要设 os.environ？
+        _apply_log_level 在 _on_start 里调用，但 Agent/Pipeline 是之后才创建的。
+        Agent 创建时 get_logger() 会读 core.logger._CONSOLE_LEVEL（模块加载时缓存的值），
+        所以必须同时更新环境变量和 core.logger 模块里的缓存值，
+        这样后续新建的 logger 也能用正确的级别。
+        """
+        import core.logger as logger_module
+
         level_map = {"TRACE": TRACE, "DEBUG": logging.DEBUG, "INFO": logging.INFO}
         level = level_map.get(level_name, logging.INFO)
+
+        # 📘 更新环境变量和模块缓存，影响后续新建的 logger
+        os.environ["LOG_LEVEL"] = level_name
+        logger_module._CONSOLE_LEVEL = level_name
+
+        # 📘 更新所有已存在的 logger
         for name in list(logging.Logger.manager.loggerDict):
             lgr = logging.getLogger(name)
-            if lgr.level > level:
-                lgr.setLevel(level)
+            # 设置 logger 自身的级别（取当前和目标的较低值，确保能输出）
+            lgr.setLevel(min(lgr.level, level) if lgr.level > 0 else level)
+            # 设置所有终端 handler 的级别
             for h in lgr.handlers:
                 if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
                     h.setLevel(level)
