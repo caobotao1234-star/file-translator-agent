@@ -218,23 +218,35 @@ class TranslatePipeline:
                 pending_indices = []  # 全部完成
                 break
 
-            # 数量不匹配 — 尝试部分匹配
+            # 数量不匹配 — 区分"多了"和"少了"两种情况
             if draft_results:
-                logger.warning(
-                    f"初翻结果数量不匹配: 期望 {count}，得到 {len(draft_results)}"
-                )
-                # 📘 教学笔记：部分匹配策略
-                # 如果模型返回的数量少于期望，前 N 个大概率是对的（按顺序翻译）。
-                # 把能匹配的先填上，剩下的留给重试。
-                matched = min(len(draft_results), count)
-                new_pending = []
-                for j in range(count):
-                    if j < matched:
-                        results[pending_indices[j]] = draft_results[j]
+                got = len(draft_results)
+                logger.warning(f"初翻结果数量不匹配: 期望 {count}，得到 {got}")
+
+                if got > count:
+                    # 📘 教学笔记：返回多了（模型拆分了段落）
+                    # 无法判断哪些是对的，因为对应关系已经错位。
+                    # 策略：如果是最后一次重试机会，截断取前 N 个（总比空着好）；
+                    # 否则整批重试，给模型再一次机会。
+                    if attempt < MAX_BATCH_RETRIES:
+                        logger.info(f"返回多了 {got}>{count}，整批重试")
+                        # pending_indices 不变，整批重试
                     else:
-                        new_pending.append(pending_indices[j])
-                pending_indices = new_pending
-                logger.info(f"部分匹配 {matched}/{count}，剩余 {len(pending_indices)} 个待重试")
+                        logger.warning(f"最后一次重试仍多了，截断取前 {count} 个")
+                        for j in range(count):
+                            results[pending_indices[j]] = draft_results[j]
+                        pending_indices = []
+                else:
+                    # 📘 教学笔记：返回少了（模型合并了段落）
+                    # 前 N 个大概率是按顺序翻译的，先填上，剩下的留给重试。
+                    new_pending = []
+                    for j in range(count):
+                        if j < got:
+                            results[pending_indices[j]] = draft_results[j]
+                        else:
+                            new_pending.append(pending_indices[j])
+                    pending_indices = new_pending
+                    logger.info(f"部分匹配 {got}/{count}，剩余 {len(pending_indices)} 个待重试")
             else:
                 logger.warning(f"初翻完全失败（JSON 解析错误），{count} 个段落将重试")
 
