@@ -1,5 +1,11 @@
 # file-translator-agent
 
+AI-powered document translation agent for Word & PowerPoint with format preservation, built on Volcengine Ark LLM.
+
+基于火山方舟大模型的智能文档翻译 Agent，支持 Word 和 PowerPoint 格式保持翻译。
+
+---
+
 An AI-powered document translation agent that translates `.docx` (Word) and `.pptx` (PowerPoint) files while preserving formatting, layout, and styles.
 
 Built on top of Volcengine Ark (doubao) LLM API with a two-stage translation pipeline (Draft → Review) for high-quality output.
