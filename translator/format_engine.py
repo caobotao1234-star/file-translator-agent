@@ -47,13 +47,19 @@ class FormatEngine:
     规则优先级（从高到低）：
     1. 用户自定义规则（通过对话设置，持久化到文件）
     2. 默认规则（DEFAULT_FONT_MAP / DEFAULT_STYLE_MAP）
-    3. 保持原格式不变（兜底）
+    3. 默认字体兜底（default_font，如果设置了的话）
+    4. 保持原格式不变（兜底）
     """
 
     def __init__(self, config_path: str = "translator_config/format_rules.json"):
         self.config_path = config_path
         self.font_map: Dict[str, str] = dict(DEFAULT_FONT_MAP)
         self.style_map: Dict[str, Dict] = dict(DEFAULT_STYLE_MAP)
+        # 📘 教学笔记：默认字体（兜底映射）
+        # 设置后，所有不在 font_map 里的字体都会映射成这个字体。
+        # 比如设成 "Times New Roman"，就不用逐个添加映射规则了。
+        # 为空字符串时表示不启用，保持原字体。
+        self.default_font: str = ""
         self._load_user_rules()
 
     def _load_user_rules(self):
@@ -66,6 +72,7 @@ class FormatEngine:
             # 用户规则覆盖默认规则
             self.font_map.update(data.get("font_map", {}))
             self.style_map.update(data.get("style_map", {}))
+            self.default_font = data.get("default_font", "")
             logger.info(f"已加载用户格式规则: {self.config_path}")
         except Exception as e:
             logger.warning(f"加载格式规则失败: {e}")
@@ -76,6 +83,7 @@ class FormatEngine:
         data = {
             "font_map": self.font_map,
             "style_map": self.style_map,
+            "default_font": self.default_font,
         }
         with open(self.config_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -107,7 +115,8 @@ class FormatEngine:
         查找顺序：
         1. 样式映射（如果段落样式名匹配）
         2. 字体映射（如果原字体名匹配）
-        3. 返回 None（保持原样）
+        3. 默认字体兜底（如果设置了 default_font）
+        4. 返回 None（保持原样）
         """
         # 优先看样式映射
         if style_name and style_name in self.style_map:
@@ -118,6 +127,10 @@ class FormatEngine:
         # 再看字体映射
         if original_font and original_font in self.font_map:
             return self.font_map[original_font]
+
+        # 📘 默认字体兜底：所有未匹配的字体都映射成这个
+        if self.default_font:
+            return self.default_font
 
         return None
 
@@ -145,6 +158,11 @@ class FormatEngine:
             if not (style_name and style_name in self.style_map
                     and "font_name" in self.style_map[style_name]):
                 result["font_name"] = self.font_map[original_font]
+        elif self.default_font:
+            # 📘 默认字体兜底
+            if not (style_name and style_name in self.style_map
+                    and "font_name" in self.style_map[style_name]):
+                result["font_name"] = self.default_font
 
         return result
 

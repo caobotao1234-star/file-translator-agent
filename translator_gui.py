@@ -366,6 +366,15 @@ class FormatMappingPanel(QWidget):
         font_tab = QWidget()
         ft_layout = QVBoxLayout(font_tab)
 
+        # 📘 默认字体：所有未在映射表中的字体都映射成这个
+        default_row = QHBoxLayout()
+        default_row.addWidget(QLabel("默认字体（兜底）:"))
+        self.default_font_input = QLineEdit()
+        self.default_font_input.setPlaceholderText("留空则保持原字体，如 Times New Roman")
+        self.default_font_input.setText(self.engine.default_font)
+        default_row.addWidget(self.default_font_input)
+        ft_layout.addLayout(default_row)
+
         self.font_table = QTableWidget(0, 2)
         self.font_table.setHorizontalHeaderLabels(["源字体", "目标字体"])
         self.font_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
@@ -418,6 +427,9 @@ class FormatMappingPanel(QWidget):
 
     def _refresh_tables(self):
         """从 FormatEngine 刷新表格数据"""
+        # 默认字体
+        self.default_font_input.setText(self.engine.default_font)
+
         # 字体映射
         self.font_table.setRowCount(0)
         for src, tgt in self.engine.font_map.items():
@@ -458,6 +470,8 @@ class FormatMappingPanel(QWidget):
             if src and tgt:
                 new_map[src] = tgt
         self.engine.font_map = new_map
+        # 📘 保存默认字体
+        self.engine.default_font = self.default_font_input.text().strip()
         self.engine._save_user_rules()
         self._refresh_tables()
 
