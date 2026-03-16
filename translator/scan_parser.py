@@ -1,6 +1,6 @@
 # translator/scan_parser.py
 # =============================================================
-# 📘 教学笔记：扫描件 PDF 解析器（v4 — RapidOCR v3）
+# 📘 教学笔记：扫描件 PDF 解析器（v4 — RapidOCR 子进程模式）
 # =============================================================
 # 扫描件 PDF 里没有可选中的文字，每页是一张图片。
 # 普通 pdf_parser 用 PyMuPDF 的 get_text("dict") 提取文本，
@@ -10,19 +10,26 @@
 # v2 用 Vision LLM 做 OCR，文字识别准但位置估算不靠谱。
 # v3 用火山引擎 OCR API（OCRNormal），但需要开通"视觉智能"服务，控制台 404。
 #
-# v4 改用 RapidOCR v3（新包名 rapidocr，和 v1 的 rapidocr-onnxruntime 不同）：
+# v4 用 RapidOCR v3 + 子进程隔离：
 #   - 基于 PaddleOCR 的 ONNX 推理，纯本地运行，不需要网络
 #   - 自带中英文 OCR 模型（PP-OCRv4），开箱即用
 #   - bbox 精度像素级（四边形 polygon）
-#   - 不需要 AK/SK 认证，不需要开通任何云服务
-#   - v3 修复了 v1 在 Python 3.14 下的 DLL 兼容性问题
 #
-# 📘 为什么 RapidOCR v3 能用而 v1 不行？
-# v1（rapidocr-onnxruntime）直接依赖 onnxruntime 的 C++ DLL，
-# 在 Python 3.14 + PyQt6 环境下 DLL 加载冲突。
-# v3（rapidocr）重构了引擎加载方式，解决了兼容性问题。
+# 📘 为什么要用子进程？
+# RapidOCR 依赖 onnxruntime 的 C++ DLL。
+# PyQt6 也加载了一些 C++ DLL（Qt 框架）。
+# 在同一个进程里，两者的 DLL 会冲突，导致加载失败。
+# 解决方案：在独立的子进程里运行 RapidOCR，
+# 主进程（PyQt6 GUI）通过 subprocess 调用，
+# 子进程通过 stdout 返回 JSON 结果。
+# 这样两套 DLL 各自在自己的进程空间里，互不干扰。
 # =============================================================
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import fitz  # PyMuPDF
 from typing import Dict, Any, List
 from core.logger import get_logger
@@ -35,6 +42,36 @@ OCR_RENDER_DPI = 150
 
 # 📘 扫描件判定阈值
 SCAN_THRESHOLD_BLOCKS_PER_PAGE = 2
+
+
+# 📘 教学笔记：OCR 子进程的 Python 代码
+# 这段代码会被写入临时文件，由子进程执行。
+# 子进程独立加载 onnxruntime + RapidOCR，不受主进程 PyQt6 影响。
+# 输入：命令行参数传入图片文件路径（可以多个）
+# 输出：stdout 输出 JSON，每行一个页面的 OCR 结果
+_OCR_WORKER_CODE = r'''
+import json, sys, logging, os
+logging.disable(logging.INFO)
+
+from rapidocr import RapidOCR
+engine = RapidOCR()
+
+for img_path in sys.argv[1:]:
+    try:
+        img_bytes = open(img_path, "rb").read()
+        result = engine(img_bytes)
+        if result and result.boxes is not None:
+            lines = []
+            for box, text, score in zip(result.boxes, result.txts, result.scores):
+                t = text.strip()
+                if t:
+                    lines.append({"text": t, "polygon": box.tolist(), "score": float(score)})
+            print(json.dumps(lines, ensure_ascii=False))
+        else:
+            print("[]")
+    except Exception as e:
+        print(json.dumps({"error": str(e)}))
+'''
 
 
 def detect_scan_pdf(filepath: str) -> bool:
@@ -82,87 +119,77 @@ def detect_scan_pdf(filepath: str) -> bool:
         return False
 
 
-def _get_ocr_engine():
+def _run_ocr_subprocess(img_paths: List[str]) -> List[List[dict]]:
     """
-    📘 教学笔记：初始化 RapidOCR v3 引擎
+    📘 教学笔记：在子进程中运行 RapidOCR
 
-    RapidOCR v3 自带 PP-OCRv4 模型（中英文），首次运行会自动下载。
-    引擎是线程安全的，可以复用。
-    这里用模块级缓存，避免每页都重新加载模型。
+    为什么用子进程而不是直接 import？
+    因为 onnxruntime 的 DLL 和 PyQt6 的 DLL 在同一进程中会冲突。
+    子进程有独立的内存空间，DLL 互不干扰。
+
+    流程：
+    1. 把 OCR worker 代码写入临时 .py 文件
+    2. 用 subprocess 启动子进程，传入图片路径
+    3. 子进程逐张图片 OCR，每张输出一行 JSON
+    4. 主进程解析 JSON 得到结果
+
+    📘 性能考虑：
+    子进程启动有开销（~2秒加载模型），但只启动一次。
+    所有页面的图片路径一次性传入，子进程批量处理。
     """
-    import logging
-    # 📘 抑制 RapidOCR 的 INFO 日志（模型加载信息），避免刷屏
-    # 必须在 import 之前设置，因为 RapidOCR 在 import 时就会输出日志
-    logging.getLogger("RapidOCR").setLevel(logging.WARNING)
-    logging.getLogger("rapidocr").setLevel(logging.WARNING)
-
-    from rapidocr import RapidOCR
-    return RapidOCR()
-
-
-# 📘 模块级缓存：OCR 引擎只初始化一次
-_ocr_engine = None
-
-
-def _ensure_ocr_engine():
-    """懒加载 OCR 引擎"""
-    global _ocr_engine
-    if _ocr_engine is None:
-        _ocr_engine = _get_ocr_engine()
-    return _ocr_engine
-
-
-def _render_page_to_png(doc: fitz.Document, page_idx: int) -> bytes:
-    """渲染 PDF 页面为 PNG bytes（RapidOCR 接受 bytes 输入）"""
-    page = doc[page_idx]
-    zoom = OCR_RENDER_DPI / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat)
-    return pix.tobytes("png")
-
-
-def _call_ocr(engine, img_bytes: bytes, page_idx: int) -> List[dict]:
-    """
-    📘 教学笔记：调用 RapidOCR 识别单页
-
-    RapidOCR v3 的返回格式：
-      result.boxes:  numpy array, shape (N, 4, 2) — 每行 4 个角点的像素坐标
-      result.txts:   list[str] — 每行的文字
-      result.scores: list[float] — 每行的置信度
-
-    boxes 的 4 个点顺序：左上、右上、右下、左下（和火山 OCR API 一样）。
-    """
+    # 写入临时 worker 脚本
+    worker_fd, worker_path = tempfile.mkstemp(suffix='.py', prefix='ocr_worker_')
     try:
-        result = engine(img_bytes)
-    except Exception as e:
-        logger.error(f"OCR 识别失败 (第 {page_idx + 1} 页): {e}")
-        return []
+        with os.fdopen(worker_fd, 'w', encoding='utf-8') as f:
+            f.write(_OCR_WORKER_CODE)
 
-    if result is None or result.boxes is None or len(result.boxes) == 0:
-        return []
+        # 启动子进程
+        cmd = [sys.executable, worker_path] + img_paths
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 分钟超时（大文档可能很多页）
+        )
 
-    lines = []
-    for box, text, score in zip(result.boxes, result.txts, result.scores):
-        text = text.strip()
-        if not text:
-            continue
-        # box: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]] (numpy → list)
-        polygon = box.tolist()
-        lines.append({
-            "text": text,
-            "polygon": polygon,
-            "score": float(score),
-        })
+        if result.returncode != 0:
+            logger.error(f"OCR 子进程失败: {result.stderr[:500]}")
+            return [[] for _ in img_paths]
 
-    return lines
+        # 解析输出：每行一个 JSON
+        all_results = []
+        for line in result.stdout.strip().split('\n'):
+            if not line.strip():
+                all_results.append([])
+                continue
+            try:
+                data = json.loads(line)
+                if isinstance(data, dict) and 'error' in data:
+                    logger.error(f"OCR 子进程错误: {data['error']}")
+                    all_results.append([])
+                else:
+                    all_results.append(data)
+            except json.JSONDecodeError:
+                logger.warning(f"OCR 输出解析失败: {line[:100]}")
+                all_results.append([])
+
+        # 补齐缺失的结果
+        while len(all_results) < len(img_paths):
+            all_results.append([])
+
+        return all_results
+
+    finally:
+        # 清理临时文件
+        try:
+            os.unlink(worker_path)
+        except OSError:
+            pass
 
 
 def _polygon_to_bbox_px(polygon: List[List[float]]) -> List[float]:
     """
     📘 四边形 polygon → 外接矩形 [x0, y0, x1, y1]（像素坐标）
-
-    polygon: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-    返回: [x_min, y_min, x_max, y_max]
     """
     xs = [p[0] for p in polygon]
     ys = [p[1] for p in polygon]
@@ -177,9 +204,7 @@ def _bbox_px_to_pt(bbox_px: List[float], zoom: float) -> List[float]:
 def _estimate_font_size(bbox_height_pt: float, text: str) -> float:
     """
     📘 从 bbox 高度估算字号
-
     单行文本：字号 ≈ bbox 高度 × 0.75（考虑行距）
-    多行文本：字号 ≈ bbox 高度 / 行数 × 0.75
     """
     line_count = max(1, text.count("\n") + 1)
     per_line_height = bbox_height_pt / line_count
@@ -201,16 +226,10 @@ def _merge_nearby_lines(
     - 两行的 y 间距 < 阈值（垂直相邻）
     - 合并后的文本用换行符连接
     - bbox 取所有行的外接矩形
-
-    📘 为什么要合并？
-    如果不合并，"装配式建筑全生态产业链服务商" 可能被拆成两行分别翻译，
-    译文就会变成两个独立的短句，失去上下文。
-    合并后作为一个段落翻译，质量更好。
     """
     if not ocr_lines:
         return []
 
-    # 先转换为统一格式
     items = []
     for line in ocr_lines:
         bbox_px = _polygon_to_bbox_px(line["polygon"])
@@ -229,22 +248,15 @@ def _merge_nearby_lines(
 
     for i in range(1, len(items)):
         nxt = items[i]
-
-        # 当前块和下一块的垂直间距
         gap_y = nxt["bbox_pt"][1] - current["bbox_pt"][3]
-
-        # 水平重叠检测：两个块的 x 范围是否有交集
         x_overlap = (
             min(current["bbox_pt"][2], nxt["bbox_pt"][2])
             - max(current["bbox_pt"][0], nxt["bbox_pt"][0])
         )
-        # 当前块的高度（用于估算行距阈值）
         current_height = current["bbox_pt"][3] - current["bbox_pt"][1]
-        # 📘 动态阈值：行距 < 当前块高度的 1.2 倍 → 认为是同一段落
         dynamic_threshold = max(merge_threshold_pt, current_height * 1.2)
 
         if gap_y < dynamic_threshold and x_overlap > 0:
-            # 合并
             current["text"] += "\n" + nxt["text"]
             current["bbox_px"] = [
                 min(current["bbox_px"][0], nxt["bbox_px"][0]),
@@ -268,45 +280,64 @@ def _merge_nearby_lines(
 
 def parse_scan_pdf(filepath: str, vision_llm=None) -> Dict[str, Any]:
     """
-    📘 教学笔记：扫描件 PDF 解析主函数（v4 — RapidOCR v3）
+    📘 教学笔记：扫描件 PDF 解析主函数（v4 — RapidOCR 子进程模式）
 
-    用本地 OCR 引擎识别每页的文字和精确位置。
-    输出格式和 pdf_parser.parse_pdf() 完全一致。
+    流程：
+    1. 逐页渲染 PDF 为临时 PNG 图片
+    2. 一次性启动 OCR 子进程，批量识别所有页面
+    3. 合并相邻行为段落
+    4. 转换为标准 parsed_data 格式
 
     参数 vision_llm 保留但不再使用（兼容旧调用）。
     """
-    engine = _ensure_ocr_engine()
-
     logger.info(f"开始扫描件 OCR 解析: {filepath}")
     print(f"[🔍 OCR 解析] 正在用 RapidOCR 识别扫描件文字...", flush=True)
 
     doc = fitz.open(filepath)
     zoom = OCR_RENDER_DPI / 72.0
 
-    all_items = []
+    # 1. 渲染所有页面为临时 PNG
+    tmp_dir = tempfile.mkdtemp(prefix='scan_ocr_')
+    img_paths = []
+    try:
+        for page_idx in range(len(doc)):
+            page = doc[page_idx]
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+            img_path = os.path.join(tmp_dir, f'page_{page_idx}.png')
+            pix.save(img_path)
+            img_paths.append(img_path)
 
+        # 2. 一次性 OCR 所有页面（子进程只启动一次，模型只加载一次）
+        print(f"  [🔍 OCR] 共 {len(img_paths)} 页，子进程识别中...", flush=True)
+        all_ocr_results = _run_ocr_subprocess(img_paths)
+
+    finally:
+        # 清理临时图片
+        import shutil
+        try:
+            shutil.rmtree(tmp_dir)
+        except OSError:
+            pass
+
+    # 3. 处理 OCR 结果
+    all_items = []
     for page_idx in range(len(doc)):
         page = doc[page_idx]
         page_width_pt = page.rect.width
 
-        # 1. 渲染页面为图片
-        img_bytes = _render_page_to_png(doc, page_idx)
-
-        print(f"  [🔍 第 {page_idx + 1} 页] OCR 识别中...", flush=True)
-
-        # 2. 调用 RapidOCR
-        ocr_lines = _call_ocr(engine, img_bytes, page_idx)
+        ocr_lines = all_ocr_results[page_idx] if page_idx < len(all_ocr_results) else []
         if not ocr_lines:
             logger.debug(f"第 {page_idx + 1} 页: 未识别到文字")
             continue
 
         logger.info(f"第 {page_idx + 1} 页: 识别到 {len(ocr_lines)} 行文字")
 
-        # 3. 合并相邻行为段落
+        # 合并相邻行为段落
         merged_blocks = _merge_nearby_lines(ocr_lines, zoom, page_width_pt)
         logger.info(f"第 {page_idx + 1} 页: 合并为 {len(merged_blocks)} 个段落")
 
-        # 4. 转换为标准 parsed_data 格式
+        # 转换为标准 parsed_data 格式
         for block_idx, block in enumerate(merged_blocks):
             text = block["text"]
             bbox_pt = block["bbox_pt"]
