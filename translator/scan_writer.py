@@ -32,7 +32,7 @@ from translator.format_engine import FormatEngine
 logger = get_logger("scan_writer")
 
 # 📘 渲染 DPI 必须和 scan_parser 一致，这样像素坐标才能对上
-RENDER_DPI = 200
+RENDER_DPI = 150
 
 # 📘 背景采样：在 bbox 外围采样的像素宽度
 SAMPLE_MARGIN = 5

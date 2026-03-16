@@ -1,74 +1,84 @@
 # translator/scan_parser.py
 # =============================================================
-# 📘 教学笔记：扫描件 PDF 解析器
+# 📘 教学笔记：扫描件 PDF 解析器（v2 — Vision LLM OCR）
 # =============================================================
 # 扫描件 PDF 里没有可选中的文字，每页是一张图片。
 # 普通 pdf_parser 用 PyMuPDF 的 get_text("dict") 提取文本，
 # 对扫描件会得到 0 个文本块。
 #
-# 本模块的策略：
-#   1. detect_scan_pdf(): 检测 PDF 是否为扫描件
-#   2. parse_scan_pdf(): 用 OCR 识别每页文字 + 位置
-#   3. 输出和 pdf_parser.parse_pdf() 完全相同的数据结构
-#      这样后续的翻译、写入、排版审校全部复用
+# v1 用 RapidOCR（ONNX），但在 PyQt6 + Python 3.14 环境下
+# onnxruntime 的 DLL 加载失败。
 #
-# OCR 引擎：RapidOCR（PaddleOCR 的 ONNX 移植版）
-#   - 不依赖 PaddlePaddle，兼容 Python 3.14
-#   - 离线运行，免费，中英文识别效果好
-#   - 输出每个文字块的 bbox 和置信度
+# v2 改用多模态 Vision LLM 做 OCR：
+#   - 直接复用用户已有的 doubao-seed-1.8 模型
+#   - 不需要额外安装任何包
+#   - 能识别中英文混合文本
+#   - 输出结构化 JSON（文字 + 在页面中的相对位置）
+#   - 位置精度不如传统 OCR，但对翻译场景够用
+#
+# 📘 为什么 Vision LLM 做 OCR 可行？
+# 传统 OCR 的优势是精确的 bbox 坐标（像素级）。
+# 但扫描件翻译场景中，我们不需要像素级精度：
+#   - 擦除原文用的是 OCR 行级 bbox（粗粒度就够）
+#   - 写入译文用的是合并后的段落 bbox
+#   - Vision LLM 能给出"上/中/下"、"左/中/右"的区域描述
+#   - 结合页面尺寸可以估算出合理的 bbox
 # =============================================================
 
-import os
-import sys
+import base64
+import json
 import fitz  # PyMuPDF
 import numpy as np
 from typing import Dict, Any, List, Optional
+from core.llm_engine import ArkLLMEngine
 from core.logger import get_logger
-
-# 📘 教学笔记：修复 PyQt6 环境下 ONNX Runtime DLL 加载失败
-# PyQt6 启动时会修改 DLL 搜索路径，导致 onnxruntime 的 C++ DLL 找不到。
-# 解决方案：在 import onnxruntime 之前，把相关 DLL 目录加到搜索路径。
-if sys.platform == "win32":
-    # 📘 把 venv 和系统的 DLL 目录都加上
-    _dll_dirs = [
-        os.path.join(sys.prefix, "DLLs"),
-        os.path.join(sys.prefix, "Library", "bin"),
-        os.path.join(sys.prefix, "Scripts"),
-        os.path.join(sys.prefix, "Lib", "site-packages", "onnxruntime", "capi"),
-    ]
-    for d in _dll_dirs:
-        if os.path.isdir(d):
-            try:
-                os.add_dll_directory(d)
-            except OSError:
-                pass
-    # 📘 也把 PATH 里的目录加上（兜底）
-    for d in os.environ.get("PATH", "").split(";"):
-        if d and os.path.isdir(d):
-            try:
-                os.add_dll_directory(d)
-            except OSError:
-                pass
 
 logger = get_logger("scan_parser")
 
-# 📘 OCR 渲染 DPI：200 比 150 更清晰，OCR 识别率更高
-OCR_RENDER_DPI = 200
+# 📘 OCR 渲染 DPI：150 够 Vision LLM 看清文字
+OCR_RENDER_DPI = 150
 
-# 📘 扫描件判定阈值：如果每页平均文本块数 < 此值，判定为扫描件
+# 📘 扫描件判定阈值
 SCAN_THRESHOLD_BLOCKS_PER_PAGE = 2
+
+# 📘 Vision OCR Prompt：让 LLM 识别图片中的所有文字并给出位置
+VISION_OCR_PROMPT = """你是专业的 OCR 文字识别专家。请仔细识别这张图片中的所有文字内容。
+
+要求：
+1. 识别图片中每一个独立的文字区域（标题、正文段落、表格文字、页眉页脚等）
+2. 对每个文字区域，给出：
+   - text: 识别出的完整文字内容（保持原文，不要翻译）
+   - position: 文字在页面中的位置，用百分比表示
+     - x: 左边界距页面左侧的百分比（0-100）
+     - y: 上边界距页面顶部的百分比（0-100）
+     - w: 宽度占页面宽度的百分比（0-100）
+     - h: 高度占页面高度的百分比（0-100）
+   - font_size_hint: 估算的字号大小（"large"=标题, "medium"=正文, "small"=注释/页脚）
+
+3. 按从上到下、从左到右的阅读顺序排列
+4. 不要遗漏任何文字，包括小字、水印、印章上的文字
+5. 如果某段文字跨多行，合并为一个区域
+
+输出格式：严格 JSON 数组。不要输出其他内容。
+示例：
+[
+  {
+    "text": "出生医学证明",
+    "position": {"x": 25, "y": 5, "w": 50, "h": 6},
+    "font_size_hint": "large"
+  },
+  {
+    "text": "姓名：张三\\n性别：男\\n出生日期：2024年1月1日",
+    "position": {"x": 10, "y": 20, "w": 80, "h": 15},
+    "font_size_hint": "medium"
+  }
+]"""
 
 
 def detect_scan_pdf(filepath: str) -> bool:
     """
-    📘 教学笔记：检测 PDF 是否为扫描件
-
-    策略：用 PyMuPDF 提取每页的文本块数量。
-    如果平均每页文本块数 < 阈值（2），判定为扫描件。
-
-    为什么不直接看 get_text() 是否为空？
-    因为有些扫描件 PDF 带了一层很差的 OCR 文本层（几个乱码字符），
-    不能简单用"有没有文字"来判断。要看文本块数量是否合理。
+    📘 检测 PDF 是否为扫描件
+    策略：每页平均文本块数 < 阈值 → 扫描件
     """
     try:
         doc = fitz.open(filepath)
@@ -78,11 +88,9 @@ def detect_scan_pdf(filepath: str) -> bool:
 
         total_blocks = 0
         for page in doc:
-            # 只统计文本块（type=0），忽略图片块（type=1）
             blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
             for block in blocks.get("blocks", []):
-                if block.get("type") == 0:  # 文本块
-                    # 检查是否有实际文字内容
+                if block.get("type") == 0:
                     has_text = False
                     for line in block.get("lines", []):
                         for span in line.get("spans", []):
@@ -112,183 +120,137 @@ def detect_scan_pdf(filepath: str) -> bool:
         return False
 
 
-def _render_page_to_numpy(doc: fitz.Document, page_idx: int) -> np.ndarray:
-    """渲染 PDF 页面为 numpy 数组（RGB），供 OCR 使用"""
+def _render_page_to_base64(doc: fitz.Document, page_idx: int) -> str:
+    """渲染 PDF 页面为 base64 JPEG"""
     page = doc[page_idx]
     zoom = OCR_RENDER_DPI / 72.0
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat)
-    # PyMuPDF pixmap → numpy array (H, W, 3)
+    img_bytes = pix.tobytes("jpeg", jpg_quality=90)
+    return base64.b64encode(img_bytes).decode("utf-8")
+
+
+def _render_page_to_numpy(doc: fitz.Document, page_idx: int) -> np.ndarray:
+    """渲染 PDF 页面为 numpy 数组（RGB），供 scan_writer 使用"""
+    page = doc[page_idx]
+    zoom = OCR_RENDER_DPI / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat)
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-    if pix.n == 4:  # RGBA → RGB
+    if pix.n == 4:
         img = img[:, :, :3]
     return img
 
 
-def _ocr_page(ocr_engine, img: np.ndarray) -> List[dict]:
+def _call_vision_ocr(vision_llm: ArkLLMEngine, img_b64: str, page_idx: int) -> List[dict]:
     """
-    📘 教学笔记：对单页图片做 OCR
+    📘 教学笔记：用 Vision LLM 做 OCR
 
-    RapidOCR 返回格式：
-      result = [
-        [[[x0,y0],[x1,y1],[x2,y2],[x3,y3]], text, confidence],
-        ...
-      ]
-    其中四个点是文字框的四角坐标（左上、右上、右下、左下）。
-    我们转换为 [x0, y0, x1, y1] 的 bbox 格式（左上角 + 右下角）。
+    发送页面图片给多模态模型，让它识别所有文字并给出位置。
+    返回结构化的文字块列表。
     """
-    result, _ = ocr_engine(img)
-    if not result:
-        return []
-
-    blocks = []
-    for item in result:
-        points, text, confidence = item
-        if not text or not text.strip():
-            continue
-        if confidence < 0.5:  # 📘 低置信度的识别结果丢弃
-            continue
-
-        # 四角坐标 → bbox
-        xs = [p[0] for p in points]
-        ys = [p[1] for p in points]
-        bbox = [min(xs), min(ys), max(xs), max(ys)]
-
-        blocks.append({
-            "text": text.strip(),
-            "bbox": bbox,  # 📘 注意：这是像素坐标，需要转换为 PDF 点坐标
-            "confidence": confidence,
-        })
-
-    return blocks
-
-
-def _estimate_font_size(bbox_height_pt: float) -> float:
-    """
-    📘 从 bbox 高度估算字号
-
-    OCR 给的是文字框高度，字号 ≈ 框高 × 0.75（经验值）。
-    因为文字框包含行间距，实际字号比框高小。
-    """
-    return max(6.0, round(bbox_height_pt * 0.75, 1))
-
-
-def _should_merge_ocr_blocks(a: dict, b: dict, page_width: float) -> bool:
-    """
-    📘 判断两个 OCR 块是否应该合并为一个段落
-
-    合并条件：
-    1. 垂直距离小（y 方向间距 < 行高的 1.5 倍）
-    2. 水平范围重叠（x 方向有交集，说明是同一列）
-    3. 两个块都不是很短（避免把标题和正文合并）
-    """
-    a_bbox = a["bbox_pt"]
-    b_bbox = b["bbox_pt"]
-
-    a_height = a_bbox[3] - a_bbox[1]
-    b_height = b_bbox[3] - b_bbox[1]
-    avg_height = (a_height + b_height) / 2
-
-    # 垂直间距
-    vertical_gap = b_bbox[1] - a_bbox[3]
-    if vertical_gap < 0 or vertical_gap > avg_height * 1.5:
-        return False
-
-    # 水平重叠
-    x_overlap = min(a_bbox[2], b_bbox[2]) - max(a_bbox[0], b_bbox[0])
-    min_width = min(a_bbox[2] - a_bbox[0], b_bbox[2] - b_bbox[0])
-    if min_width > 0 and x_overlap / min_width < 0.5:
-        return False
-
-    # 字号差异不能太大（避免标题和正文合并）
-    size_ratio = max(a_height, b_height) / max(min(a_height, b_height), 1)
-    if size_ratio > 1.5:
-        return False
-
-    return True
-
-
-def _merge_ocr_blocks(blocks: List[dict], page_width: float) -> List[dict]:
-    """
-    📘 合并相邻的 OCR 块为段落
-
-    OCR 通常按行识别，一个段落会被拆成多行。
-    这里把垂直相邻、水平对齐的行合并为一个段落。
-    """
-    if not blocks:
-        return []
-
-    # 按 y 坐标排序
-    sorted_blocks = sorted(blocks, key=lambda b: (b["bbox_pt"][1], b["bbox_pt"][0]))
-
-    merged = [sorted_blocks[0]]
-    for block in sorted_blocks[1:]:
-        if _should_merge_ocr_blocks(merged[-1], block, page_width):
-            # 合并：扩展 bbox，拼接文本
-            prev = merged[-1]
-            prev["text"] += "\n" + block["text"]
-            prev["bbox_pt"] = [
-                min(prev["bbox_pt"][0], block["bbox_pt"][0]),
-                min(prev["bbox_pt"][1], block["bbox_pt"][1]),
-                max(prev["bbox_pt"][2], block["bbox_pt"][2]),
-                max(prev["bbox_pt"][3], block["bbox_pt"][3]),
-            ]
-            prev["bbox_px"] = [
-                min(prev["bbox_px"][0], block["bbox_px"][0]),
-                min(prev["bbox_px"][1], block["bbox_px"][1]),
-                max(prev["bbox_px"][2], block["bbox_px"][2]),
-                max(prev["bbox_px"][3], block["bbox_px"][3]),
-            ]
-            # 📘 子块 bbox 列表：scan_writer 需要逐个擦除
-            prev["sub_bboxes_pt"].append(block["bbox_pt"])
-            prev["sub_bboxes_px"].append(block["bbox_px"])
-        else:
-            merged.append(block)
-
-    return merged
-
-
-def parse_scan_pdf(filepath: str) -> Dict[str, Any]:
-    """
-    📘 教学笔记：扫描件 PDF 解析主函数
-
-    输出格式和 pdf_parser.parse_pdf() 完全一致：
-    {
-        "source": "scan_parser",
-        "source_type": "scan",       ← 标记为扫描件，writer 据此切换擦除策略
-        "filepath": "...",
-        "items": [
-            {
-                "key": "pg0_b0",
-                "type": "pdf_block",
-                "full_text": "识别出的文字",
-                "bbox": [x0, y0, x1, y1],      # PDF 点坐标
-                "text_bbox": [x0, y0, x1, y1],  # 同 bbox
-                "sub_bboxes": [[...]],           # 合并前的子块 bbox
-                "sub_bboxes_px": [[...]],        # 像素坐标版（scan_writer 用）
-                "dominant_format": {
-                    "font_name": "Unknown",
-                    "font_size": 12.0,
-                    "font_color": "#000000",
-                    "bold": False,
-                    "bbox": [x0, y0, x1, y1],
+    messages = [
+        {"role": "system", "content": VISION_OCR_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"请识别第 {page_idx + 1} 页中的所有文字。"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
                 },
-                "alignment": "left" / "justify",
-                "is_multiline": True/False,
-                "is_empty": False,
-            },
-            ...
-        ]
-    }
+            ],
+        },
+    ]
+
+    full_text = ""
+    try:
+        for chunk in vision_llm.stream_chat(messages):
+            if chunk["type"] == "text":
+                full_text += chunk["content"]
+    except Exception as e:
+        logger.error(f"Vision OCR 调用失败 (第 {page_idx + 1} 页): {e}")
+        return []
+
+    # 解析 JSON
+    text = full_text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+
+    try:
+        result = json.loads(text)
+        if isinstance(result, list):
+            return result
+    except json.JSONDecodeError:
+        logger.warning(f"Vision OCR 结果解析失败 (第 {page_idx + 1} 页): {text[:200]}")
+    return []
+
+
+def _position_to_bbox(position: dict, page_width: float, page_height: float) -> List[float]:
     """
-    from rapidocr_onnxruntime import RapidOCR
+    📘 把 Vision LLM 给出的百分比位置转换为 PDF 点坐标
 
-    logger.info(f"开始扫描件 OCR 解析: {filepath}")
-    print(f"[🔍 OCR 解析] 正在识别扫描件文字...", flush=True)
+    position: {"x": 25, "y": 5, "w": 50, "h": 6}  (百分比)
+    返回: [x0, y0, x1, y1]  (PDF 点坐标)
+    """
+    x_pct = max(0, min(100, position.get("x", 0)))
+    y_pct = max(0, min(100, position.get("y", 0)))
+    w_pct = max(1, min(100, position.get("w", 10)))
+    h_pct = max(1, min(100, position.get("h", 5)))
 
-    ocr_engine = RapidOCR()
+    x0 = page_width * x_pct / 100.0
+    y0 = page_height * y_pct / 100.0
+    x1 = x0 + page_width * w_pct / 100.0
+    y1 = y0 + page_height * h_pct / 100.0
+
+    return [x0, y0, x1, y1]
+
+
+def _position_to_bbox_px(position: dict, img_width: int, img_height: int) -> List[float]:
+    """百分比位置 → 像素坐标（scan_writer 用）"""
+    x_pct = max(0, min(100, position.get("x", 0)))
+    y_pct = max(0, min(100, position.get("y", 0)))
+    w_pct = max(1, min(100, position.get("w", 10)))
+    h_pct = max(1, min(100, position.get("h", 5)))
+
+    x0 = img_width * x_pct / 100.0
+    y0 = img_height * y_pct / 100.0
+    x1 = x0 + img_width * w_pct / 100.0
+    y1 = y0 + img_height * h_pct / 100.0
+
+    return [x0, y0, x1, y1]
+
+
+def _font_size_from_hint(hint: str, bbox_height_pt: float) -> float:
+    """从 LLM 的字号提示估算实际字号"""
+    hint_map = {"large": 0.6, "medium": 0.7, "small": 0.75}
+    factor = hint_map.get(hint, 0.7)
+    return max(6.0, round(bbox_height_pt * factor, 1))
+
+
+def parse_scan_pdf(filepath: str, vision_llm: ArkLLMEngine = None) -> Dict[str, Any]:
+    """
+    📘 教学笔记：扫描件 PDF 解析主函数（v2 — Vision LLM OCR）
+
+    用多模态 Vision LLM 识别每页的文字和位置。
+    如果没有传入 vision_llm，自动创建一个（用默认模型）。
+
+    输出格式和 pdf_parser.parse_pdf() 完全一致。
+    """
+    # 📘 如果没有传入 vision_llm，用默认配置创建
+    if vision_llm is None:
+        from config.settings import Config
+        model_id = Config.VISION_MODEL_ID or Config.DEFAULT_MODEL_ID
+        vision_llm = ArkLLMEngine(model_id=model_id)
+        logger.info(f"扫描件 OCR 使用模型: {model_id}")
+
+    logger.info(f"开始扫描件 Vision OCR 解析: {filepath}")
+    print(f"[🔍 OCR 解析] 正在用 Vision 模型识别扫描件文字...", flush=True)
+
     doc = fitz.open(filepath)
-    zoom = OCR_RENDER_DPI / 72.0  # 像素坐标 → PDF 点坐标的缩放因子
+    zoom = OCR_RENDER_DPI / 72.0
 
     all_items = []
 
@@ -298,58 +260,54 @@ def parse_scan_pdf(filepath: str) -> Dict[str, Any]:
         page_height_pt = page.rect.height
 
         # 1. 渲染页面为图片
-        img = _render_page_to_numpy(doc, page_idx)
-        logger.debug(f"第 {page_idx + 1} 页: 图片尺寸 {img.shape}")
+        img_b64 = _render_page_to_base64(doc, page_idx)
 
-        # 2. OCR 识别
-        ocr_blocks = _ocr_page(ocr_engine, img)
-        if not ocr_blocks:
-            logger.debug(f"第 {page_idx + 1} 页: OCR 未识别到文字")
+        # 📘 也渲染 numpy 版本，用于计算像素坐标
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+        img_w_px, img_h_px = pix.w, pix.h
+
+        print(f"  [🔍 第 {page_idx + 1} 页] Vision OCR 识别中...", flush=True)
+
+        # 2. Vision LLM OCR
+        ocr_results = _call_vision_ocr(vision_llm, img_b64, page_idx)
+        if not ocr_results:
+            logger.debug(f"第 {page_idx + 1} 页: 未识别到文字")
             continue
 
-        logger.info(f"第 {page_idx + 1} 页: OCR 识别到 {len(ocr_blocks)} 个文字块")
+        logger.info(f"第 {page_idx + 1} 页: 识别到 {len(ocr_results)} 个文字区域")
 
-        # 3. 像素坐标 → PDF 点坐标
-        for block in ocr_blocks:
-            px_bbox = block["bbox"]
-            pt_bbox = [
-                px_bbox[0] / zoom,
-                px_bbox[1] / zoom,
-                px_bbox[2] / zoom,
-                px_bbox[3] / zoom,
-            ]
-            block["bbox_pt"] = pt_bbox
-            block["bbox_px"] = px_bbox
-            block["sub_bboxes_pt"] = [pt_bbox]
-            block["sub_bboxes_px"] = [px_bbox]
+        # 3. 转换为标准 parsed_data 格式
+        for block_idx, block in enumerate(ocr_results):
+            text = block.get("text", "").strip()
+            if not text:
+                continue
 
-        # 4. 合并相邻行为段落
-        merged = _merge_ocr_blocks(ocr_blocks, page_width_pt)
-        logger.debug(f"第 {page_idx + 1} 页: 合并后 {len(merged)} 个段落")
+            position = block.get("position", {})
+            font_hint = block.get("font_size_hint", "medium")
 
-        # 5. 转换为标准 parsed_data 格式
-        for block_idx, block in enumerate(merged):
-            bbox_pt = block["bbox_pt"]
+            # 百分比 → PDF 点坐标
+            bbox_pt = _position_to_bbox(position, page_width_pt, page_height_pt)
+            bbox_px = _position_to_bbox_px(position, img_w_px, img_h_px)
+
             height_pt = bbox_pt[3] - bbox_pt[1]
-            font_size = _estimate_font_size(height_pt)
-            is_multiline = "\n" in block["text"]
+            font_size = _font_size_from_hint(font_hint, height_pt)
+            is_multiline = "\n" in text or height_pt > font_size * 2.5
 
-            # 📘 多行文本用两端对齐，单行用左对齐
             alignment = "justify" if is_multiline else "left"
 
             item = {
                 "key": f"pg{page_idx}_b{block_idx}",
                 "type": "pdf_block",
-                "full_text": block["text"],
+                "full_text": text,
                 "bbox": bbox_pt,
                 "text_bbox": bbox_pt,
-                "sub_bboxes": block["sub_bboxes_pt"],
-                "sub_bboxes_px": block["sub_bboxes_px"],
+                "sub_bboxes": [bbox_pt],
+                "sub_bboxes_px": [bbox_px],
                 "dominant_format": {
                     "font_name": "Unknown",
                     "font_size": font_size,
                     "font_color": "#000000",
-                    "bold": False,
+                    "bold": font_hint == "large",
                     "bbox": bbox_pt,
                 },
                 "alignment": alignment,

@@ -19,13 +19,6 @@ import sys
 import os
 import logging
 
-# 📘 教学笔记：修复 PyQt6 + ONNX Runtime DLL 冲突
-# PyQt6 会修改 Windows 的 DLL 搜索路径，导致 onnxruntime 的 DLL 找不到。
-# 必须在 import PyQt6 之前把 onnxruntime 的 DLL 目录加到搜索路径。
-if sys.platform == "win32":
-    _ort_capi = os.path.join(sys.prefix, "Lib", "site-packages", "onnxruntime", "capi")
-    if os.path.isdir(_ort_capi):
-        os.add_dll_directory(_ort_capi)
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QTextEdit, QProgressBar,
