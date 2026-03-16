@@ -136,8 +136,11 @@ def _detect_alignment(block_bbox: list, spans_info: list) -> str:
     - 文本起始 x 接近 block 左边界 → 左对齐
     - 文本起始 x 远离左边界，且结束 x 接近右边界 → 右对齐
     - 文本在 block 中间 → 居中
+    - 多行文本几乎填满 block → 两端对齐（justify）
 
-    对于数字、短文本块尤其重要——它们经常是居中或右对齐的。
+    📘 v2: 多行正文段落默认两端对齐
+    之前对"文本填满 block"的情况默认左对齐，导致英文译文右边参差不齐。
+    现在改为：如果是多行文本且宽度接近 block 宽度，用 justify。
     """
     if not spans_info:
         return "left"
@@ -156,9 +159,16 @@ def _detect_alignment(block_bbox: list, spans_info: list) -> str:
     right_margin = block_x1 - text_x1
     text_width = text_x1 - text_x0
 
-    # 📘 如果文本几乎填满 block，无法判断对齐，默认左对齐
+    # 📘 v2: 多行文本填满 block → 两端对齐
+    # 判断是否多行：检查 span 的 y 坐标是否有多个不同值
+    y_positions = set()
+    for s in spans_info:
+        y_positions.add(round(s["format"]["bbox"][1], 1))
+    is_multiline = len(y_positions) > 1
+
     if text_width > block_width * 0.85:
-        return "left"
+        # 📘 多行且填满 → justify，单行填满 → left
+        return "justify" if is_multiline else "left"
 
     # 📘 左右边距差异判断
     margin_diff = abs(left_margin - right_margin)

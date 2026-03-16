@@ -107,7 +107,7 @@ def _build_html_text(text: str, fontsize: float, font_color: str,
     """
     📘 构建 HTML 文本用于 insert_htmlbox。
     换行符 → <br>，特殊字符转义。
-    align: "left" / "center" / "right"
+    align: "left" / "center" / "right" / "justify"
     """
     safe_text = (text
                  .replace("&", "&amp;")
@@ -272,6 +272,7 @@ def write_pdf(
                     "left": fitz.TEXT_ALIGN_LEFT,
                     "center": fitz.TEXT_ALIGN_CENTER,
                     "right": fitz.TEXT_ALIGN_RIGHT,
+                    "justify": fitz.TEXT_ALIGN_JUSTIFY,
                 }
                 text_align = align_map.get(info["alignment"], fitz.TEXT_ALIGN_LEFT)
                 try:
