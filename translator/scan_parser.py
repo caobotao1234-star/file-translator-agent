@@ -1,33 +1,30 @@
 # translator/scan_parser.py
 # =============================================================
-# 📘 教学笔记：扫描件 PDF 解析器（v3 — 火山引擎 OCR API）
+# 📘 教学笔记：扫描件 PDF 解析器（v4 — RapidOCR v3）
 # =============================================================
 # 扫描件 PDF 里没有可选中的文字，每页是一张图片。
 # 普通 pdf_parser 用 PyMuPDF 的 get_text("dict") 提取文本，
 # 对扫描件会得到 0 个文本块。
 #
-# v1 用 RapidOCR（ONNX），但 onnxruntime DLL 在 PyQt6 + Python 3.14 下加载失败。
-# v2 用 Vision LLM 做 OCR，文字识别准但位置估算不靠谱（百分比坐标误差大）。
+# v1 用 RapidOCR v1（rapidocr-onnxruntime），DLL 在 PyQt6 + Python 3.14 下加载失败。
+# v2 用 Vision LLM 做 OCR，文字识别准但位置估算不靠谱。
+# v3 用火山引擎 OCR API（OCRNormal），但需要开通"视觉智能"服务，控制台 404。
 #
-# v3 改用火山引擎 OCR API（OCRNormal）：
-#   - 专业 OCR 引擎，bbox 精度像素级
-#   - 返回每行文字的精确多边形坐标（polygon）
-#   - 不需要额外安装包（volcengine SDK 已在 requirements.txt）
-#   - 用 AK/SK 认证（和 Ark API Key 是两套体系）
+# v4 改用 RapidOCR v3（新包名 rapidocr，和 v1 的 rapidocr-onnxruntime 不同）：
+#   - 基于 PaddleOCR 的 ONNX 推理，纯本地运行，不需要网络
+#   - 自带中英文 OCR 模型（PP-OCRv4），开箱即用
+#   - bbox 精度像素级（四边形 polygon）
+#   - 不需要 AK/SK 认证，不需要开通任何云服务
+#   - v3 修复了 v1 在 Python 3.14 下的 DLL 兼容性问题
 #
-# 📘 为什么专业 OCR 比 Vision LLM 好？
-# Vision LLM 擅长"理解"图片内容，但不擅长精确定位。
-# 它给出的位置是"大概在页面中间偏上"这种模糊描述。
-# 专业 OCR 引擎用的是文字检测模型（如 EAST/DB），
-# 输出的是像素级精确的 bounding box，误差通常 < 3px。
-# 翻译场景需要精确 bbox 来擦除原文和写入译文，所以必须用专业 OCR。
+# 📘 为什么 RapidOCR v3 能用而 v1 不行？
+# v1（rapidocr-onnxruntime）直接依赖 onnxruntime 的 C++ DLL，
+# 在 Python 3.14 + PyQt6 环境下 DLL 加载冲突。
+# v3（rapidocr）重构了引擎加载方式，解决了兼容性问题。
 # =============================================================
 
-import base64
-import json
-import os
 import fitz  # PyMuPDF
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from core.logger import get_logger
 
 logger = get_logger("scan_parser")
@@ -85,96 +82,79 @@ def detect_scan_pdf(filepath: str) -> bool:
         return False
 
 
-def _get_visual_service():
+def _get_ocr_engine():
     """
-    📘 教学笔记：初始化火山引擎视觉智能服务
+    📘 教学笔记：初始化 RapidOCR v3 引擎
 
-    OCR API 用 AK/SK 认证（和 Ark LLM 的 API Key 是两套体系）。
-    AK/SK 从 .env 读取，也支持环境变量 VOLC_ACCESSKEY / VOLC_SECRETKEY。
+    RapidOCR v3 自带 PP-OCRv4 模型（中英文），首次运行会自动下载。
+    引擎是线程安全的，可以复用。
+    这里用模块级缓存，避免每页都重新加载模型。
     """
-    from volcengine.visual.VisualService import VisualService
+    import logging
+    # 📘 抑制 RapidOCR 的 INFO 日志（模型加载信息），避免刷屏
+    # 必须在 import 之前设置，因为 RapidOCR 在 import 时就会输出日志
+    logging.getLogger("RapidOCR").setLevel(logging.WARNING)
+    logging.getLogger("rapidocr").setLevel(logging.WARNING)
 
-    ak = os.getenv("VOLC_ACCESSKEY", "")
-    sk = os.getenv("VOLC_SECRETKEY", "")
-
-    if not ak or not sk:
-        raise ValueError(
-            "扫描件 OCR 需要火山引擎 AK/SK。\n"
-            "请在 .env 中设置 VOLC_ACCESSKEY 和 VOLC_SECRETKEY。\n"
-            "获取方式：火山引擎控制台 → 访问控制 → 访问密钥"
-        )
-
-    vs = VisualService()
-    vs.set_ak(ak)
-    vs.set_sk(sk)
-    return vs
+    from rapidocr import RapidOCR
+    return RapidOCR()
 
 
-def _render_page_to_base64(doc: fitz.Document, page_idx: int) -> str:
-    """渲染 PDF 页面为 base64 JPEG"""
+# 📘 模块级缓存：OCR 引擎只初始化一次
+_ocr_engine = None
+
+
+def _ensure_ocr_engine():
+    """懒加载 OCR 引擎"""
+    global _ocr_engine
+    if _ocr_engine is None:
+        _ocr_engine = _get_ocr_engine()
+    return _ocr_engine
+
+
+def _render_page_to_png(doc: fitz.Document, page_idx: int) -> bytes:
+    """渲染 PDF 页面为 PNG bytes（RapidOCR 接受 bytes 输入）"""
     page = doc[page_idx]
     zoom = OCR_RENDER_DPI / 72.0
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat)
-    img_bytes = pix.tobytes("jpeg", jpg_quality=90)
-    return base64.b64encode(img_bytes).decode("utf-8")
+    return pix.tobytes("png")
 
 
-def _call_ocr_api(visual_service, img_b64: str, page_idx: int) -> List[dict]:
+def _call_ocr(engine, img_bytes: bytes, page_idx: int) -> List[dict]:
     """
-    📘 教学笔记：调用火山引擎 OCRNormal API
+    📘 教学笔记：调用 RapidOCR 识别单页
 
-    请求参数：image_base64（图片的 base64 编码）
-    返回格式：
-    {
-      "code": 10000,
-      "data": {
-        "line_texts": ["第一行文字", "第二行文字", ...],
-        "line_rects": [
-          [[x1,y1], [x2,y2], [x3,y3], [x4,y4]],  // 四个角的像素坐标
-          ...
-        ]
-      }
-    }
+    RapidOCR v3 的返回格式：
+      result.boxes:  numpy array, shape (N, 4, 2) — 每行 4 个角点的像素坐标
+      result.txts:   list[str] — 每行的文字
+      result.scores: list[float] — 每行的置信度
 
-    📘 line_rects 是四边形（polygon），不是矩形。
-    四个点顺序：左上、右上、右下、左下。
-    我们取外接矩形（min/max）作为 bbox。
+    boxes 的 4 个点顺序：左上、右上、右下、左下（和火山 OCR API 一样）。
     """
     try:
-        resp = visual_service.ocr_normal({"image_base64": img_b64})
+        result = engine(img_bytes)
     except Exception as e:
-        logger.error(f"OCR API 调用失败 (第 {page_idx + 1} 页): {e}")
+        logger.error(f"OCR 识别失败 (第 {page_idx + 1} 页): {e}")
         return []
 
-    code = resp.get("code", 0)
-    if code != 10000:
-        msg = resp.get("message", "未知错误")
-        logger.error(f"OCR API 返回错误 (第 {page_idx + 1} 页): code={code}, message={msg}")
+    if result is None or result.boxes is None or len(result.boxes) == 0:
         return []
 
-    data = resp.get("data", {})
-    line_texts = data.get("line_texts", [])
-    line_rects = data.get("line_rects", [])
-
-    if len(line_texts) != len(line_rects):
-        logger.warning(
-            f"OCR 结果数量不匹配: {len(line_texts)} texts vs {len(line_rects)} rects"
-        )
-
-    results = []
-    for i in range(min(len(line_texts), len(line_rects))):
-        text = line_texts[i].strip()
+    lines = []
+    for box, text, score in zip(result.boxes, result.txts, result.scores):
+        text = text.strip()
         if not text:
             continue
-
-        polygon = line_rects[i]  # [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-        results.append({
+        # box: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]] (numpy → list)
+        polygon = box.tolist()
+        lines.append({
             "text": text,
             "polygon": polygon,
+            "score": float(score),
         })
 
-    return results
+    return lines
 
 
 def _polygon_to_bbox_px(polygon: List[List[float]]) -> List[float]:
@@ -288,21 +268,17 @@ def _merge_nearby_lines(
 
 def parse_scan_pdf(filepath: str, vision_llm=None) -> Dict[str, Any]:
     """
-    📘 教学笔记：扫描件 PDF 解析主函数（v3 — 火山引擎 OCR API）
+    📘 教学笔记：扫描件 PDF 解析主函数（v4 — RapidOCR v3）
 
-    用专业 OCR 引擎识别每页的文字和精确位置。
+    用本地 OCR 引擎识别每页的文字和精确位置。
     输出格式和 pdf_parser.parse_pdf() 完全一致。
 
     参数 vision_llm 保留但不再使用（兼容旧调用）。
     """
-    # 📘 加载 .env（确保 VOLC_ACCESSKEY/VOLC_SECRETKEY 可用）
-    from dotenv import load_dotenv
-    load_dotenv()
-
-    visual_service = _get_visual_service()
+    engine = _ensure_ocr_engine()
 
     logger.info(f"开始扫描件 OCR 解析: {filepath}")
-    print(f"[🔍 OCR 解析] 正在用火山引擎 OCR 识别扫描件文字...", flush=True)
+    print(f"[🔍 OCR 解析] 正在用 RapidOCR 识别扫描件文字...", flush=True)
 
     doc = fitz.open(filepath)
     zoom = OCR_RENDER_DPI / 72.0
@@ -312,15 +288,14 @@ def parse_scan_pdf(filepath: str, vision_llm=None) -> Dict[str, Any]:
     for page_idx in range(len(doc)):
         page = doc[page_idx]
         page_width_pt = page.rect.width
-        page_height_pt = page.rect.height
 
         # 1. 渲染页面为图片
-        img_b64 = _render_page_to_base64(doc, page_idx)
+        img_bytes = _render_page_to_png(doc, page_idx)
 
         print(f"  [🔍 第 {page_idx + 1} 页] OCR 识别中...", flush=True)
 
-        # 2. 调用火山引擎 OCR API
-        ocr_lines = _call_ocr_api(visual_service, img_b64, page_idx)
+        # 2. 调用 RapidOCR
+        ocr_lines = _call_ocr(engine, img_bytes, page_idx)
         if not ocr_lines:
             logger.debug(f"第 {page_idx + 1} 页: 未识别到文字")
             continue
