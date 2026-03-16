@@ -18,10 +18,37 @@
 #   - 输出每个文字块的 bbox 和置信度
 # =============================================================
 
+import os
+import sys
 import fitz  # PyMuPDF
 import numpy as np
 from typing import Dict, Any, List, Optional
 from core.logger import get_logger
+
+# 📘 教学笔记：修复 PyQt6 环境下 ONNX Runtime DLL 加载失败
+# PyQt6 启动时会修改 DLL 搜索路径，导致 onnxruntime 的 C++ DLL 找不到。
+# 解决方案：在 import onnxruntime 之前，把相关 DLL 目录加到搜索路径。
+if sys.platform == "win32":
+    # 📘 把 venv 和系统的 DLL 目录都加上
+    _dll_dirs = [
+        os.path.join(sys.prefix, "DLLs"),
+        os.path.join(sys.prefix, "Library", "bin"),
+        os.path.join(sys.prefix, "Scripts"),
+        os.path.join(sys.prefix, "Lib", "site-packages", "onnxruntime", "capi"),
+    ]
+    for d in _dll_dirs:
+        if os.path.isdir(d):
+            try:
+                os.add_dll_directory(d)
+            except OSError:
+                pass
+    # 📘 也把 PATH 里的目录加上（兜底）
+    for d in os.environ.get("PATH", "").split(";"):
+        if d and os.path.isdir(d):
+            try:
+                os.add_dll_directory(d)
+            except OSError:
+                pass
 
 logger = get_logger("scan_parser")
 
