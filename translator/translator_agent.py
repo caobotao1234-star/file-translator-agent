@@ -52,6 +52,7 @@ class TranslatorAgent:
         max_workers: int = 1,
         debug: bool = False,
         scan_mode: str = "adaptive",
+        fixed_fontsize: float = 10.0,
     ):
         """
         参数：
@@ -61,10 +62,12 @@ class TranslatorAgent:
             batch_size: 每批翻译的段落数
             max_workers: 并行线程数（同时发多少个LLM请求）
             debug: 调试模式
-            scan_mode: 扫描件排版模式 "adaptive"(自适应字号) / "uniform"(统一字号)
+            scan_mode: 扫描件排版模式 "adaptive"/"aligned"/"fixed"
+            fixed_fontsize: 指定字号模式下的字号（pt）
         """
         self.debug = debug
         self.scan_mode = scan_mode  # 📘 扫描件排版模式
+        self.fixed_fontsize = fixed_fontsize  # 📘 指定字号（仅 fixed 模式生效）
         self.format_engine = FormatEngine()
 
         # 初始化 LLM 路由
@@ -203,7 +206,8 @@ class TranslatorAgent:
         elif is_scan:
             # 📘 扫描件走图像级写入（inpainting 擦除 + PIL 绘制）
             write_scan_pdf(parsed_data, translations, output_path, self.format_engine,
-                           source_path=input_path, scan_mode=self.scan_mode)
+                           source_path=input_path, scan_mode=self.scan_mode,
+                           fixed_fontsize=self.fixed_fontsize)
         else:  # 普通 PDF
             write_pdf(parsed_data, translations, output_path, self.format_engine,
                       source_path=input_path)
@@ -251,7 +255,7 @@ class TranslatorAgent:
                 elif is_scan:
                     write_scan_pdf(parsed_data, translations, output_path, self.format_engine,
                                    source_path=input_path, layout_overrides=layout_overrides,
-                                   scan_mode=self.scan_mode)
+                                   scan_mode=self.scan_mode, fixed_fontsize=self.fixed_fontsize)
                 else:  # 普通 PDF
                     write_pdf(parsed_data, translations, output_path, self.format_engine,
                               source_path=input_path, layout_overrides=layout_overrides)

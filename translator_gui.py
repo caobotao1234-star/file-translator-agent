@@ -674,11 +674,30 @@ class MainWindow(QMainWindow):
         self.scan_mode_combo.setToolTip(
             "扫描件 PDF 的字号策略：\n"
             "自适应字号：每个文字块保持原始字号，放不下自动缩小\n"
-            "统一字号：全页统一字号，框不够大向下扩展（适合证件类文档）"
+            "原文对齐：原文同字号的块，译文也用同一字号（保持层级）\n"
+            "指定字号：全部文本框使用右侧输入的字号"
         )
         self.scan_mode_combo.addItem("自适应字号", "adaptive")
-        self.scan_mode_combo.addItem("统一字号（证件推荐）", "uniform")
+        self.scan_mode_combo.addItem("原文对齐（证件推荐）", "aligned")
+        self.scan_mode_combo.addItem("指定字号", "fixed")
         scan_row.addWidget(self.scan_mode_combo, 1)
+
+        # 📘 指定字号输入框（仅 fixed 模式可用）
+        self.fixed_fontsize_spin = QSpinBox()
+        self.fixed_fontsize_spin.setRange(6, 72)
+        self.fixed_fontsize_spin.setValue(10)
+        self.fixed_fontsize_spin.setSuffix(" pt")
+        self.fixed_fontsize_spin.setFixedWidth(80)
+        self.fixed_fontsize_spin.setEnabled(False)
+        self.fixed_fontsize_spin.setToolTip("指定字号模式下，全部文本框使用此字号")
+        scan_row.addWidget(self.fixed_fontsize_spin)
+
+        # 📘 切换模式时，启用/禁用字号输入框
+        self.scan_mode_combo.currentIndexChanged.connect(
+            lambda: self.fixed_fontsize_spin.setEnabled(
+                self.scan_mode_combo.currentData() == "fixed"
+            )
+        )
         sg_layout.addLayout(scan_row)
 
         left_layout.addWidget(settings_group)
@@ -855,14 +874,17 @@ class MainWindow(QMainWindow):
 
         # 扫描件排版模式
         scan_mode = self.scan_mode_combo.currentData()
+        fixed_fontsize = float(self.fixed_fontsize_spin.value())
 
         self._append_log(f"初翻模型: {draft_model}", "info")
         self._append_log(f"审校模型: {review_model or '跳过'}", "info")
         self._append_log(f"目标语言: {target_lang}  |  批量: {batch_size}  |  线程: {max_workers}", "info")
         if vision_model:
             self._append_log(f"排版审校: {vision_model}", "info")
-        if scan_mode == "uniform":
-            self._append_log(f"扫描件排版: 统一字号", "info")
+        if scan_mode == "aligned":
+            self._append_log(f"扫描件排版: 原文对齐", "info")
+        elif scan_mode == "fixed":
+            self._append_log(f"扫描件排版: 指定字号 {fixed_fontsize}pt", "info")
         self._append_log(f"文件数: {len(files)}", "info")
         self._append_log("─" * 50, "info")
 
@@ -885,6 +907,7 @@ class MainWindow(QMainWindow):
                 max_workers=max_workers,
                 debug=True,
                 scan_mode=scan_mode,
+                fixed_fontsize=fixed_fontsize,
             )
             # 📘 教学笔记：共享格式引擎
             # GUI 里编辑的字体/样式映射表存在 self.format_engine 里，
@@ -987,6 +1010,7 @@ class MainWindow(QMainWindow):
         self.log_combo.setEnabled(not running)
         self.vision_combo.setEnabled(not running)
         self.scan_mode_combo.setEnabled(not running)
+        self.fixed_fontsize_spin.setEnabled(not running and self.scan_mode_combo.currentData() == "fixed")
         self.format_panel.setEnabled(not running)
 
     def _apply_log_level(self, level_name: str):

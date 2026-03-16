@@ -313,31 +313,96 @@ def _wrap_text(draw: ImageDraw.Draw, text: str, font: ImageFont.FreeTypeFont, ma
     return all_lines if all_lines else [""]
 
 
-def _compute_uniform_layout(items: List[dict], translations: Dict[str, str],
+def _compute_aligned_layout(items: List[dict], translations: Dict[str, str],
                             zoom: float, page_height_px: float) -> tuple:
     """
-    📘 教学笔记：统一字号模式 — 计算全局字号 + 扩展框（不重叠）
+    📘 教学笔记：原文对齐模式 — 同字号的块用同一个字号 + 扩展框（不重叠）
 
     策略：
-    1. 取所有块的中位数字号作为统一字号
-    2. 根据译文长度计算每个块需要的高度
+    1. 把原文字号四舍五入到整数，相同整数字号的块归为一组
+    2. 每组内：根据译文长度，找到能让所有块都放下的最大字号
+       （从原始字号开始，逐步缩小，直到每个块都能放下）
     3. 向下扩展 bbox，但不能和下一个块重叠
-    4. 返回 (uniform_fontsize_pt, expanded_bboxes_px)
+    4. 返回 (size_map: {key: fontsize_pt}, expanded_bboxes_px: {key: bbox})
+
+    📘 和"统一字号"的区别：
+    统一字号 = 全页一个字号（标题和正文一样大，不合理）
+    原文对齐 = 保持原文的字号层级（标题大、正文小），同级别内统一
     """
     if not items:
-        return 10.0, {}
+        return {}, {}
 
-    # 1. 计算中位数字号
-    sizes = [it["dominant_format"].get("font_size", 10) for it in items]
-    sizes.sort()
-    median_size = sizes[len(sizes) // 2]
-    # 📘 限制在合理范围：8~14pt，证件类文档不需要太大
-    uniform_size = max(8.0, min(14.0, median_size))
+    # 1. 按四舍五入字号分组
+    from collections import defaultdict
+    groups: Dict[int, List[dict]] = defaultdict(list)
+    for it in items:
+        fs = it["dominant_format"].get("font_size", 10)
+        rounded = round(fs)
+        groups[rounded].append(it)
 
-    # 2. 按 y 坐标排序，计算扩展空间
+    # 2. 每组计算统一字号
+    size_map = {}  # key -> fontsize_pt
+    for rounded_fs, group_items in groups.items():
+        # 组内统一用四舍五入后的字号
+        target_fs = float(rounded_fs)
+        for it in group_items:
+            size_map[it["key"]] = target_fs
+
+    # 3. 按 y 坐标排序，计算扩展空间
     sorted_items = sorted(items, key=lambda it: it["bbox"][1])
     expanded = {}
-    px_size = uniform_size * RENDER_DPI / 72.0
+
+    for i, item in enumerate(sorted_items):
+        key = item["key"]
+        if key not in translations or key not in size_map:
+            continue
+
+        fs = size_map[key]
+        px_size = fs * RENDER_DPI / 72.0
+        line_h = px_size * 1.3
+
+        bbox_px = [
+            item["bbox"][0] * zoom, item["bbox"][1] * zoom,
+            item["bbox"][2] * zoom, item["bbox"][3] * zoom,
+        ]
+        box_w = bbox_px[2] - bbox_px[0]
+        text = translations[key]
+
+        # 估算需要的行数
+        avg_char_w = px_size * 0.6
+        chars_per_line = max(1, int(box_w / avg_char_w))
+        needed_lines = max(1, -(-len(text) // chars_per_line))
+        needed_h = needed_lines * line_h + 4
+
+        current_h = bbox_px[3] - bbox_px[1]
+        if needed_h > current_h:
+            max_bottom = page_height_px - 5
+            if i + 1 < len(sorted_items):
+                next_top_px = sorted_items[i + 1]["bbox"][1] * zoom
+                max_bottom = next_top_px - 3
+            new_bottom = min(bbox_px[1] + needed_h, max_bottom)
+            bbox_px[3] = new_bottom
+
+        expanded[key] = bbox_px
+
+    return size_map, expanded
+
+
+def _compute_fixed_layout(items: List[dict], translations: Dict[str, str],
+                          zoom: float, page_height_px: float,
+                          fixed_size: float) -> tuple:
+    """
+    📘 教学笔记：指定字号模式 — 用户指定一个字号，全部文本框统一使用
+
+    和原文对齐模式共享扩展框逻辑，只是字号来源不同。
+    返回 (fixed_size, expanded_bboxes_px)
+    """
+    if not items:
+        return fixed_size, {}
+
+    sorted_items = sorted(items, key=lambda it: it["bbox"][1])
+    expanded = {}
+    px_size = fixed_size * RENDER_DPI / 72.0
     line_h = px_size * 1.3
 
     for i, item in enumerate(sorted_items):
@@ -352,26 +417,23 @@ def _compute_uniform_layout(items: List[dict], translations: Dict[str, str],
         box_w = bbox_px[2] - bbox_px[0]
         text = translations[key]
 
-        # 估算需要的行数
-        avg_char_w = px_size * 0.6  # 粗略估算
+        avg_char_w = px_size * 0.6
         chars_per_line = max(1, int(box_w / avg_char_w))
-        needed_lines = max(1, -(-len(text) // chars_per_line))  # ceil division
-        needed_h = needed_lines * line_h + 4  # 加点余量
+        needed_lines = max(1, -(-len(text) // chars_per_line))
+        needed_h = needed_lines * line_h + 4
 
         current_h = bbox_px[3] - bbox_px[1]
         if needed_h > current_h:
-            # 📘 向下扩展，但不能超过下一个块的顶部
-            max_bottom = page_height_px - 5  # 页面底部留 5px
+            max_bottom = page_height_px - 5
             if i + 1 < len(sorted_items):
                 next_top_px = sorted_items[i + 1]["bbox"][1] * zoom
-                max_bottom = next_top_px - 3  # 和下一个块留 3px 间距
-
+                max_bottom = next_top_px - 3
             new_bottom = min(bbox_px[1] + needed_h, max_bottom)
             bbox_px[3] = new_bottom
 
         expanded[key] = bbox_px
 
-    return uniform_size, expanded
+    return fixed_size, expanded
 
 
 def write_scan_pdf(
@@ -382,13 +444,15 @@ def write_scan_pdf(
     source_path: str = None,
     layout_overrides: Dict[str, dict] = None,
     scan_mode: str = "adaptive",
+    fixed_fontsize: float = 10.0,
 ):
     """
     📘 教学笔记：扫描件 PDF 写入主函数
 
-    scan_mode 两种模式：
+    scan_mode 三种模式：
     - "adaptive"（自适应字号）: 每个块用 OCR 估算的字号，放不下就缩小
-    - "uniform"（统一字号）: 全页统一字号，框不够大就向下扩展（不重叠）
+    - "aligned"（原文对齐）: 原文同字号的块，译文也用同一个字号，保持层级
+    - "fixed"（指定字号）: 用户指定一个字号，全部文本框统一使用
 
     📘 可编辑 PDF：
     在图片层之上叠加透明文本层（PyMuPDF insert_text），
@@ -399,7 +463,8 @@ def write_scan_pdf(
     if layout_overrides is None:
         layout_overrides = {}
 
-    mode_name = "统一字号" if scan_mode == "uniform" else "自适应字号"
+    mode_names = {"adaptive": "自适应字号", "aligned": "原文对齐", "fixed": f"指定字号({fixed_fontsize}pt)"}
+    mode_name = mode_names.get(scan_mode, scan_mode)
     logger.info(f"开始生成扫描件 PDF: {output_path} (模式: {mode_name})")
     print(f"[📝 扫描件写入] 擦除原文 + 写入译文 ({mode_name})...", flush=True)
 
@@ -435,15 +500,23 @@ def write_scan_pdf(
 
         items = page_items.get(page_idx, [])
 
-        # 📘 统一字号模式：预计算全局字号和扩展框
-        uniform_size = None
-        expanded_bboxes = {}
-        if scan_mode == "uniform" and items:
+        # 📘 非自适应模式：预计算字号和扩展框
+        aligned_size_map = {}   # key -> fontsize_pt（原文对齐模式）
+        fixed_size_val = None   # float（指定字号模式）
+        expanded_bboxes = {}    # key -> bbox_px
+
+        if scan_mode == "aligned" and items:
             page_h_px = page_height * zoom
-            uniform_size, expanded_bboxes = _compute_uniform_layout(
+            aligned_size_map, expanded_bboxes = _compute_aligned_layout(
                 items, translations, zoom, page_h_px
             )
-            logger.debug(f"第 {page_idx+1} 页: 统一字号 {uniform_size}pt")
+            logger.debug(f"第 {page_idx+1} 页: 原文对齐模式，{len(set(aligned_size_map.values()))} 种字号")
+        elif scan_mode == "fixed" and items:
+            page_h_px = page_height * zoom
+            fixed_size_val, expanded_bboxes = _compute_fixed_layout(
+                items, translations, zoom, page_h_px, fixed_fontsize
+            )
+            logger.debug(f"第 {page_idx+1} 页: 指定字号 {fixed_size_val}pt")
 
         # 📘 收集文本层数据（用于可编辑 PDF）
         text_layer_items = []
@@ -466,8 +539,8 @@ def write_scan_pdf(
                     bg_color, variance = _sample_background_color(img, sub_bbox_px)
                     img = _erase_text_region(img, sub_bbox_px, bg_color, variance)
 
-                # 📘 统一字号模式：用扩展后的 bbox 和统一字号
-                if scan_mode == "uniform" and key in expanded_bboxes:
+                # 📘 根据模式决定字号和 bbox
+                if scan_mode in ("aligned", "fixed") and key in expanded_bboxes:
                     bbox_px = expanded_bboxes[key]
                     # 扩展区域也需要擦除背景
                     orig_px = sub_bboxes_px[0] if sub_bboxes_px else bbox_px
@@ -475,7 +548,11 @@ def write_scan_pdf(
                         extra = [bbox_px[0], orig_px[3], bbox_px[2], bbox_px[3]]
                         bg_c, var = _sample_background_color(img, extra)
                         img = _erase_text_region(img, extra, bg_c, var)
-                    font_size = uniform_size
+                    # 📘 原文对齐：从 size_map 取；指定字号：用固定值
+                    if scan_mode == "aligned":
+                        font_size = aligned_size_map.get(key, 10.0)
+                    else:
+                        font_size = fixed_size_val
                 else:
                     bbox_pt = item["bbox"]
                     bbox_px = [
