@@ -11,6 +11,8 @@ from translator.pptx_parser import parse_pptx
 from translator.pptx_writer import write_pptx
 from translator.pdf_parser import parse_pdf
 from translator.pdf_writer import write_pdf
+from translator.scan_parser import detect_scan_pdf, parse_scan_pdf
+from translator.scan_writer import write_scan_pdf
 from translator.format_engine import FormatEngine
 from translator.translate_pipeline import TranslatePipeline
 from translator.com_engine import is_com_available, extract_extra_texts, write_extra_texts
@@ -136,6 +138,7 @@ class TranslatorAgent:
 
         # 1. 解析文档（按格式分发）
         print(f"[📄 解析文档] {input_path}")
+        is_scan = False  # 📘 标记是否为扫描件
         if ext == ".docx":
             parsed_data = parse_docx(input_path)
             para_count = sum(1 for i in parsed_data["items"]
@@ -145,7 +148,16 @@ class TranslatorAgent:
             para_count = sum(1 for i in parsed_data["items"]
                              if i["type"] == "slide_text")
         else:  # .pdf
-            parsed_data = parse_pdf(input_path)
+            # 📘 教学笔记：扫描件自动检测
+            # 先检测是否为扫描件（每页文本块数 < 阈值）。
+            # 扫描件走 OCR 解析，普通 PDF 走文本提取。
+            # 后续翻译流程完全一样，只有写入策略不同。
+            is_scan = detect_scan_pdf(input_path)
+            if is_scan:
+                print(f"[🔍 检测到扫描件] 将使用 OCR 识别文字", flush=True)
+                parsed_data = parse_scan_pdf(input_path)
+            else:
+                parsed_data = parse_pdf(input_path)
             para_count = sum(1 for i in parsed_data["items"]
                              if i["type"] == "pdf_block")
 
@@ -185,7 +197,11 @@ class TranslatorAgent:
         elif ext == ".pptx":
             write_pptx(parsed_data, translations, output_path, self.format_engine,
                        source_path=input_path)
-        else:  # .pdf
+        elif is_scan:
+            # 📘 扫描件走图像级写入（inpainting 擦除 + PIL 绘制）
+            write_scan_pdf(parsed_data, translations, output_path, self.format_engine,
+                           source_path=input_path)
+        else:  # 普通 PDF
             write_pdf(parsed_data, translations, output_path, self.format_engine,
                       source_path=input_path)
 
@@ -229,7 +245,10 @@ class TranslatorAgent:
                 if ext == ".pptx":
                     write_pptx(parsed_data, translations, output_path, self.format_engine,
                                source_path=input_path)
-                else:  # .pdf
+                elif is_scan:
+                    write_scan_pdf(parsed_data, translations, output_path, self.format_engine,
+                                   source_path=input_path, layout_overrides=layout_overrides)
+                else:  # 普通 PDF
                     write_pdf(parsed_data, translations, output_path, self.format_engine,
                               source_path=input_path, layout_overrides=layout_overrides)
 

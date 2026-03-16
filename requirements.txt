@@ -5,5 +5,7 @@ python-docx
 python-pptx
 pywin32; sys_platform == "win32"
 PyMuPDF
+opencv-python
+rapidocr-onnxruntime
 
 PyQt6
