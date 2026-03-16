@@ -155,11 +155,7 @@ class TranslatorAgent:
             is_scan = detect_scan_pdf(input_path)
             if is_scan:
                 print(f"[🔍 检测到扫描件] 将使用 OCR 识别文字", flush=True)
-                # 📘 教学笔记：复用 Vision LLM 做 OCR
-                # 如果排版审校 Agent 已启用，复用它的 vision_llm 实例，
-                # 避免重复创建 LLM engine。否则 parse_scan_pdf 会自动创建。
-                scan_vision_llm = self.layout_agent.vision_llm if self.layout_agent else None
-                parsed_data = parse_scan_pdf(input_path, vision_llm=scan_vision_llm)
+                parsed_data = parse_scan_pdf(input_path)
             else:
                 parsed_data = parse_pdf(input_path)
             para_count = sum(1 for i in parsed_data["items"]

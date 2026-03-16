@@ -1,78 +1,43 @@
 # translator/scan_parser.py
 # =============================================================
-# 📘 教学笔记：扫描件 PDF 解析器（v2 — Vision LLM OCR）
+# 📘 教学笔记：扫描件 PDF 解析器（v3 — 火山引擎 OCR API）
 # =============================================================
 # 扫描件 PDF 里没有可选中的文字，每页是一张图片。
 # 普通 pdf_parser 用 PyMuPDF 的 get_text("dict") 提取文本，
 # 对扫描件会得到 0 个文本块。
 #
-# v1 用 RapidOCR（ONNX），但在 PyQt6 + Python 3.14 环境下
-# onnxruntime 的 DLL 加载失败。
+# v1 用 RapidOCR（ONNX），但 onnxruntime DLL 在 PyQt6 + Python 3.14 下加载失败。
+# v2 用 Vision LLM 做 OCR，文字识别准但位置估算不靠谱（百分比坐标误差大）。
 #
-# v2 改用多模态 Vision LLM 做 OCR：
-#   - 直接复用用户已有的 doubao-seed-1.8 模型
-#   - 不需要额外安装任何包
-#   - 能识别中英文混合文本
-#   - 输出结构化 JSON（文字 + 在页面中的相对位置）
-#   - 位置精度不如传统 OCR，但对翻译场景够用
+# v3 改用火山引擎 OCR API（OCRNormal）：
+#   - 专业 OCR 引擎，bbox 精度像素级
+#   - 返回每行文字的精确多边形坐标（polygon）
+#   - 不需要额外安装包（volcengine SDK 已在 requirements.txt）
+#   - 用 AK/SK 认证（和 Ark API Key 是两套体系）
 #
-# 📘 为什么 Vision LLM 做 OCR 可行？
-# 传统 OCR 的优势是精确的 bbox 坐标（像素级）。
-# 但扫描件翻译场景中，我们不需要像素级精度：
-#   - 擦除原文用的是 OCR 行级 bbox（粗粒度就够）
-#   - 写入译文用的是合并后的段落 bbox
-#   - Vision LLM 能给出"上/中/下"、"左/中/右"的区域描述
-#   - 结合页面尺寸可以估算出合理的 bbox
+# 📘 为什么专业 OCR 比 Vision LLM 好？
+# Vision LLM 擅长"理解"图片内容，但不擅长精确定位。
+# 它给出的位置是"大概在页面中间偏上"这种模糊描述。
+# 专业 OCR 引擎用的是文字检测模型（如 EAST/DB），
+# 输出的是像素级精确的 bounding box，误差通常 < 3px。
+# 翻译场景需要精确 bbox 来擦除原文和写入译文，所以必须用专业 OCR。
 # =============================================================
 
 import base64
 import json
+import os
 import fitz  # PyMuPDF
-import numpy as np
 from typing import Dict, Any, List, Optional
-from core.llm_engine import ArkLLMEngine
 from core.logger import get_logger
 
 logger = get_logger("scan_parser")
 
-# 📘 OCR 渲染 DPI：150 够 Vision LLM 看清文字
+# 📘 OCR 渲染 DPI：150 够 OCR 引擎识别，又不会太大
+# scan_writer 必须用同样的 DPI，像素坐标才能对上
 OCR_RENDER_DPI = 150
 
 # 📘 扫描件判定阈值
 SCAN_THRESHOLD_BLOCKS_PER_PAGE = 2
-
-# 📘 Vision OCR Prompt：让 LLM 识别图片中的所有文字并给出位置
-VISION_OCR_PROMPT = """你是专业的 OCR 文字识别专家。请仔细识别这张图片中的所有文字内容。
-
-要求：
-1. 识别图片中每一个独立的文字区域（标题、正文段落、表格文字、页眉页脚等）
-2. 对每个文字区域，给出：
-   - text: 识别出的完整文字内容（保持原文，不要翻译）
-   - position: 文字在页面中的位置，用百分比表示
-     - x: 左边界距页面左侧的百分比（0-100）
-     - y: 上边界距页面顶部的百分比（0-100）
-     - w: 宽度占页面宽度的百分比（0-100）
-     - h: 高度占页面高度的百分比（0-100）
-   - font_size_hint: 估算的字号大小（"large"=标题, "medium"=正文, "small"=注释/页脚）
-
-3. 按从上到下、从左到右的阅读顺序排列
-4. 不要遗漏任何文字，包括小字、水印、印章上的文字
-5. 如果某段文字跨多行，合并为一个区域
-
-输出格式：严格 JSON 数组。不要输出其他内容。
-示例：
-[
-  {
-    "text": "出生医学证明",
-    "position": {"x": 25, "y": 5, "w": 50, "h": 6},
-    "font_size_hint": "large"
-  },
-  {
-    "text": "姓名：张三\\n性别：男\\n出生日期：2024年1月1日",
-    "position": {"x": 10, "y": 20, "w": 80, "h": 15},
-    "font_size_hint": "medium"
-  }
-]"""
 
 
 def detect_scan_pdf(filepath: str) -> bool:
@@ -120,6 +85,31 @@ def detect_scan_pdf(filepath: str) -> bool:
         return False
 
 
+def _get_visual_service():
+    """
+    📘 教学笔记：初始化火山引擎视觉智能服务
+
+    OCR API 用 AK/SK 认证（和 Ark LLM 的 API Key 是两套体系）。
+    AK/SK 从 .env 读取，也支持环境变量 VOLC_ACCESSKEY / VOLC_SECRETKEY。
+    """
+    from volcengine.visual.VisualService import VisualService
+
+    ak = os.getenv("VOLC_ACCESSKEY", "")
+    sk = os.getenv("VOLC_SECRETKEY", "")
+
+    if not ak or not sk:
+        raise ValueError(
+            "扫描件 OCR 需要火山引擎 AK/SK。\n"
+            "请在 .env 中设置 VOLC_ACCESSKEY 和 VOLC_SECRETKEY。\n"
+            "获取方式：火山引擎控制台 → 访问控制 → 访问密钥"
+        )
+
+    vs = VisualService()
+    vs.set_ak(ak)
+    vs.set_sk(sk)
+    return vs
+
+
 def _render_page_to_base64(doc: fitz.Document, page_idx: int) -> str:
     """渲染 PDF 页面为 base64 JPEG"""
     page = doc[page_idx]
@@ -130,124 +120,189 @@ def _render_page_to_base64(doc: fitz.Document, page_idx: int) -> str:
     return base64.b64encode(img_bytes).decode("utf-8")
 
 
-def _render_page_to_numpy(doc: fitz.Document, page_idx: int) -> np.ndarray:
-    """渲染 PDF 页面为 numpy 数组（RGB），供 scan_writer 使用"""
-    page = doc[page_idx]
-    zoom = OCR_RENDER_DPI / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat)
-    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-    if pix.n == 4:
-        img = img[:, :, :3]
-    return img
-
-
-def _call_vision_ocr(vision_llm: ArkLLMEngine, img_b64: str, page_idx: int) -> List[dict]:
+def _call_ocr_api(visual_service, img_b64: str, page_idx: int) -> List[dict]:
     """
-    📘 教学笔记：用 Vision LLM 做 OCR
+    📘 教学笔记：调用火山引擎 OCRNormal API
 
-    发送页面图片给多模态模型，让它识别所有文字并给出位置。
-    返回结构化的文字块列表。
+    请求参数：image_base64（图片的 base64 编码）
+    返回格式：
+    {
+      "code": 10000,
+      "data": {
+        "line_texts": ["第一行文字", "第二行文字", ...],
+        "line_rects": [
+          [[x1,y1], [x2,y2], [x3,y3], [x4,y4]],  // 四个角的像素坐标
+          ...
+        ]
+      }
+    }
+
+    📘 line_rects 是四边形（polygon），不是矩形。
+    四个点顺序：左上、右上、右下、左下。
+    我们取外接矩形（min/max）作为 bbox。
     """
-    messages = [
-        {"role": "system", "content": VISION_OCR_PROMPT},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": f"请识别第 {page_idx + 1} 页中的所有文字。"},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
-                },
-            ],
-        },
-    ]
-
-    full_text = ""
     try:
-        for chunk in vision_llm.stream_chat(messages):
-            if chunk["type"] == "text":
-                full_text += chunk["content"]
+        resp = visual_service.ocr_normal({"image_base64": img_b64})
     except Exception as e:
-        logger.error(f"Vision OCR 调用失败 (第 {page_idx + 1} 页): {e}")
+        logger.error(f"OCR API 调用失败 (第 {page_idx + 1} 页): {e}")
         return []
 
-    # 解析 JSON
-    text = full_text.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        text = "\n".join(lines).strip()
+    code = resp.get("code", 0)
+    if code != 10000:
+        msg = resp.get("message", "未知错误")
+        logger.error(f"OCR API 返回错误 (第 {page_idx + 1} 页): code={code}, message={msg}")
+        return []
 
-    try:
-        result = json.loads(text)
-        if isinstance(result, list):
-            return result
-    except json.JSONDecodeError:
-        logger.warning(f"Vision OCR 结果解析失败 (第 {page_idx + 1} 页): {text[:200]}")
-    return []
+    data = resp.get("data", {})
+    line_texts = data.get("line_texts", [])
+    line_rects = data.get("line_rects", [])
+
+    if len(line_texts) != len(line_rects):
+        logger.warning(
+            f"OCR 结果数量不匹配: {len(line_texts)} texts vs {len(line_rects)} rects"
+        )
+
+    results = []
+    for i in range(min(len(line_texts), len(line_rects))):
+        text = line_texts[i].strip()
+        if not text:
+            continue
+
+        polygon = line_rects[i]  # [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+        results.append({
+            "text": text,
+            "polygon": polygon,
+        })
+
+    return results
 
 
-def _position_to_bbox(position: dict, page_width: float, page_height: float) -> List[float]:
+def _polygon_to_bbox_px(polygon: List[List[float]]) -> List[float]:
     """
-    📘 把 Vision LLM 给出的百分比位置转换为 PDF 点坐标
+    📘 四边形 polygon → 外接矩形 [x0, y0, x1, y1]（像素坐标）
 
-    position: {"x": 25, "y": 5, "w": 50, "h": 6}  (百分比)
-    返回: [x0, y0, x1, y1]  (PDF 点坐标)
+    polygon: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+    返回: [x_min, y_min, x_max, y_max]
     """
-    x_pct = max(0, min(100, position.get("x", 0)))
-    y_pct = max(0, min(100, position.get("y", 0)))
-    w_pct = max(1, min(100, position.get("w", 10)))
-    h_pct = max(1, min(100, position.get("h", 5)))
-
-    x0 = page_width * x_pct / 100.0
-    y0 = page_height * y_pct / 100.0
-    x1 = x0 + page_width * w_pct / 100.0
-    y1 = y0 + page_height * h_pct / 100.0
-
-    return [x0, y0, x1, y1]
+    xs = [p[0] for p in polygon]
+    ys = [p[1] for p in polygon]
+    return [min(xs), min(ys), max(xs), max(ys)]
 
 
-def _position_to_bbox_px(position: dict, img_width: int, img_height: int) -> List[float]:
-    """百分比位置 → 像素坐标（scan_writer 用）"""
-    x_pct = max(0, min(100, position.get("x", 0)))
-    y_pct = max(0, min(100, position.get("y", 0)))
-    w_pct = max(1, min(100, position.get("w", 10)))
-    h_pct = max(1, min(100, position.get("h", 5)))
-
-    x0 = img_width * x_pct / 100.0
-    y0 = img_height * y_pct / 100.0
-    x1 = x0 + img_width * w_pct / 100.0
-    y1 = y0 + img_height * h_pct / 100.0
-
-    return [x0, y0, x1, y1]
+def _bbox_px_to_pt(bbox_px: List[float], zoom: float) -> List[float]:
+    """像素坐标 → PDF 点坐标（除以 zoom）"""
+    return [v / zoom for v in bbox_px]
 
 
-def _font_size_from_hint(hint: str, bbox_height_pt: float) -> float:
-    """从 LLM 的字号提示估算实际字号"""
-    hint_map = {"large": 0.6, "medium": 0.7, "small": 0.75}
-    factor = hint_map.get(hint, 0.7)
-    return max(6.0, round(bbox_height_pt * factor, 1))
-
-
-def parse_scan_pdf(filepath: str, vision_llm: ArkLLMEngine = None) -> Dict[str, Any]:
+def _estimate_font_size(bbox_height_pt: float, text: str) -> float:
     """
-    📘 教学笔记：扫描件 PDF 解析主函数（v2 — Vision LLM OCR）
+    📘 从 bbox 高度估算字号
 
-    用多模态 Vision LLM 识别每页的文字和位置。
-    如果没有传入 vision_llm，自动创建一个（用默认模型）。
+    单行文本：字号 ≈ bbox 高度 × 0.75（考虑行距）
+    多行文本：字号 ≈ bbox 高度 / 行数 × 0.75
+    """
+    line_count = max(1, text.count("\n") + 1)
+    per_line_height = bbox_height_pt / line_count
+    return max(6.0, round(per_line_height * 0.75, 1))
 
+
+def _merge_nearby_lines(
+    ocr_lines: List[dict],
+    zoom: float,
+    page_width_pt: float,
+    merge_threshold_pt: float = 3.0,
+) -> List[dict]:
+    """
+    📘 教学笔记：合并相邻行为段落
+
+    OCR 返回的是行级结果，但翻译需要段落级。
+    合并策略：
+    - 两行的 x 范围重叠（水平对齐）
+    - 两行的 y 间距 < 阈值（垂直相邻）
+    - 合并后的文本用换行符连接
+    - bbox 取所有行的外接矩形
+
+    📘 为什么要合并？
+    如果不合并，"装配式建筑全生态产业链服务商" 可能被拆成两行分别翻译，
+    译文就会变成两个独立的短句，失去上下文。
+    合并后作为一个段落翻译，质量更好。
+    """
+    if not ocr_lines:
+        return []
+
+    # 先转换为统一格式
+    items = []
+    for line in ocr_lines:
+        bbox_px = _polygon_to_bbox_px(line["polygon"])
+        bbox_pt = _bbox_px_to_pt(bbox_px, zoom)
+        items.append({
+            "text": line["text"],
+            "bbox_px": bbox_px,
+            "bbox_pt": bbox_pt,
+        })
+
+    # 按 y 坐标排序
+    items.sort(key=lambda it: it["bbox_pt"][1])
+
+    merged = []
+    current = items[0]
+
+    for i in range(1, len(items)):
+        nxt = items[i]
+
+        # 当前块和下一块的垂直间距
+        gap_y = nxt["bbox_pt"][1] - current["bbox_pt"][3]
+
+        # 水平重叠检测：两个块的 x 范围是否有交集
+        x_overlap = (
+            min(current["bbox_pt"][2], nxt["bbox_pt"][2])
+            - max(current["bbox_pt"][0], nxt["bbox_pt"][0])
+        )
+        # 当前块的高度（用于估算行距阈值）
+        current_height = current["bbox_pt"][3] - current["bbox_pt"][1]
+        # 📘 动态阈值：行距 < 当前块高度的 1.2 倍 → 认为是同一段落
+        dynamic_threshold = max(merge_threshold_pt, current_height * 1.2)
+
+        if gap_y < dynamic_threshold and x_overlap > 0:
+            # 合并
+            current["text"] += "\n" + nxt["text"]
+            current["bbox_px"] = [
+                min(current["bbox_px"][0], nxt["bbox_px"][0]),
+                min(current["bbox_px"][1], nxt["bbox_px"][1]),
+                max(current["bbox_px"][2], nxt["bbox_px"][2]),
+                max(current["bbox_px"][3], nxt["bbox_px"][3]),
+            ]
+            current["bbox_pt"] = [
+                min(current["bbox_pt"][0], nxt["bbox_pt"][0]),
+                min(current["bbox_pt"][1], nxt["bbox_pt"][1]),
+                max(current["bbox_pt"][2], nxt["bbox_pt"][2]),
+                max(current["bbox_pt"][3], nxt["bbox_pt"][3]),
+            ]
+        else:
+            merged.append(current)
+            current = nxt
+
+    merged.append(current)
+    return merged
+
+
+def parse_scan_pdf(filepath: str, vision_llm=None) -> Dict[str, Any]:
+    """
+    📘 教学笔记：扫描件 PDF 解析主函数（v3 — 火山引擎 OCR API）
+
+    用专业 OCR 引擎识别每页的文字和精确位置。
     输出格式和 pdf_parser.parse_pdf() 完全一致。
-    """
-    # 📘 如果没有传入 vision_llm，用默认配置创建
-    if vision_llm is None:
-        from config.settings import Config
-        model_id = Config.VISION_MODEL_ID or Config.DEFAULT_MODEL_ID
-        vision_llm = ArkLLMEngine(api_key=Config.ARK_API_KEY, model_id=model_id)
-        logger.info(f"扫描件 OCR 使用模型: {model_id}")
 
-    logger.info(f"开始扫描件 Vision OCR 解析: {filepath}")
-    print(f"[🔍 OCR 解析] 正在用 Vision 模型识别扫描件文字...", flush=True)
+    参数 vision_llm 保留但不再使用（兼容旧调用）。
+    """
+    # 📘 加载 .env（确保 VOLC_ACCESSKEY/VOLC_SECRETKEY 可用）
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    visual_service = _get_visual_service()
+
+    logger.info(f"开始扫描件 OCR 解析: {filepath}")
+    print(f"[🔍 OCR 解析] 正在用火山引擎 OCR 识别扫描件文字...", flush=True)
 
     doc = fitz.open(filepath)
     zoom = OCR_RENDER_DPI / 72.0
@@ -262,37 +317,29 @@ def parse_scan_pdf(filepath: str, vision_llm: ArkLLMEngine = None) -> Dict[str, 
         # 1. 渲染页面为图片
         img_b64 = _render_page_to_base64(doc, page_idx)
 
-        # 📘 也渲染 numpy 版本，用于计算像素坐标
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-        img_w_px, img_h_px = pix.w, pix.h
+        print(f"  [🔍 第 {page_idx + 1} 页] OCR 识别中...", flush=True)
 
-        print(f"  [🔍 第 {page_idx + 1} 页] Vision OCR 识别中...", flush=True)
-
-        # 2. Vision LLM OCR
-        ocr_results = _call_vision_ocr(vision_llm, img_b64, page_idx)
-        if not ocr_results:
+        # 2. 调用火山引擎 OCR API
+        ocr_lines = _call_ocr_api(visual_service, img_b64, page_idx)
+        if not ocr_lines:
             logger.debug(f"第 {page_idx + 1} 页: 未识别到文字")
             continue
 
-        logger.info(f"第 {page_idx + 1} 页: 识别到 {len(ocr_results)} 个文字区域")
+        logger.info(f"第 {page_idx + 1} 页: 识别到 {len(ocr_lines)} 行文字")
 
-        # 3. 转换为标准 parsed_data 格式
-        for block_idx, block in enumerate(ocr_results):
-            text = block.get("text", "").strip()
-            if not text:
-                continue
+        # 3. 合并相邻行为段落
+        merged_blocks = _merge_nearby_lines(ocr_lines, zoom, page_width_pt)
+        logger.info(f"第 {page_idx + 1} 页: 合并为 {len(merged_blocks)} 个段落")
 
-            position = block.get("position", {})
-            font_hint = block.get("font_size_hint", "medium")
-
-            # 百分比 → PDF 点坐标
-            bbox_pt = _position_to_bbox(position, page_width_pt, page_height_pt)
-            bbox_px = _position_to_bbox_px(position, img_w_px, img_h_px)
+        # 4. 转换为标准 parsed_data 格式
+        for block_idx, block in enumerate(merged_blocks):
+            text = block["text"]
+            bbox_pt = block["bbox_pt"]
+            bbox_px = block["bbox_px"]
 
             height_pt = bbox_pt[3] - bbox_pt[1]
-            font_size = _font_size_from_hint(font_hint, height_pt)
+            font_size = _estimate_font_size(height_pt, text)
             is_multiline = "\n" in text or height_pt > font_size * 2.5
-
             alignment = "justify" if is_multiline else "left"
 
             item = {
@@ -307,7 +354,7 @@ def parse_scan_pdf(filepath: str, vision_llm: ArkLLMEngine = None) -> Dict[str, 
                     "font_name": "Unknown",
                     "font_size": font_size,
                     "font_color": "#000000",
-                    "bold": font_hint == "large",
+                    "bold": font_size >= 14,
                     "bbox": bbox_pt,
                 },
                 "alignment": alignment,

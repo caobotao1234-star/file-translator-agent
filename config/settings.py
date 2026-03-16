@@ -9,6 +9,8 @@ class Config:
     ARK_API_KEY = os.getenv("ARK_API_KEY")
     DEFAULT_MODEL_ID = os.getenv("DEFAULT_MODEL_ID")
     VISION_MODEL_ID = os.getenv("VISION_MODEL_ID", "")
+    VOLC_ACCESSKEY = os.getenv("VOLC_ACCESSKEY", "")
+    VOLC_SECRETKEY = os.getenv("VOLC_SECRETKEY", "")
 
     if not ARK_API_KEY:
         raise ValueError("请在 .env 文件中设置 ARK_API_KEY")
