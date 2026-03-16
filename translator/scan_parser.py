@@ -243,7 +243,7 @@ def parse_scan_pdf(filepath: str, vision_llm: ArkLLMEngine = None) -> Dict[str, 
     if vision_llm is None:
         from config.settings import Config
         model_id = Config.VISION_MODEL_ID or Config.DEFAULT_MODEL_ID
-        vision_llm = ArkLLMEngine(model_id=model_id)
+        vision_llm = ArkLLMEngine(api_key=Config.ARK_API_KEY, model_id=model_id)
         logger.info(f"扫描件 OCR 使用模型: {model_id}")
 
     logger.info(f"开始扫描件 Vision OCR 解析: {filepath}")
