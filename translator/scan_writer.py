@@ -313,6 +313,67 @@ def _wrap_text(draw: ImageDraw.Draw, text: str, font: ImageFont.FreeTypeFont, ma
     return all_lines if all_lines else [""]
 
 
+def _compute_uniform_layout(items: List[dict], translations: Dict[str, str],
+                            zoom: float, page_height_px: float) -> tuple:
+    """
+    📘 教学笔记：统一字号模式 — 计算全局字号 + 扩展框（不重叠）
+
+    策略：
+    1. 取所有块的中位数字号作为统一字号
+    2. 根据译文长度计算每个块需要的高度
+    3. 向下扩展 bbox，但不能和下一个块重叠
+    4. 返回 (uniform_fontsize_pt, expanded_bboxes_px)
+    """
+    if not items:
+        return 10.0, {}
+
+    # 1. 计算中位数字号
+    sizes = [it["dominant_format"].get("font_size", 10) for it in items]
+    sizes.sort()
+    median_size = sizes[len(sizes) // 2]
+    # 📘 限制在合理范围：8~14pt，证件类文档不需要太大
+    uniform_size = max(8.0, min(14.0, median_size))
+
+    # 2. 按 y 坐标排序，计算扩展空间
+    sorted_items = sorted(items, key=lambda it: it["bbox"][1])
+    expanded = {}
+    px_size = uniform_size * RENDER_DPI / 72.0
+    line_h = px_size * 1.3
+
+    for i, item in enumerate(sorted_items):
+        key = item["key"]
+        if key not in translations:
+            continue
+
+        bbox_px = [
+            item["bbox"][0] * zoom, item["bbox"][1] * zoom,
+            item["bbox"][2] * zoom, item["bbox"][3] * zoom,
+        ]
+        box_w = bbox_px[2] - bbox_px[0]
+        text = translations[key]
+
+        # 估算需要的行数
+        avg_char_w = px_size * 0.6  # 粗略估算
+        chars_per_line = max(1, int(box_w / avg_char_w))
+        needed_lines = max(1, -(-len(text) // chars_per_line))  # ceil division
+        needed_h = needed_lines * line_h + 4  # 加点余量
+
+        current_h = bbox_px[3] - bbox_px[1]
+        if needed_h > current_h:
+            # 📘 向下扩展，但不能超过下一个块的顶部
+            max_bottom = page_height_px - 5  # 页面底部留 5px
+            if i + 1 < len(sorted_items):
+                next_top_px = sorted_items[i + 1]["bbox"][1] * zoom
+                max_bottom = next_top_px - 3  # 和下一个块留 3px 间距
+
+            new_bottom = min(bbox_px[1] + needed_h, max_bottom)
+            bbox_px[3] = new_bottom
+
+        expanded[key] = bbox_px
+
+    return uniform_size, expanded
+
+
 def write_scan_pdf(
     parsed_data: Dict[str, Any],
     translations: Dict[str, str],
@@ -320,29 +381,27 @@ def write_scan_pdf(
     format_engine: FormatEngine,
     source_path: str = None,
     layout_overrides: Dict[str, dict] = None,
+    scan_mode: str = "adaptive",
 ):
     """
     📘 教学笔记：扫描件 PDF 写入主函数
 
-    流程：
-    1. 逐页渲染原 PDF 为图片
-    2. 对每个翻译块：
-       a. 采样背景色
-       b. 擦除原文（纯色填充 or inpainting）
-       c. 写入译文
-    3. 把修改后的图片组装回 PDF
+    scan_mode 两种模式：
+    - "adaptive"（自适应字号）: 每个块用 OCR 估算的字号，放不下就缩小
+    - "uniform"（统一字号）: 全页统一字号，框不够大就向下扩展（不重叠）
 
-    和 pdf_writer.write_pdf() 的区别：
-    - pdf_writer 操作 PDF 的文本层（矢量）
-    - scan_writer 操作 PDF 的图片层（位图）
+    📘 可编辑 PDF：
+    在图片层之上叠加透明文本层（PyMuPDF insert_text），
+    这样 PDF 阅读器可以选中、复制、搜索文字。
     """
     if not source_path:
         raise ValueError("source_path is required")
     if layout_overrides is None:
         layout_overrides = {}
 
-    logger.info(f"开始生成扫描件 PDF: {output_path}")
-    print(f"[📝 扫描件写入] 擦除原文 + 写入译文...", flush=True)
+    mode_name = "统一字号" if scan_mode == "uniform" else "自适应字号"
+    logger.info(f"开始生成扫描件 PDF: {output_path} (模式: {mode_name})")
+    print(f"[📝 扫描件写入] 擦除原文 + 写入译文 ({mode_name})...", flush=True)
 
     doc = fitz.open(source_path)
     zoom = RENDER_DPI / 72.0
@@ -358,12 +417,13 @@ def write_scan_pdf(
             page_items[page_idx] = []
         page_items[page_idx].append(item)
 
-    # 创建输出 PDF
     out_doc = fitz.open()
     replaced_count = 0
 
     for page_idx in range(len(doc)):
         page = doc[page_idx]
+        page_width = page.rect.width
+        page_height = page.rect.height
 
         # 1. 渲染页面为图片
         mat = fitz.Matrix(zoom, zoom)
@@ -371,20 +431,31 @@ def write_scan_pdf(
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
         if pix.n == 4:
             img = img[:, :, :3]
-        # 📘 PyMuPDF 输出 RGB，OpenCV 需要 BGR
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
         items = page_items.get(page_idx, [])
+
+        # 📘 统一字号模式：预计算全局字号和扩展框
+        uniform_size = None
+        expanded_bboxes = {}
+        if scan_mode == "uniform" and items:
+            page_h_px = page_height * zoom
+            uniform_size, expanded_bboxes = _compute_uniform_layout(
+                items, translations, zoom, page_h_px
+            )
+            logger.debug(f"第 {page_idx+1} 页: 统一字号 {uniform_size}pt")
+
+        # 📘 收集文本层数据（用于可编辑 PDF）
+        text_layer_items = []
+
         if items:
-            # 2. 逐块擦除原文 + 写入译文
             for item in items:
                 key = item["key"]
                 translated = translations[key]
 
-                # 📘 用像素坐标（sub_bboxes_px）擦除每个子块
+                # 擦除原文
                 sub_bboxes_px = item.get("sub_bboxes_px", [])
                 if not sub_bboxes_px:
-                    # 兜底：用 bbox 的像素坐标
                     bbox_pt = item["bbox"]
                     sub_bboxes_px = [[
                         bbox_pt[0] * zoom, bbox_pt[1] * zoom,
@@ -395,26 +466,36 @@ def write_scan_pdf(
                     bg_color, variance = _sample_background_color(img, sub_bbox_px)
                     img = _erase_text_region(img, sub_bbox_px, bg_color, variance)
 
-                # 3. 写入译文（用合并后的整体 bbox 像素坐标）
-                bbox_pt = item["bbox"]
-                bbox_px = [
-                    bbox_pt[0] * zoom, bbox_pt[1] * zoom,
-                    bbox_pt[2] * zoom, bbox_pt[3] * zoom,
-                ]
+                # 📘 统一字号模式：用扩展后的 bbox 和统一字号
+                if scan_mode == "uniform" and key in expanded_bboxes:
+                    bbox_px = expanded_bboxes[key]
+                    # 扩展区域也需要擦除背景
+                    orig_px = sub_bboxes_px[0] if sub_bboxes_px else bbox_px
+                    if bbox_px[3] > orig_px[3]:
+                        extra = [bbox_px[0], orig_px[3], bbox_px[2], bbox_px[3]]
+                        bg_c, var = _sample_background_color(img, extra)
+                        img = _erase_text_region(img, extra, bg_c, var)
+                    font_size = uniform_size
+                else:
+                    bbox_pt = item["bbox"]
+                    bbox_px = [
+                        bbox_pt[0] * zoom, bbox_pt[1] * zoom,
+                        bbox_pt[2] * zoom, bbox_pt[3] * zoom,
+                    ]
+                    fmt = item["dominant_format"]
+                    override = layout_overrides.get(key, {})
+                    font_size = override.get("fontsize", fmt.get("font_size", 12))
 
                 fmt = item["dominant_format"]
-                override = layout_overrides.get(key, {})
-                font_size = override.get("fontsize", fmt.get("font_size", 12))
                 bold = fmt.get("bold", False)
                 alignment = item.get("alignment", "left")
 
-                # 📘 字体颜色：从原文格式获取，默认黑色
                 color_hex = fmt.get("font_color", "#000000").lstrip("#")
                 if len(color_hex) == 6:
                     b = int(color_hex[4:6], 16)
                     g = int(color_hex[2:4], 16)
                     r = int(color_hex[0:2], 16)
-                    font_color = (b, g, r)  # BGR for OpenCV
+                    font_color = (b, g, r)
                 else:
                     font_color = (0, 0, 0)
 
@@ -427,28 +508,51 @@ def write_scan_pdf(
                 )
                 replaced_count += 1
 
-        # 4. 图片 → PDF 页面
-        # BGR → RGB for PIL
+                # 📘 收集文本层数据（pt 坐标）
+                bbox_pt_for_text = [v / zoom for v in bbox_px]
+                text_layer_items.append({
+                    "text": translated,
+                    "bbox_pt": bbox_pt_for_text,
+                    "font_size": font_size,
+                })
+
+        # 3. 图片 → PDF 页面
         rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(rgb_img)
 
-        # 📘 保持原始页面尺寸
-        page_width = page.rect.width
-        page_height = page.rect.height
         new_page = out_doc.new_page(width=page_width, height=page_height)
 
-        # PIL → bytes → fitz.Pixmap → 插入页面
         import io
         img_buffer = io.BytesIO()
         pil_img.save(img_buffer, format="JPEG", quality=92)
         img_buffer.seek(0)
-
         img_rect = fitz.Rect(0, 0, page_width, page_height)
         new_page.insert_image(img_rect, stream=img_buffer.read())
+
+        # 4. 📘 叠加透明文本层 — 让 PDF 可编辑/可搜索/可复制
+        # 在图片上方插入不可见文字（字体颜色透明），
+        # PDF 阅读器能选中和复制，但视觉上看不到。
+        for tl_item in text_layer_items:
+            rect = fitz.Rect(tl_item["bbox_pt"])
+            fs = tl_item["font_size"]
+            txt = tl_item["text"].replace("\n", " ")
+            try:
+                # 📘 fontsize 不能太小，否则 insert_textbox 会失败
+                actual_fs = max(6, min(fs, 72))
+                new_page.insert_textbox(
+                    rect, txt,
+                    fontsize=actual_fs,
+                    fontname="helv",  # PDF 内置字体
+                    color=(0, 0, 0),  # 黑色但会被图片遮住
+                    overlay=True,     # 在图片上方
+                    render_mode=3,    # 📘 render_mode=3 = 不可见文字（invisible）
+                )
+            except Exception:
+                pass  # 个别块写入失败不影响整体
 
     out_doc.save(output_path, garbage=4, deflate=True)
     out_doc.close()
     doc.close()
 
     logger.info(f"扫描件 PDF 生成完成: {output_path} (替换 {replaced_count} 个文字块)")
-    print(f"[✅ 扫描件写入完成] 替换了 {replaced_count} 个文字块", flush=True)
+    print(f"[✅ 扫描件写入完成] 替换了 {replaced_count} 个文字块 (可编辑)", flush=True)

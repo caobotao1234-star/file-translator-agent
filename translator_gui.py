@@ -667,6 +667,20 @@ class MainWindow(QMainWindow):
         layout_row.addWidget(self.vision_combo, 1)
         sg_layout.addLayout(layout_row)
 
+        # 📘 扫描件排版模式
+        scan_row = QHBoxLayout()
+        scan_row.addWidget(QLabel("扫描件排版"))
+        self.scan_mode_combo = QComboBox()
+        self.scan_mode_combo.setToolTip(
+            "扫描件 PDF 的字号策略：\n"
+            "自适应字号：每个文字块保持原始字号，放不下自动缩小\n"
+            "统一字号：全页统一字号，框不够大向下扩展（适合证件类文档）"
+        )
+        self.scan_mode_combo.addItem("自适应字号", "adaptive")
+        self.scan_mode_combo.addItem("统一字号（证件推荐）", "uniform")
+        scan_row.addWidget(self.scan_mode_combo, 1)
+        sg_layout.addLayout(scan_row)
+
         left_layout.addWidget(settings_group)
 
         # 格式映射面板
@@ -839,11 +853,16 @@ class MainWindow(QMainWindow):
         vision_choice = self.vision_combo.currentData()
         vision_model = None if vision_choice == "__off__" else vision_choice
 
+        # 扫描件排版模式
+        scan_mode = self.scan_mode_combo.currentData()
+
         self._append_log(f"初翻模型: {draft_model}", "info")
         self._append_log(f"审校模型: {review_model or '跳过'}", "info")
         self._append_log(f"目标语言: {target_lang}  |  批量: {batch_size}  |  线程: {max_workers}", "info")
         if vision_model:
             self._append_log(f"排版审校: {vision_model}", "info")
+        if scan_mode == "uniform":
+            self._append_log(f"扫描件排版: 统一字号", "info")
         self._append_log(f"文件数: {len(files)}", "info")
         self._append_log("─" * 50, "info")
 
@@ -865,6 +884,7 @@ class MainWindow(QMainWindow):
                 batch_size=batch_size,
                 max_workers=max_workers,
                 debug=True,
+                scan_mode=scan_mode,
             )
             # 📘 教学笔记：共享格式引擎
             # GUI 里编辑的字体/样式映射表存在 self.format_engine 里，
@@ -966,6 +986,7 @@ class MainWindow(QMainWindow):
         self.worker_spin.setEnabled(not running)
         self.log_combo.setEnabled(not running)
         self.vision_combo.setEnabled(not running)
+        self.scan_mode_combo.setEnabled(not running)
         self.format_panel.setEnabled(not running)
 
     def _apply_log_level(self, level_name: str):
