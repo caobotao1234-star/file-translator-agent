@@ -82,6 +82,33 @@ def _set_run_font(run, bold: bool = False, size_pt: float = 10, font_name: str =
     run._element.rPr.rFonts.set(qn("w:eastAsia"), font_name)
 
 
+def _add_image_to_cell(cell, image_bytes: bytes, align: str = "center"):
+    """
+    📘 v7 新增：把裁剪好的图片嵌入到表格单元格中
+
+    📘 教学笔记：
+    Word 表格单元格里可以放图片，方法是在单元格的段落里添加 InlineShape。
+    图片宽度根据单元格宽度自适应，最大不超过 4cm。
+    """
+    try:
+        from PIL import Image as PILImage
+        img = PILImage.open(io.BytesIO(image_bytes))
+        w_px, h_px = img.size
+        # 📘 图片宽度限制在 4cm 以内（单元格内不能太大）
+        max_w_cm = 4.0
+        w_cm = min(max_w_cm, w_px * 2.54 / 200)  # 200 DPI
+
+        para = cell.add_paragraph()
+        para.alignment = _get_alignment(align)
+        para.paragraph_format.space_before = Pt(2)
+        para.paragraph_format.space_after = Pt(2)
+        run = para.add_run()
+        img_stream = io.BytesIO(image_bytes)
+        run.add_picture(img_stream, width=Cm(w_cm))
+    except Exception as e:
+        logger.warning(f"单元格图片嵌入失败: {e}")
+
+
 def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, str],
                       page_idx: int, elem_idx: int):
     """
@@ -190,6 +217,11 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
                 para.paragraph_format.space_after = Pt(1)
                 run = para.add_run(line_text.strip())
                 _set_run_font(run, bold=cell_bold, size_pt=10)
+
+            # 📘 v7: 图片嵌入单元格
+            # Vision LLM 标记了 has_image 的单元格，把裁剪好的图片放进去
+            if cell_data.get("has_image") and cell_data.get("cropped_image"):
+                _add_image_to_cell(cell, cell_data["cropped_image"], cell_align)
 
             # 📘 设置列宽（仅第一行设置即可）
             if row_idx == 0 and col_cursor < len(col_widths_cm):
