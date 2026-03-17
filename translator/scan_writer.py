@@ -1,29 +1,20 @@
 # translator/scan_writer.py
 # =============================================================
-# 📘 教学笔记：扫描件 PDF → Word 写入器（v5 — 结构化重建）
+# 📘 教学笔记：扫描件 PDF → Word 写入器（v5.1 — 精确布局还原）
 # =============================================================
-# v4 方案：在原图上擦除文字 + 重写译文（inpainting）
-#   问题：字号不统一、位置不精确、不可编辑
-#
-# v5 方案：基于 Vision LLM 识别的结构，生成全新的 Word 文档
-#   - 表格 → Word 表格（保持行列结构和合并单元格）
-#   - 段落 → Word 段落
-#   - 图片区域 → 嵌入原始页面截图
-#   - 每页之间加分页符
-#
-# 📘 为什么输出 Word 而不是 PDF？
-# 用户的实际需求是"可编辑的翻译文档"，Word 天然可编辑。
-# 而且 python-docx 生成表格比在 PDF 上画表格简单得多。
+# 基于 Vision LLM 识别的结构，生成 Word 文档：
+#   - 表格：按列宽比例设置列宽，按边框样式设置边框，合并单元格
+#   - 段落：按字号和对齐方式排版
+#   - 图片区域：从原图裁剪 LOGO/二维码/印章等，嵌入对应位置
 # =============================================================
 
 import io
 import os
 from typing import Dict, Any, List
 from docx import Document
-from docx.shared import Inches, Pt, Cm, RGBColor
+from docx.shared import Pt, Cm, Emu, RGBColor
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.section import WD_ORIENT
 from docx.oxml.ns import qn, nsdecls
 from docx.oxml import parse_xml
 from core.logger import get_logger
@@ -31,109 +22,183 @@ from translator.format_engine import FormatEngine
 
 logger = get_logger("scan_writer")
 
+# 📘 页面可用宽度（A4 纸宽 21cm - 左右边距各 1.5cm = 18cm）
+PAGE_CONTENT_WIDTH_CM = 18.0
 
-def _set_cell_border(cell, **kwargs):
+
+def _set_cell_borders(cell, top=None, bottom=None, left=None, right=None):
     """
-    📘 给 Word 表格单元格设置边框
-    用法: _set_cell_border(cell, top={"sz": 4, "val": "single", "color": "000000"})
+    📘 设置单元格边框
+    每个参数是 dict: {"sz": 4, "val": "single", "color": "000000"}
+    或 None 表示无边框
     """
     tc = cell._tc
     tcPr = tc.get_or_add_tcPr()
-    tcBorders = parse_xml(f'<w:tcBorders {nsdecls("w")}></w:tcBorders>')
-    for edge in ("top", "left", "bottom", "right"):
-        if edge in kwargs:
-            element = parse_xml(
-                f'<w:{edge} {nsdecls("w")} '
-                f'w:val="{kwargs[edge].get("val", "single")}" '
-                f'w:sz="{kwargs[edge].get("sz", 4)}" '
-                f'w:space="0" '
-                f'w:color="{kwargs[edge].get("color", "000000")}"/>'
+    borders_xml = f'<w:tcBorders {nsdecls("w")}>'
+    for edge, style in [("top", top), ("left", left), ("bottom", bottom), ("right", right)]:
+        if style:
+            borders_xml += (
+                f'<w:{edge} w:val="{style.get("val", "single")}" '
+                f'w:sz="{style.get("sz", 4)}" w:space="0" '
+                f'w:color="{style.get("color", "000000")}"/>'
             )
-            tcBorders.append(element)
+        else:
+            borders_xml += f'<w:{edge} w:val="none" w:sz="0" w:space="0" w:color="auto"/>'
+    borders_xml += '</w:tcBorders>'
+    tcBorders = parse_xml(borders_xml)
     tcPr.append(tcBorders)
 
 
-def _set_cell_shading(cell, color: str):
-    """📘 设置单元格背景色"""
-    shading = parse_xml(
-        f'<w:shd {nsdecls("w")} w:fill="{color}" w:val="clear"/>'
-    )
-    cell._tc.get_or_add_tcPr().append(shading)
+def _set_cell_width(cell, width_cm: float):
+    """📘 设置单元格宽度"""
+    width_emu = int(width_cm * 360000)  # 1cm = 360000 EMU
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    tcW = parse_xml(f'<w:tcW {nsdecls("w")} w:w="{width_emu}" w:type="dxa"/>')
+    tcPr.append(tcW)
+
+
+def _get_alignment(align_str: str):
+    """📘 字符串 → WD_ALIGN_PARAGRAPH 枚举"""
+    mapping = {
+        "center": WD_ALIGN_PARAGRAPH.CENTER,
+        "right": WD_ALIGN_PARAGRAPH.RIGHT,
+        "left": WD_ALIGN_PARAGRAPH.LEFT,
+    }
+    return mapping.get(align_str, WD_ALIGN_PARAGRAPH.LEFT)
+
+
+def _get_font_size(size_str: str) -> float:
+    """📘 字号描述 → pt 值"""
+    mapping = {"small": 8, "normal": 10.5, "large": 14, "title": 18}
+    return mapping.get(size_str, 10.5)
+
+
+def _set_run_font(run, bold: bool = False, size_pt: float = 10, font_name: str = "Microsoft YaHei"):
+    """📘 设置 run 的字体属性"""
+    run.font.size = Pt(size_pt)
+    run.font.name = font_name
+    run.font.bold = bold
+    run._element.rPr.rFonts.set(qn("w:eastAsia"), font_name)
 
 
 def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, str],
                       page_idx: int, elem_idx: int):
     """
-    📘 教学笔记：把结构化表格数据写入 Word 文档
+    📘 教学笔记：把结构化表格数据写入 Word 文档（精确布局版）
 
-    处理合并单元格的策略：
-    1. 先创建一个 max_rows × max_cols 的完整表格
-    2. 遍历结构化数据，填入译文
-    3. 对 colspan > 1 或 rowspan > 1 的单元格执行合并
+    1. 按 col_widths 比例设置列宽
+    2. 按 border 样式设置边框（all/outer/none）
+    3. 处理合并单元格（colspan/rowspan）
+    4. 按每个单元格的 bold/align 设置格式
     """
     rows_data = table_data.get("rows", [])
     if not rows_data:
         return
 
-    # 📘 计算表格实际列数（考虑 colspan）
+    col_widths_pct = table_data.get("col_widths", [])
+    border_style = table_data.get("border", "all")
+
+    # 📘 计算实际列数（考虑 colspan）
     max_cols = 0
     for row in rows_data:
-        col_count = sum(cell.get("colspan", 1) for cell in row)
+        cells = row.get("cells", row) if isinstance(row, dict) else row
+        if isinstance(cells, dict):
+            cells = cells.get("cells", [])
+        col_count = sum(cell.get("colspan", 1) for cell in cells)
         max_cols = max(max_cols, col_count)
 
     num_rows = len(rows_data)
     if max_cols == 0 or num_rows == 0:
         return
 
-    # 创建表格
+    # 📘 计算列宽（cm）
+    if col_widths_pct and len(col_widths_pct) == max_cols:
+        total_pct = sum(col_widths_pct)
+        col_widths_cm = [PAGE_CONTENT_WIDTH_CM * p / total_pct for p in col_widths_pct]
+    else:
+        col_widths_cm = [PAGE_CONTENT_WIDTH_CM / max_cols] * max_cols
+
+    # 创建表格（不用默认样式，手动控制边框）
     table = doc.add_table(rows=num_rows, cols=max_cols)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.style = "Table Grid"
 
-    # 📘 跟踪哪些单元格被 rowspan 占用
-    # occupied[row][col] = True 表示该位置被上方的 rowspan 覆盖
+    # 📘 设置表格总宽度
+    tbl = table._tbl
+    tblPr = tbl.tblPr if tbl.tblPr is not None else parse_xml(f'<w:tblPr {nsdecls("w")}/>') 
+    total_width_twips = int(PAGE_CONTENT_WIDTH_CM * 567)  # 1cm ≈ 567 twips
+    tblW = parse_xml(f'<w:tblW {nsdecls("w")} w:w="{total_width_twips}" w:type="dxa"/>')
+    tblPr.append(tblW)
+
+    # 📘 边框样式定义
+    border_on = {"sz": 4, "val": "single", "color": "000000"}
+    border_off = None  # None = 无边框
+
+    # 📘 跟踪被 rowspan 占用的位置
     occupied = [[False] * max_cols for _ in range(num_rows)]
 
-    for row_idx, row_data in enumerate(rows_data):
-        col_cursor = 0  # 当前列位置
-        cell_data_idx = 0  # 当前处理的 cell 数据索引
+    for row_idx, row in enumerate(rows_data):
+        cells = row.get("cells", row) if isinstance(row, dict) else row
+        if isinstance(cells, dict):
+            cells = cells.get("cells", [])
 
-        for cell_data in row_data:
+        col_cursor = 0
+        cell_data_idx = 0
+
+        for cell_data in cells:
             # 跳过被 rowspan 占用的列
             while col_cursor < max_cols and occupied[row_idx][col_cursor]:
                 col_cursor += 1
-
             if col_cursor >= max_cols:
                 break
 
             cell_text = cell_data.get("text", "").strip()
             colspan = cell_data.get("colspan", 1)
             rowspan = cell_data.get("rowspan", 1)
+            cell_bold = cell_data.get("bold", False)
+            cell_align = cell_data.get("align", "left")
 
             # 📘 查找译文
             key = f"pg{page_idx}_e{elem_idx}_r{row_idx}_c{cell_data_idx}"
             translated = translations.get(key, cell_text)
 
-            # 写入单元格
+            # 获取单元格
             cell = table.cell(row_idx, col_cursor)
-            cell.text = translated
-            # 设置字体
-            for paragraph in cell.paragraphs:
-                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                for run in paragraph.runs:
-                    run.font.size = Pt(10)
-                    run.font.name = "Microsoft YaHei"
-                    run._element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
 
-            # 📘 合并单元格
+            # 📘 合并单元格（必须在写入内容之前）
             if colspan > 1 or rowspan > 1:
                 end_row = min(row_idx + rowspan - 1, num_rows - 1)
                 end_col = min(col_cursor + colspan - 1, max_cols - 1)
                 try:
-                    merge_cell = table.cell(end_row, end_col)
-                    cell.merge(merge_cell)
+                    cell = cell.merge(table.cell(end_row, end_col))
                 except Exception as e:
-                    logger.debug(f"单元格合并失败 [{row_idx},{col_cursor}]->[{end_row},{end_col}]: {e}")
+                    logger.debug(f"合并失败 [{row_idx},{col_cursor}]->[{end_row},{end_col}]: {e}")
+
+            # 写入内容
+            cell.text = ""
+            para = cell.paragraphs[0]
+            para.alignment = _get_alignment(cell_align)
+            run = para.add_run(translated)
+            _set_run_font(run, bold=cell_bold, size_pt=10)
+
+            # 📘 设置列宽（仅第一行设置即可）
+            if row_idx == 0 and col_cursor < len(col_widths_cm):
+                w = sum(col_widths_cm[col_cursor:col_cursor + colspan])
+                _set_cell_width(cell, w)
+
+            # 📘 设置边框
+            if border_style == "all":
+                _set_cell_borders(cell, top=border_on, bottom=border_on, left=border_on, right=border_on)
+            elif border_style == "outer":
+                _set_cell_borders(
+                    cell,
+                    top=border_on if row_idx == 0 else border_off,
+                    bottom=border_on if row_idx + rowspan - 1 == num_rows - 1 else border_off,
+                    left=border_on if col_cursor == 0 else border_off,
+                    right=border_on if col_cursor + colspan - 1 == max_cols - 1 else border_off,
+                )
+            else:  # none
+                _set_cell_borders(cell, top=border_off, bottom=border_off, left=border_off, right=border_off)
 
             # 标记被占用的位置
             for r in range(row_idx, min(row_idx + rowspan, num_rows)):
@@ -144,40 +209,60 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
             col_cursor += colspan
             cell_data_idx += 1
 
-    # 📘 表格后加一个空段落作为间距
+    # 表格后加间距
     doc.add_paragraph()
 
 
 def _add_paragraph_to_doc(doc: Document, elem: dict, translations: Dict[str, str],
                           page_idx: int, elem_idx: int):
-    """📘 把段落文本写入 Word 文档"""
+    """📘 把段落文本写入 Word 文档（带格式）"""
     key = f"pg{page_idx}_e{elem_idx}_para"
     original_text = elem.get("text", "").strip()
     translated = translations.get(key, original_text)
 
     para = doc.add_paragraph()
+    para.alignment = _get_alignment(elem.get("align", "left"))
     run = para.add_run(translated)
-    run.font.size = Pt(11)
-    run.font.name = "Microsoft YaHei"
-    run._element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
+    size_pt = _get_font_size(elem.get("font_size", "normal"))
+    _set_run_font(run, bold=elem.get("bold", False), size_pt=size_pt)
 
 
-def _add_image_to_doc(doc: Document, page_image_bytes: bytes, elem: dict):
+def _add_image_to_doc(doc: Document, elem: dict):
     """
-    📘 把原始页面图片嵌入 Word 文档（用于图片区域）
+    📘 教学笔记：嵌入裁剪的图片到 Word 文档
 
-    📘 教学笔记：为什么嵌入整页图片而不是裁剪？
-    Vision LLM 返回的是语义描述（"红色印章"），没有精确坐标。
-    裁剪需要坐标，而我们没有。所以嵌入整页图片作为参考。
-    但如果同一页已经嵌入过图片，就不重复嵌入了。
+    如果 Vision LLM 返回了 bbox_pct 且裁剪成功，
+    elem["cropped_image"] 里就有裁剪后的 JPEG bytes。
+    直接嵌入 Word，宽度按裁剪图片的宽高比自适应。
     """
+    cropped = elem.get("cropped_image")
     description = elem.get("description", "图片区域")
-    para = doc.add_paragraph()
-    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = para.add_run(f"[{description}]")
-    run.font.size = Pt(9)
-    run.font.color.rgb = RGBColor(128, 128, 128)
-    run.italic = True
+
+    if cropped:
+        para = doc.add_paragraph()
+        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = para.add_run()
+        img_stream = io.BytesIO(cropped)
+        # 📘 图片宽度限制在 8cm 以内，避免太大
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(cropped))
+            w_px, h_px = img.size
+            # 按比例缩放，最大宽度 8cm
+            max_w_cm = 8.0
+            aspect = h_px / w_px if w_px > 0 else 1
+            w_cm = min(max_w_cm, w_px * 2.54 / 200)  # 200 DPI
+            run.add_picture(img_stream, width=Cm(w_cm))
+        except Exception:
+            run.add_picture(img_stream, width=Cm(6))
+    else:
+        # 📘 没有裁剪图片，用文字占位
+        para = doc.add_paragraph()
+        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = para.add_run(f"[{description}]")
+        run.font.size = Pt(9)
+        run.font.color.rgb = RGBColor(128, 128, 128)
+        run.italic = True
 
 
 def write_scan_pdf(
@@ -191,42 +276,37 @@ def write_scan_pdf(
     fixed_fontsize: float = 10.0,
 ):
     """
-    📘 教学笔记：扫描件写入主函数（v5 — 生成 Word 文档）
+    📘 扫描件写入主函数（v5.1 — 精确布局还原）
 
-    📘 核心思路：
-    不在原图上修改，而是基于 Vision LLM 识别的结构，
-    生成一个全新的 Word 文档。每页包含：
-    1. 页面标题（"第 X 页"）
-    2. 原始页面图片（作为参考）
-    3. 结构化内容（表格/段落的译文）
-    4. 分页符
-
-    输出路径自动改为 .docx（即使传入的是 .pdf 路径）
+    生成 Word 文档，每页包含：
+    1. 原始页面图片（参考）
+    2. 结构化译文（表格按列宽/边框/合并还原，图片裁剪嵌入）
+    3. 分页符
     """
     page_structures = parsed_data.get("page_structures", [])
     page_images = parsed_data.get("page_images", [])
 
     if not page_structures:
-        raise ValueError("parsed_data 中缺少 page_structures，请确认使用了 v5 scan_parser")
+        raise ValueError("parsed_data 中缺少 page_structures")
 
-    # 📘 输出路径强制改为 .docx
+    # 📘 输出路径强制 .docx
     base, ext = os.path.splitext(output_path)
     if ext.lower() != ".docx":
         output_path = base + ".docx"
 
     logger.info(f"开始生成扫描件 Word 文档: {output_path}")
-    print(f"[📝 扫描件写入] 生成 Word 文档...", flush=True)
+    print(f"[📝 扫描件写入] 生成 Word 文档（精确布局）...", flush=True)
 
     doc = Document()
 
-    # 📘 设置默认字体
+    # 📘 默认字体
     style = doc.styles["Normal"]
     font = style.font
     font.name = "Microsoft YaHei"
     font.size = Pt(10.5)
     style.element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
 
-    # 📘 设置页边距（窄边距，给表格更多空间）
+    # 📘 窄边距
     for section in doc.sections:
         section.top_margin = Cm(1.5)
         section.bottom_margin = Cm(1.5)
@@ -237,23 +317,20 @@ def write_scan_pdf(
 
     for page_idx, structure in enumerate(page_structures):
         if page_idx > 0:
-            # 📘 分页符
             doc.add_page_break()
 
         # 📘 页面标题
         heading = doc.add_heading(f"第 {page_idx + 1} 页", level=2)
         heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-        # 📘 嵌入原始页面图片（作为参考）
+        # 📘 嵌入原始页面图片（参考）
         if page_idx < len(page_images) and page_images[page_idx]:
             img_stream = io.BytesIO(page_images[page_idx])
             para = doc.add_paragraph()
             para.alignment = WD_ALIGN_PARAGRAPH.CENTER
             run = para.add_run()
-            # 📘 图片宽度设为页面宽度的 90%（约 16cm）
             run.add_picture(img_stream, width=Cm(16))
 
-            # 分隔线
             sep = doc.add_paragraph()
             sep.alignment = WD_ALIGN_PARAGRAPH.CENTER
             run = sep.add_run("— 以下为译文 —")
@@ -267,9 +344,11 @@ def write_scan_pdf(
 
             if elem_type == "table":
                 _add_table_to_doc(doc, elem, translations, page_idx, elem_idx)
-                # 统计翻译数
                 for row_idx, row in enumerate(elem.get("rows", [])):
-                    for col_idx, cell in enumerate(row):
+                    cells = row.get("cells", row) if isinstance(row, dict) else row
+                    if isinstance(cells, dict):
+                        cells = cells.get("cells", [])
+                    for col_idx, cell in enumerate(cells):
                         key = f"pg{page_idx}_e{elem_idx}_r{row_idx}_c{col_idx}"
                         if key in translations:
                             translated_count += 1
@@ -281,7 +360,7 @@ def write_scan_pdf(
                     translated_count += 1
 
             elif elem_type == "image_region":
-                _add_image_to_doc(doc, page_images[page_idx] if page_idx < len(page_images) else b"", elem)
+                _add_image_to_doc(doc, elem)
 
     doc.save(output_path)
 
