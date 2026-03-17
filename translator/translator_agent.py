@@ -51,8 +51,6 @@ class TranslatorAgent:
         batch_size: int = 10,
         max_workers: int = 1,
         debug: bool = False,
-        scan_mode: str = "adaptive",
-        fixed_fontsize: float = 10.0,
     ):
         """
         参数：
@@ -62,12 +60,8 @@ class TranslatorAgent:
             batch_size: 每批翻译的段落数
             max_workers: 并行线程数（同时发多少个LLM请求）
             debug: 调试模式
-            scan_mode: 扫描件排版模式 "adaptive"/"aligned"/"fixed"
-            fixed_fontsize: 指定字号模式下的字号（pt）
         """
         self.debug = debug
-        self.scan_mode = scan_mode  # 📘 扫描件排版模式
-        self.fixed_fontsize = fixed_fontsize  # 📘 指定字号（仅 fixed 模式生效）
         self.format_engine = FormatEngine()
 
         # 初始化 LLM 路由
@@ -160,8 +154,18 @@ class TranslatorAgent:
             # 后续翻译流程完全一样，只有写入策略不同。
             is_scan = detect_scan_pdf(input_path)
             if is_scan:
-                print(f"[🔍 检测到扫描件] 将使用 OCR 识别文字", flush=True)
-                parsed_data = parse_scan_pdf(input_path)
+                print(f"[🔍 检测到扫描件] 将使用 Vision LLM 识别结构", flush=True)
+                # 📘 扫描件需要 Vision 模型来识别页面结构
+                # 优先用 vision 模型，没有则用初翻模型（需要是多模态的）
+                if "vision" in self.router.engines:
+                    vision_engine = self.router.get("vision")
+                else:
+                    vision_engine = self.router.get("draft")
+                    print(f"[ℹ️ 提示] 使用初翻模型进行结构识别（建议选择多模态模型）", flush=True)
+                parsed_data = parse_scan_pdf(input_path, vision_llm=vision_engine)
+                # 📘 扫描件输出 .docx 而不是 .pdf
+                base, _ = os.path.splitext(output_path)
+                output_path = base + ".docx"
             else:
                 parsed_data = parse_pdf(input_path)
             para_count = sum(1 for i in parsed_data["items"]
@@ -204,10 +208,9 @@ class TranslatorAgent:
             write_pptx(parsed_data, translations, output_path, self.format_engine,
                        source_path=input_path)
         elif is_scan:
-            # 📘 扫描件走图像级写入（inpainting 擦除 + PIL 绘制）
-            write_scan_pdf(parsed_data, translations, output_path, self.format_engine,
-                           source_path=input_path, scan_mode=self.scan_mode,
-                           fixed_fontsize=self.fixed_fontsize)
+            # 📘 扫描件 v5：基于结构化识别，生成全新 Word 文档
+            output_path = write_scan_pdf(parsed_data, translations, output_path, self.format_engine,
+                           source_path=input_path)
         else:  # 普通 PDF
             write_pdf(parsed_data, translations, output_path, self.format_engine,
                       source_path=input_path)
@@ -217,7 +220,7 @@ class TranslatorAgent:
         # Vision 模型同时接收图片和结构化数据（bbox、字号、可用空间），
         # 可以下达两种指令：精简译文（shorten）和调整字号（resize）。
         # 返回 layout_overrides 字典，writer 写入时按指令调整字号。
-        if self.layout_agent and not was_stopped:
+        if self.layout_agent and not was_stopped and not is_scan:
             layout_overrides = {}
             layout_modified = False
 
@@ -252,10 +255,6 @@ class TranslatorAgent:
                 if ext == ".pptx":
                     write_pptx(parsed_data, translations, output_path, self.format_engine,
                                source_path=input_path)
-                elif is_scan:
-                    write_scan_pdf(parsed_data, translations, output_path, self.format_engine,
-                                   source_path=input_path, layout_overrides=layout_overrides,
-                                   scan_mode=self.scan_mode, fixed_fontsize=self.fixed_fontsize)
                 else:  # 普通 PDF
                     write_pdf(parsed_data, translations, output_path, self.format_engine,
                               source_path=input_path, layout_overrides=layout_overrides)
