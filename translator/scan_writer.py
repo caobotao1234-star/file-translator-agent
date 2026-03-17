@@ -176,10 +176,20 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
 
             # 写入内容
             cell.text = ""
-            para = cell.paragraphs[0]
-            para.alignment = _get_alignment(cell_align)
-            run = para.add_run(translated)
-            _set_run_font(run, bold=cell_bold, size_pt=10)
+            # 📘 v6.1: 处理多行文本（\n 分隔的行）
+            # 每行一个段落，保持原文的行结构
+            lines = translated.split("\n")
+            for line_idx, line_text in enumerate(lines):
+                if line_idx == 0:
+                    para = cell.paragraphs[0]
+                else:
+                    para = cell.add_paragraph()
+                para.alignment = _get_alignment(cell_align)
+                # 📘 减小段落间距，避免单元格太高
+                para.paragraph_format.space_before = Pt(0)
+                para.paragraph_format.space_after = Pt(1)
+                run = para.add_run(line_text.strip())
+                _set_run_font(run, bold=cell_bold, size_pt=10)
 
             # 📘 设置列宽（仅第一行设置即可）
             if row_idx == 0 and col_cursor < len(col_widths_cm):

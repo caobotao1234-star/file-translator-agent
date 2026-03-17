@@ -375,8 +375,9 @@ def _detect_image_regions(
 
     策略：
     1. 找到页面中颜色丰富（非灰度）的区域
-    2. 排除表格区域和文字区域
-    3. 面积足够大的连通区域 → 可能是图片
+    2. 面积足够大的连通区域 → 可能是图片
+    3. 📘 v6.1: 不再排除表格内部的图片区域
+       出生证明等文档的国徽、二维码都在表格内部
 
     简化实现：用颜色饱和度检测。
     扫描件的文字和表格线通常是黑白的，
@@ -410,13 +411,6 @@ def _detect_image_regions(
         # 📘 过滤太大的区域（超过页面 50% 可能是背景）
         if area > h * w * 0.5:
             continue
-
-        # 📘 排除在表格内部的区域
-        if table_bbox:
-            tx1, ty1, tx2, ty2 = table_bbox
-            cx, cy = x + cw // 2, y + ch // 2
-            if tx1 <= cx <= tx2 and ty1 <= cy <= ty2:
-                continue
 
         # 📘 计算 bbox 百分比（用于裁剪）
         bbox_pct = [
@@ -662,6 +656,46 @@ def _process_page_cv_ocr(
         return {"page_type": "empty", "elements": []}, []
 
 
+def _group_texts_by_line(ocr_texts: List[dict], line_threshold: int = 15) -> str:
+    """
+    📘 教学笔记：把 OCR 文字块按 Y 坐标分组成行
+
+    同一行的文字（Y 坐标差 < threshold）用空格连接，
+    不同行的文字用换行符连接。
+
+    这样 "Name" 和 "ZHUYUHENG" 在同一行会变成 "Name ZHUYUHENG"，
+    而 "Name ZHUYUHENG" 和 "Sex MALE" 在不同行会用换行分隔。
+    """
+    if not ocr_texts:
+        return ""
+
+    # 按 Y 坐标排序
+    sorted_texts = sorted(ocr_texts, key=lambda t: (t["bbox"][1], t["bbox"][0]))
+
+    lines = []
+    current_line = [sorted_texts[0]]
+    current_y = sorted_texts[0]["bbox"][1]
+
+    for t in sorted_texts[1:]:
+        t_y = t["bbox"][1]
+        if abs(t_y - current_y) <= line_threshold:
+            # 同一行
+            current_line.append(t)
+        else:
+            # 新行
+            # 按 X 坐标排序当前行
+            current_line.sort(key=lambda x: x["bbox"][0])
+            lines.append(" ".join(x["text"] for x in current_line))
+            current_line = [t]
+            current_y = t_y
+
+    # 最后一行
+    current_line.sort(key=lambda x: x["bbox"][0])
+    lines.append(" ".join(x["text"] for x in current_line))
+
+    return "\n".join(lines)
+
+
 def _process_with_cv(
     cv_img: np.ndarray,
     gray: np.ndarray,
@@ -812,9 +846,7 @@ def _process_with_cv(
 
     # 📘 图片区域（表格上方）
     for region in [r for r in image_regions if r["bbox_px"][3] < table_bbox[1]]:
-        elements.append(region)
-
-    # 📘 表格 — 用 per-row 结构
+        elements.append(region)    # 📘 表格 — 用 per-row 结构
     # 计算最大列数（用于 col_widths）
     max_cols = max(len(cells) for cells in row_structures) if row_structures else 0
     total_width = table_bbox[2] - table_bbox[0]
@@ -844,7 +876,8 @@ def _process_with_cv(
         for c_idx, cell in enumerate(cells):
             cell_texts = cell.get("texts", [])
             cell_texts.sort(key=lambda t: (t["bbox"][1], t["bbox"][0]))
-            combined_text = " ".join(t["text"] for t in cell_texts)
+            # 📘 v6.1: 按 Y 坐标分组，同一行用空格连接，不同行用换行
+            combined_text = _group_texts_by_line(cell_texts)
 
             # 📘 计算 colspan
             cell_width = cell["x2"] - cell["x1"]
@@ -878,8 +911,12 @@ def _process_with_cv(
 
     elements.append(table_elem)
 
-    # 📘 图片区域（表格下方）
-    for region in [r for r in image_regions if r["bbox_px"][1] > table_bbox[3]]:
+    # 📘 所有图片区域（包括表格内部的国徽、二维码等）
+    # 按 Y 坐标排序，放在表格后面
+    for region in sorted(image_regions, key=lambda r: r["bbox_px"][1]):
+        # 跳过已经放在表格上方的
+        if region["bbox_px"][3] < table_bbox[1]:
+            continue
         elements.append(region)
 
     # 下方段落
