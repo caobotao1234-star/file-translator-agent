@@ -154,14 +154,14 @@ class TranslatorAgent:
             # 后续翻译流程完全一样，只有写入策略不同。
             is_scan = detect_scan_pdf(input_path)
             if is_scan:
-                print(f"[🔍 检测到扫描件] 将使用 Vision LLM 识别结构", flush=True)
-                # 📘 扫描件需要 Vision 模型来识别页面结构
-                # 优先用 vision 模型，没有则用初翻模型（需要是多模态的）
+                print(f"[🔍 检测到扫描件] CV + OCR 混合识别...", flush=True)
+                # 📘 v6: 主要靠 OpenCV + RapidOCR，Vision LLM 仅作 fallback
+                # 当 OpenCV 检测不到表格线时（无边框表格等），才用 Vision LLM
+                vision_engine = None
                 if "vision" in self.router.engines:
                     vision_engine = self.router.get("vision")
-                else:
+                elif self.router.get("draft"):
                     vision_engine = self.router.get("draft")
-                    print(f"[ℹ️ 提示] 使用初翻模型进行结构识别（建议选择多模态模型）", flush=True)
                 parsed_data = parse_scan_pdf(input_path, vision_llm=vision_engine)
                 # 📘 扫描件输出 .docx 而不是 .pdf
                 base, _ = os.path.splitext(output_path)
