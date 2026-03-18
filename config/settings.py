@@ -4,6 +4,35 @@ from dotenv import load_dotenv
 # 加载 .env 文件中的环境变量
 load_dotenv()
 
+# =============================================================
+# 📘 教学笔记：全局代理配置
+# =============================================================
+# 企业网络通常需要 HTTP 代理才能访问外部 API（Gemini/Claude/GPT/GitHub）。
+# 在这里统一设置进程级环境变量 HTTP_PROXY / HTTPS_PROXY，
+# 这样所有 HTTP 库（httpx、requests、urllib3、openai SDK）都自动走代理。
+#
+# 📘 为什么在 settings.py 里设？
+#   settings.py 是整个项目最早被 import 的模块之一（GUI/CLI 都会 import Config），
+#   在这里设置环境变量，后续所有模块创建的 HTTP 客户端都能读到。
+#
+# 📘 开关机制：
+#   ENABLE_PROXY=true  → 启用代理
+#   ENABLE_PROXY=false → 禁用代理（即使 PROXY_URL 有值也不生效）
+#   这样切换网络环境时只改一个开关，不用删 URL。
+# =============================================================
+_proxy_enabled = os.getenv("ENABLE_PROXY", "true").strip().lower() in ("true", "1", "yes", "on")
+_proxy_url = os.getenv("PROXY_URL", "").strip()
+
+if _proxy_enabled and _proxy_url:
+    os.environ["HTTP_PROXY"] = _proxy_url
+    os.environ["HTTPS_PROXY"] = _proxy_url
+    # 📘 NO_PROXY: 火山引擎 API 走内网，不需要代理
+    os.environ.setdefault("NO_PROXY", "open.volcengineapi.com,visual.volcengineapi.com")
+elif not _proxy_enabled:
+    # 📘 显式禁用：清除可能已存在的代理环境变量
+    os.environ.pop("HTTP_PROXY", None)
+    os.environ.pop("HTTPS_PROXY", None)
+
 
 class Config:
     ARK_API_KEY = os.getenv("ARK_API_KEY")

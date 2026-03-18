@@ -479,8 +479,9 @@ class ScanAgent:
             if tool_calls_in_turn:
                 # 📘 把 Brain 的 assistant 消息（含 tool_calls）加入对话历史
                 assistant_msg = {"role": "assistant", "content": text_in_turn or None}
-                assistant_msg["tool_calls"] = [
-                    {
+                assistant_msg["tool_calls"] = []
+                for tc in tool_calls_in_turn:
+                    tc_entry = {
                         "id": tc["id"],
                         "type": "function",
                         "function": {
@@ -488,8 +489,13 @@ class ScanAgent:
                             "arguments": tc["arguments"],
                         },
                     }
-                    for tc in tool_calls_in_turn
-                ]
+                    # 📘 教学笔记：Gemini thought_signature 回传
+                    # Gemini 3.x 要求把 thought_signature 原样回传，
+                    # 否则下一轮 API 调用会返回 400 错误。
+                    # extra_content 由 ExternalLLMEngine 从流式响应中捕获并透传。
+                    if "extra_content" in tc:
+                        tc_entry["extra_content"] = tc["extra_content"]
+                    assistant_msg["tool_calls"].append(tc_entry)
                 messages.append(assistant_msg)
 
                 # 📘 逐个执行工具调用

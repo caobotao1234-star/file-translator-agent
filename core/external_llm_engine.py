@@ -18,7 +18,9 @@
 import os
 import time
 from typing import List, Dict, Generator, Optional
-from openai import OpenAI
+
+import httpx
+from openai import OpenAI, APITimeoutError, APIConnectionError
 from core.logger import get_logger
 from core.llm_engine import LLMRetryError
 
@@ -71,7 +73,29 @@ class ExternalLLMEngine:
             raise ValueError(
                 f"外部模型 API 密钥未配置。请在 .env 中设置对应的 API Key。"
             )
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+
+        # 📘 教学笔记：代理（Proxy）支持
+        # 代理已在 config/settings.py 中全局设置（HTTP_PROXY / HTTPS_PROXY 环境变量），
+        # httpx 和 openai SDK 会自动读取这些环境变量。
+        # 这里只需要处理超时和重试配置。
+        #
+        # 📘 但有一个坑：openai SDK 内置重试会自己创建新的 httpx.Client，
+        # 那个新 Client 也会读环境变量，所以全局代理方案下 SDK 重试也能走代理了。
+        # 不过我们仍然禁用 SDK 重试，用自己的重试逻辑（更可控、有日志）。
+
+        # 📘 超时配置：扫描件图片是大尺寸 base64，需要更长超时
+        timeout_seconds = float(os.getenv("EXTERNAL_API_TIMEOUT", "180"))
+
+        proxy_url = os.getenv("HTTPS_PROXY", "") or os.getenv("HTTP_PROXY", "")
+        if proxy_url:
+            logger.info(f"外部模型使用全局代理: {proxy_url}")
+
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout_seconds,
+            max_retries=0,  # 📘 禁用 SDK 内置重试，用我们自己的
+        )
         self.model_id = model_id
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay
@@ -79,16 +103,33 @@ class ExternalLLMEngine:
 
     def _is_retryable(self, error: Exception) -> bool:
         """
-        📘 复用 ArkLLMEngine 相同的重试判断逻辑
-        网络错误 / 429 限流 / 5xx 服务端故障 → 重试
-        参数错误 400 → 不重试
+        📘 教学笔记：重试判断逻辑（改进版）
+
+        之前的问题：openai SDK 把超时包装成 APITimeoutError，
+        str(error) 可能不包含 "timeout" 关键字，导致误判为"不可重试"。
+
+        改进：先按异常类型判断（最可靠），再按字符串兜底。
+        - APITimeoutError → 一定重试（网络慢/图片大）
+        - APIConnectionError → 一定重试（代理/网络问题）
+        - 429 / 5xx → 重试（限流/服务端故障）
+        - 400 参数错误 → 不重试
         """
+        # 📘 第一优先级：按异常类型判断（最可靠）
+        if isinstance(error, (APITimeoutError, APIConnectionError)):
+            return True
+        # 📘 httpx 自己的超时和连接异常
+        if isinstance(error, (httpx.TimeoutException, httpx.ConnectError)):
+            return True
+
+        # 📘 第二优先级：按 HTTP 状态码判断
+        if hasattr(error, "status_code"):
+            return error.status_code in (429, 500, 502, 503, 504)
+
+        # 📘 第三优先级：字符串兜底（以防有其他包装层）
         error_str = str(error).lower()
         network_keywords = ["timeout", "connection", "network", "reset", "broken pipe"]
         if any(kw in error_str for kw in network_keywords):
             return True
-        if hasattr(error, "status_code"):
-            return error.status_code in (429, 500, 502, 503, 504)
         retryable_codes = ["429", "500", "502", "503", "504"]
         if any(code in error_str for code in retryable_codes):
             return True
@@ -196,6 +237,15 @@ class ExternalLLMEngine:
                         tool_calls_dict[idx]["name"] += tc.function.name
                     if tc.function and tc.function.arguments:
                         tool_calls_dict[idx]["arguments"] += tc.function.arguments
+                    # 📘 教学笔记：Gemini thought_signature 支持
+                    # Gemini 3.x 模型在 tool_call 中返回 extra_content，
+                    # 包含 thought_signature（模型推理状态的加密快照）。
+                    # 必须在下一轮对话中原样回传，否则 Gemini 返回 400 错误。
+                    # openai SDK 的 pydantic model 配置了 extra='allow'，
+                    # 所以 extra_content 会保留在 model_extra 中。
+                    extra = getattr(tc, "model_extra", None)
+                    if extra and "extra_content" in extra:
+                        tool_calls_dict[idx]["extra_content"] = extra["extra_content"]
 
         if full_text:
             self.logger.trace(f"外部模型响应 [text]\n{full_text}")
@@ -207,12 +257,16 @@ class ExternalLLMEngine:
 
         # 📘 流结束后，yield 收集到的工具调用
         for idx, tc_data in tool_calls_dict.items():
-            yield {
+            result = {
                 "type": "tool_call",
                 "id": tc_data["id"],
                 "name": tc_data["name"],
                 "arguments": tc_data["arguments"],
             }
+            # 📘 透传 Gemini thought_signature（如果有）
+            if "extra_content" in tc_data:
+                result["extra_content"] = tc_data["extra_content"]
+            yield result
 
 
 def create_external_engine(

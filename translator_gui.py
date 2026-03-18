@@ -615,6 +615,8 @@ class MainWindow(QMainWindow):
         self.review_combo.addItem("跳过审校", "__skip__")
         for name, mid in self.available_models.items():
             self.review_combo.addItem(name, mid)
+        # 📘 默认跳过审校（index 1）
+        self.review_combo.setCurrentIndex(1)
         review_row.addWidget(self.review_combo, 1)
         mg_layout.addLayout(review_row)
 
@@ -629,8 +631,13 @@ class MainWindow(QMainWindow):
         )
         self.vision_combo.addItem("关闭", "__off__")
         vision_models = Config.get_vision_models()
-        for name, mid in vision_models.items():
+        default_vision_idx = 0  # 📘 默认关闭
+        for i, (name, mid) in enumerate(vision_models.items()):
             self.vision_combo.addItem(f"✅ {name}", mid)
+            # 📘 默认选中 gemini-3.1-pro-preview
+            if mid == "gemini:gemini-3.1-pro-preview":
+                default_vision_idx = i + 1  # +1 因为第 0 项是"关闭"
+        self.vision_combo.setCurrentIndex(default_vision_idx)
         vision_row.addWidget(self.vision_combo, 1)
         mg_layout.addLayout(vision_row)
 
@@ -646,16 +653,13 @@ class MainWindow(QMainWindow):
         )
         self.brain_combo.addItem("关闭（v7.1 流水线）", "__off__")
         # 📘 规划者用 vision 模型列表（需要多模态能力）
-        for name, mid in vision_models.items():
+        default_brain_idx = 0  # 📘 默认关闭
+        for i, (name, mid) in enumerate(vision_models.items()):
             self.brain_combo.addItem(f"🧠 {name}", mid)
-        # 📘 如果 .env 里配了 Agent Brain，尝试选中它
-        brain_config = Config.get_agent_brain_config()
-        if brain_config:
-            env_brain_id = f"{brain_config['provider']}:{brain_config['model']}"
-            for i in range(self.brain_combo.count()):
-                if self.brain_combo.itemData(i) == env_brain_id:
-                    self.brain_combo.setCurrentIndex(i)
-                    break
+            # 📘 默认选中 gemini-3.1-pro-preview
+            if mid == "gemini:gemini-3.1-pro-preview":
+                default_brain_idx = i + 1
+        self.brain_combo.setCurrentIndex(default_brain_idx)
         brain_row.addWidget(self.brain_combo, 1)
         mg_layout.addLayout(brain_row)
 
@@ -670,8 +674,13 @@ class MainWindow(QMainWindow):
         )
         self.image_combo.addItem("关闭", "__off__")
         image_models = Config.get_image_gen_models()
-        for name, mid in image_models.items():
+        default_image_idx = 0  # 📘 默认关闭
+        for i, (name, mid) in enumerate(image_models.items()):
             self.image_combo.addItem(name, mid)
+            # 📘 默认选中 gemini-3-pro-image-preview
+            if mid == "gemini:gemini-3-pro-image-preview":
+                default_image_idx = i + 1
+        self.image_combo.setCurrentIndex(default_image_idx)
         image_row.addWidget(self.image_combo, 1)
         mg_layout.addLayout(image_row)
 
