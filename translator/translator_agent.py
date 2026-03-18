@@ -48,6 +48,7 @@ class TranslatorAgent:
         draft_model_id: str = None,
         review_model_id: str = None,
         vision_model_id: str = None,
+        brain_model_id: str = None,
         image_model_id: str = None,
         batch_size: int = 10,
         max_workers: int = 1,
@@ -58,6 +59,7 @@ class TranslatorAgent:
             draft_model_id: 初翻模型（支持 "provider:model" 或纯模型ID）
             review_model_id: 审校模型（为 None 则跳过审校）
             vision_model_id: 排版审校 Vision 模型
+            brain_model_id: 规划者 / Agent Brain（扫描件分析决策大脑）
             image_model_id: 图片生成模型（如 gemini-3-pro-image-preview）
             batch_size: 每批翻译的段落数
             max_workers: 并行线程数
@@ -109,29 +111,42 @@ class TranslatorAgent:
         # 无 COM → 静默降级，只处理段落+表格（python-docx 能力范围）
         self.com_enabled = is_com_available()
 
-        # 📘 教学笔记：Agent Brain（扫描件翻译大脑）
-        # 外部高能力模型（Gemini/Claude/GPT/NanoBanana）用于扫描件分析。
+        # 📘 教学笔记：Agent Brain（规划者 / 扫描件翻译大脑）
+        # GUI 选择优先，.env 配置作为 fallback。
         # 未配置时自动回退到 v7.1 固定流水线，不影响其他功能。
-        brain_config = Config.get_agent_brain_config()
-        if brain_config:
+        if brain_model_id:
+            # 📘 GUI 指定了规划者模型 → 直接用 register_model
             try:
-                self.router.register_external(
-                    name="agent_brain",
-                    provider=brain_config["provider"],
-                    model_id=brain_config["model"],
-                    api_key=brain_config["api_key"],
-                    max_retries=brain_config.get("max_retries", 3),
-                )
-                supported, warning = Config.validate_agent_brain_model(
-                    brain_config["provider"], brain_config["model"]
-                )
+                self.router.register_model("agent_brain", model_id=brain_model_id)
+                provider, model = Config.parse_model_id(brain_model_id)
+                supported, warning = Config.validate_agent_brain_model(provider, model)
                 if warning:
                     logger.warning(f"Agent Brain 模型警告: {warning}")
-                logger.info(
-                    f"Agent Brain 已启用: {brain_config['provider']}/{brain_config['model']}"
-                )
+                logger.info(f"Agent Brain 已启用 (GUI): {brain_model_id}")
             except Exception as e:
                 logger.warning(f"Agent Brain 注册失败，将使用 v7.1 流水线: {e}")
+        else:
+            # 📘 GUI 未选择 → 尝试从 .env 读取
+            brain_config = Config.get_agent_brain_config()
+            if brain_config:
+                try:
+                    self.router.register_external(
+                        name="agent_brain",
+                        provider=brain_config["provider"],
+                        model_id=brain_config["model"],
+                        api_key=brain_config["api_key"],
+                        max_retries=brain_config.get("max_retries", 3),
+                    )
+                    supported, warning = Config.validate_agent_brain_model(
+                        brain_config["provider"], brain_config["model"]
+                    )
+                    if warning:
+                        logger.warning(f"Agent Brain 模型警告: {warning}")
+                    logger.info(
+                        f"Agent Brain 已启用 (.env): {brain_config['provider']}/{brain_config['model']}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Agent Brain 注册失败，将使用 v7.1 流水线: {e}")
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         logger.info(f"翻译 Agent 初始化完成 (COM 增强: {'✅ 开启' if self.com_enabled else '❌ 关闭'})")
@@ -205,6 +220,11 @@ class TranslatorAgent:
                             brain_engine=self.router.get("agent_brain"),
                             translate_pipeline=self.pipeline,
                             format_engine=self.format_engine,
+                            image_gen_engine=(
+                                self.router.get("image_gen")
+                                if "image_gen" in self.router.engines
+                                else None
+                            ),
                         )
                         result = scan_agent.process_scan_pdf(
                             filepath=input_path,

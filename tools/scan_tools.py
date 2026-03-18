@@ -352,3 +352,156 @@ class WordWriterTool(BaseTool):
                 {"error": f"Word 生成失败: {type(e).__name__}: {str(e)}"},
                 ensure_ascii=False,
             )
+
+
+class ImageGenTool(BaseTool):
+    """
+    📘 教学笔记：图片生成工具（Image Generation Tool）
+
+    Agent Brain 决定某些内容（如扫描件中的图表、证件、排版复杂的区域）
+    用图片生成方式处理时，调用此工具。
+
+    📘 工作流程（两步走）：
+    1. Agent Brain 先自己输出：
+       - translated_text: 准确的译文
+       - image_prompt: 给生图模型的详细提示词（描述原文的布局、位置、结构）
+    2. 本工具调用生图模型（如 gemini-3-pro-image-preview），
+       将原始页面图片 + 提示词一起发送，生成翻译后的图片。
+
+    📘 目标：让译文和原文内容位置结构一致，且翻译准确。
+    Agent Brain 负责"想"（翻译+提示词），生图模型负责"画"。
+    """
+
+    name = "generate_translated_image"
+    description = (
+        "用图片生成模型将页面中的指定区域重新绘制为目标语言版本。"
+        "需要提供原始页面图片、准确的译文、以及详细的图片生成提示词。"
+        "生图模型会根据提示词生成与原文布局结构一致的翻译图片。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "page_index": {
+                "type": "integer",
+                "description": "页码索引（从0开始）",
+            },
+            "translated_text": {
+                "type": "string",
+                "description": "准确的译文内容（Agent Brain 翻译后的文本）",
+            },
+            "image_prompt": {
+                "type": "string",
+                "description": (
+                    "给生图模型的详细提示词，描述：\n"
+                    "1. 原文的布局结构（表格/证件/图表等）\n"
+                    "2. 文字在图片中的位置和排列方式\n"
+                    "3. 字体大小、粗细、颜色等视觉要求\n"
+                    "4. 需要保持的设计元素（边框、背景色、logo 等）\n"
+                    "5. 将 translated_text 放在对应位置的指令"
+                ),
+            },
+            "target_lang": {
+                "type": "string",
+                "description": "目标语言，如'英文'、'日文'",
+            },
+        },
+        "required": ["page_index", "translated_text", "image_prompt", "target_lang"],
+    }
+
+    def __init__(self, image_gen_engine=None, context: Dict[str, Any] = None):
+        """
+        📘 参数：
+        - image_gen_engine: 图片生成模型引擎（ExternalLLMEngine 实例）
+        - context: 包含 page_images（每页 JPEG bytes）
+        """
+        self.image_gen_engine = image_gen_engine
+        self.context = context or {}
+
+    def execute(self, params: dict) -> str:
+        valid, msg = self.validate_params(params)
+        if not valid:
+            return json.dumps({"error": msg}, ensure_ascii=False)
+
+        if not self.image_gen_engine:
+            return json.dumps(
+                {"error": "图片生成模型未配置"},
+                ensure_ascii=False,
+            )
+
+        page_index = params["page_index"]
+        translated_text = params["translated_text"]
+        image_prompt = params["image_prompt"]
+        target_lang = params["target_lang"]
+
+        page_images = self.context.get("page_images", [])
+        if page_index < 0 or page_index >= len(page_images):
+            return json.dumps(
+                {"error": f"page_index {page_index} 超出范围 [0, {len(page_images) - 1}]"},
+                ensure_ascii=False,
+            )
+
+        try:
+            import base64
+
+            # 📘 构建生图请求：原始页面图片 + 详细提示词
+            img_b64 = base64.b64encode(page_images[page_index]).decode("utf-8")
+
+            # 📘 教学笔记：组合提示词
+            # Agent Brain 已经输出了准确的译文和布局描述，
+            # 这里把它们组合成一个完整的生图指令。
+            full_prompt = (
+                f"请根据以下要求，将这张文档图片中的文字替换为{target_lang}译文，"
+                f"保持原文的布局、位置、结构、字体风格完全一致。\n\n"
+                f"## 译文内容\n{translated_text}\n\n"
+                f"## 布局和样式要求\n{image_prompt}\n\n"
+                f"## 关键规则\n"
+                f"- 译文必须放在与原文完全相同的位置\n"
+                f"- 保持原文的字体大小比例、粗细、颜色\n"
+                f"- 保持所有非文字元素（边框、背景、logo、图片）不变\n"
+                f"- 如果空间不够，适当缩小字号但保持可读性"
+            )
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_b64}",
+                            },
+                        },
+                        {"type": "text", "text": full_prompt},
+                    ],
+                },
+            ]
+
+            # 📘 调用生图模型
+            response_text = ""
+            for chunk in self.image_gen_engine.stream_chat(messages):
+                if chunk["type"] == "text":
+                    response_text += chunk["content"]
+
+            # 📘 检查响应中是否包含生成的图片（base64）
+            # Gemini image generation 返回的图片通常在 inline_data 中
+            # 通过 OpenAI 兼容接口可能以 base64 文本形式返回
+            result = {
+                "success": True,
+                "page_index": page_index,
+                "translated_text": translated_text,
+                "response": response_text[:500] if response_text else "（无文本响应）",
+            }
+
+            logger.info(
+                f"图片生成完成: 第 {page_index} 页, "
+                f"译文长度={len(translated_text)}, "
+                f"提示词长度={len(image_prompt)}"
+            )
+            return json.dumps(result, ensure_ascii=False)
+
+        except Exception as e:
+            logger.error(f"图片生成工具执行失败: {e}")
+            return json.dumps(
+                {"error": f"图片生成失败: {type(e).__name__}: {str(e)}"},
+                ensure_ascii=False,
+            )

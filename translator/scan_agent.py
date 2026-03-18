@@ -37,7 +37,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.agent_events import AgentEvent
 from core.logger import get_logger
-from tools.scan_tools import OCRTool, CVTool, TranslationTool, WordWriterTool
+from tools.scan_tools import OCRTool, CVTool, TranslationTool, WordWriterTool, ImageGenTool
 
 logger = get_logger("scan_agent")
 
@@ -52,6 +52,26 @@ SCAN_AGENT_SYSTEM_PROMPT = """\
 - ocr_extract_text: OCR 文字识别（返回文字内容和位置坐标）
 - cv_detect_layout: 表格线和图片区域检测（返回水平线、垂直线、图片区域）
 - translate_texts: 文本翻译（使用 doubao 模型翻译为目标语言）
+- generate_translated_image: 图片生成（可选，将页面区域重新绘制为目标语言版本）
+
+## 图片生成能力（如果可用）
+当你判断某些内容用图片生成方式能更好地保持原文的布局和视觉效果时，
+可以调用 generate_translated_image 工具。典型场景：
+- 排版极其复杂的证件、名片、海报
+- 包含大量装饰性文字和图形元素的页面
+- 文字与背景图片紧密融合的区域
+
+调用流程（两步走）：
+1. 你先自己翻译出准确的译文（translated_text）
+2. 你再写一段详细的图片生成提示词（image_prompt），描述：
+   - 原文的布局结构（位置、大小、排列）
+   - 字体风格（大小、粗细、颜色）
+   - 需要保持的设计元素（边框、背景、logo）
+   - 将译文放在对应位置的具体指令
+3. 调用 generate_translated_image，传入译文和提示词
+
+注意：图片生成成本较高，只在你认为确实需要时才使用。
+大多数文档（表格、纯文本）用 OCR + 翻译 + Word 生成即可。
 
 ## 工作流程
 1. 观察页面图片，判断文档类型（表格文档/证件/纯文本/混合等）
@@ -59,6 +79,7 @@ SCAN_AGENT_SYSTEM_PROMPT = """\
    - 有表格 → 先调 cv_detect_layout 检测表格线，再调 ocr_extract_text 识别文字
    - 纯文本/证件 → 直接调 ocr_extract_text
    - 有图片 → cv_detect_layout 会检测图片区域
+   - 排版极复杂 → 考虑用 generate_translated_image
 3. 综合工具结果和你的视觉理解，生成结构化数据
 4. 调用 translate_texts 翻译所有文本
 5. 输出最终的 JSON 结构化数据
@@ -143,6 +164,7 @@ class ScanAgent:
         brain_engine,
         translate_pipeline,
         format_engine,
+        image_gen_engine=None,
         max_tool_calls: int = 10,
         max_review_retries: int = 2,
     ):
@@ -151,12 +173,14 @@ class ScanAgent:
         - brain_engine: ExternalLLMEngine 实例（Agent 大脑，Gemini/Claude/GPT）
         - translate_pipeline: TranslatePipeline 实例（翻译用 doubao）
         - format_engine: FormatEngine 实例（Word 格式用）
+        - image_gen_engine: 图片生成模型引擎（可选，如 gemini-3-pro-image-preview）
         - max_tool_calls: 单页最大工具调用次数（防止无限循环）
         - max_review_retries: 自我审查最大重试次数
         """
         self.brain_engine = brain_engine
         self.translate_pipeline = translate_pipeline
         self.format_engine = format_engine
+        self.image_gen_engine = image_gen_engine
         self.max_tool_calls = max_tool_calls
         self.max_review_retries = max_review_retries
 
@@ -165,7 +189,7 @@ class ScanAgent:
             "total_time_seconds": 0,
             "brain_tokens": {"prompt": 0, "completion": 0},
             "translate_tokens": {"prompt": 0, "completion": 0},
-            "tool_calls": {"ocr": 0, "cv": 0, "translate": 0, "word_writer": 0},
+            "tool_calls": {"ocr": 0, "cv": 0, "translate": 0, "word_writer": 0, "image_gen": 0},
             "review_results": [],
         }
 
@@ -234,6 +258,13 @@ class ScanAgent:
                 page_images=page_images,
             ),
         }
+        # 📘 图片生成工具（可选）：Agent Brain 自主决定是否调用
+        if self.image_gen_engine:
+            self.tools["generate_translated_image"] = ImageGenTool(
+                image_gen_engine=self.image_gen_engine,
+                context=context,
+            )
+            logger.info("图片生成工具已注册，Agent Brain 可自主调用")
 
         # ── 2. 逐页处理 ──
         all_items = []
@@ -415,6 +446,11 @@ class ScanAgent:
             self.tools["cv_detect_layout"].get_api_format(),
             self.tools["translate_texts"].get_api_format(),
         ]
+        # 📘 图片生成工具（可选）：让 Brain 自主决定是否调用
+        if "generate_translated_image" in self.tools:
+            tool_schemas.append(
+                self.tools["generate_translated_image"].get_api_format()
+            )
 
         # 📘 ReAct 循环
         tool_call_count = 0
@@ -466,6 +502,7 @@ class ScanAgent:
                         "ocr_extract_text": "ocr",
                         "cv_detect_layout": "cv",
                         "translate_texts": "translate",
+                        "generate_translated_image": "image_gen",
                     }.get(tool_name, tool_name)
                     self.stats["tool_calls"][stat_key] = (
                         self.stats["tool_calls"].get(stat_key, 0) + 1

@@ -579,7 +579,105 @@ class MainWindow(QMainWindow):
         file_gl.addLayout(btn_row)
         left_layout.addWidget(file_group)
 
-        # 翻译设置
+        # =============================================================
+        # 📘 教学笔记：模型配置独立分组
+        # =============================================================
+        # 5 个角色各自独立选择模型：
+        #   1. 初翻模型 — 负责第一遍翻译（文本→文本）
+        #   2. 审校模型 — 对照原文审校译文质量
+        #   3. 排版审校 — Vision 多模态模型，看图检查排版溢出
+        #   4. 规划者   — Agent Brain，扫描件分析决策大脑
+        #   5. 图片生成 — 生图模型，Agent 自主决定是否调用
+        # =============================================================
+        model_group = QGroupBox("🤖 模型配置")
+        mg_layout = QVBoxLayout(model_group)
+
+        # 初翻模型（📘 统一列表：火山引擎 + Gemini 等外部模型）
+        draft_row = QHBoxLayout()
+        draft_row.addWidget(QLabel("初翻模型"))
+        self.draft_combo = QComboBox()
+        self.draft_combo.setToolTip("负责第一遍翻译，将原文翻译为目标语言")
+        default_idx = 0
+        for i, (name, mid) in enumerate(self.available_models.items()):
+            self.draft_combo.addItem(name, mid)
+            if mid == Config.DEFAULT_MODEL_ID:
+                default_idx = i
+        self.draft_combo.setCurrentIndex(default_idx)
+        draft_row.addWidget(self.draft_combo, 1)
+        mg_layout.addLayout(draft_row)
+
+        # 审校模型
+        review_row = QHBoxLayout()
+        review_row.addWidget(QLabel("审校模型"))
+        self.review_combo = QComboBox()
+        self.review_combo.setToolTip("对照原文审校译文，纠正漏译、误译、语法错误")
+        self.review_combo.addItem("与初翻相同", "__same__")
+        self.review_combo.addItem("跳过审校", "__skip__")
+        for name, mid in self.available_models.items():
+            self.review_combo.addItem(name, mid)
+        review_row.addWidget(self.review_combo, 1)
+        mg_layout.addLayout(review_row)
+
+        # 排版审校（Vision 多模态模型）
+        vision_row = QHBoxLayout()
+        vision_row.addWidget(QLabel("排版审校"))
+        self.vision_combo = QComboBox()
+        self.vision_combo.setToolTip(
+            "翻译完成后，用多模态 Vision 模型逐页审校排版。\n"
+            "自动发现文字溢出、位置偏移、字号过小等问题并修正。\n"
+            "仅支持多模态（图片输入）模型。"
+        )
+        self.vision_combo.addItem("关闭", "__off__")
+        vision_models = Config.get_vision_models()
+        for name, mid in vision_models.items():
+            self.vision_combo.addItem(f"✅ {name}", mid)
+        vision_row.addWidget(self.vision_combo, 1)
+        mg_layout.addLayout(vision_row)
+
+        # 📘 规划者 / Agent Brain（扫描件分析决策大脑）
+        brain_row = QHBoxLayout()
+        brain_row.addWidget(QLabel("规划者"))
+        self.brain_combo = QComboBox()
+        self.brain_combo.setToolTip(
+            "扫描件翻译的 Agent 大脑（规划者）。\n"
+            "负责分析页面结构、决定调用哪些工具、自我审查。\n"
+            "需要支持视觉+工具调用的高能力模型。\n"
+            "关闭时扫描件走 v7.1 固定流水线。"
+        )
+        self.brain_combo.addItem("关闭（v7.1 流水线）", "__off__")
+        # 📘 规划者用 vision 模型列表（需要多模态能力）
+        for name, mid in vision_models.items():
+            self.brain_combo.addItem(f"🧠 {name}", mid)
+        # 📘 如果 .env 里配了 Agent Brain，尝试选中它
+        brain_config = Config.get_agent_brain_config()
+        if brain_config:
+            env_brain_id = f"{brain_config['provider']}:{brain_config['model']}"
+            for i in range(self.brain_combo.count()):
+                if self.brain_combo.itemData(i) == env_brain_id:
+                    self.brain_combo.setCurrentIndex(i)
+                    break
+        brain_row.addWidget(self.brain_combo, 1)
+        mg_layout.addLayout(brain_row)
+
+        # 图片生成模型
+        image_row = QHBoxLayout()
+        image_row.addWidget(QLabel("图片生成"))
+        self.image_combo = QComboBox()
+        self.image_combo.setToolTip(
+            "规划者可自主决定是否调用图片生成。\n"
+            "先输出译文和提示词，再调用生图模型生成与原文\n"
+            "内容位置结构一致的翻译图片。"
+        )
+        self.image_combo.addItem("关闭", "__off__")
+        image_models = Config.get_image_gen_models()
+        for name, mid in image_models.items():
+            self.image_combo.addItem(name, mid)
+        image_row.addWidget(self.image_combo, 1)
+        mg_layout.addLayout(image_row)
+
+        left_layout.addWidget(model_group)
+
+        # 翻译设置（不含模型选择）
         settings_group = QGroupBox("⚙️ 翻译设置")
         sg_layout = QVBoxLayout(settings_group)
 
@@ -592,30 +690,6 @@ class MainWindow(QMainWindow):
         self.lang_combo.setCurrentIndex(1)  # 默认英文
         lang_row.addWidget(self.lang_combo, 1)
         sg_layout.addLayout(lang_row)
-
-        # 初翻模型（📘 统一列表：火山引擎 + Gemini 等外部模型）
-        draft_row = QHBoxLayout()
-        draft_row.addWidget(QLabel("初翻模型"))
-        self.draft_combo = QComboBox()
-        default_idx = 0
-        for i, (name, mid) in enumerate(self.available_models.items()):
-            self.draft_combo.addItem(name, mid)
-            if mid == Config.DEFAULT_MODEL_ID:
-                default_idx = i
-        self.draft_combo.setCurrentIndex(default_idx)
-        draft_row.addWidget(self.draft_combo, 1)
-        sg_layout.addLayout(draft_row)
-
-        # 审校模型（📘 同样的统一列表）
-        review_row = QHBoxLayout()
-        review_row.addWidget(QLabel("审校模型"))
-        self.review_combo = QComboBox()
-        self.review_combo.addItem("与初翻相同", "__same__")
-        self.review_combo.addItem("跳过审校", "__skip__")
-        for name, mid in self.available_models.items():
-            self.review_combo.addItem(name, mid)
-        review_row.addWidget(self.review_combo, 1)
-        sg_layout.addLayout(review_row)
 
         # 批量大小
         batch_row = QHBoxLayout()
@@ -650,38 +724,6 @@ class MainWindow(QMainWindow):
         self.log_combo.addItem("TRACE（完整对话）", "TRACE")
         log_row.addWidget(self.log_combo, 1)
         sg_layout.addLayout(log_row)
-
-        # 📘 排版审校（Vision 模型下拉框 — 统一列表：火山引擎 + 外部模型）
-        layout_row = QHBoxLayout()
-        layout_row.addWidget(QLabel("排版审校"))
-        self.vision_combo = QComboBox()
-        self.vision_combo.setToolTip(
-            "翻译完成后，用多模态 Vision 模型逐页审校排版。\n"
-            "自动发现文字溢出、位置偏移、字号过小等问题并修正。\n"
-            "会增加额外的 API 调用成本。"
-        )
-        self.vision_combo.addItem("关闭", "__off__")
-        vision_models = Config.get_vision_models()
-        for name, mid in vision_models.items():
-            self.vision_combo.addItem(f"✅ {name}", mid)
-        layout_row.addWidget(self.vision_combo, 1)
-        sg_layout.addLayout(layout_row)
-
-        # 📘 图片生成模型（如 gemini-3-pro-image-preview）
-        # Agent 可以自主决定是否调用图片生成能力来处理特定任务。
-        image_row = QHBoxLayout()
-        image_row.addWidget(QLabel("图片生成"))
-        self.image_combo = QComboBox()
-        self.image_combo.setToolTip(
-            "注册图片生成模型后，Agent 可自主决定是否调用。\n"
-            "适用于扫描件中图表重绘等场景。"
-        )
-        self.image_combo.addItem("关闭", "__off__")
-        image_models = Config.get_image_gen_models()
-        for name, mid in image_models.items():
-            self.image_combo.addItem(name, mid)
-        image_row.addWidget(self.image_combo, 1)
-        sg_layout.addLayout(image_row)
 
         left_layout.addWidget(settings_group)
 
@@ -855,6 +897,10 @@ class MainWindow(QMainWindow):
         vision_choice = self.vision_combo.currentData()
         vision_model = None if vision_choice == "__off__" else vision_choice
 
+        # 规划者 / Agent Brain
+        brain_choice = self.brain_combo.currentData()
+        brain_model = None if brain_choice == "__off__" else brain_choice
+
         # 图片生成模型
         image_choice = self.image_combo.currentData()
         image_model = None if image_choice == "__off__" else image_choice
@@ -864,6 +910,8 @@ class MainWindow(QMainWindow):
         self._append_log(f"目标语言: {target_lang}  |  批量: {batch_size}  |  线程: {max_workers}", "info")
         if vision_model:
             self._append_log(f"排版审校: {vision_model}", "info")
+        if brain_model:
+            self._append_log(f"规划者: {brain_model}", "info")
         if image_model:
             self._append_log(f"图片生成: {image_model}", "info")
         self._append_log(f"文件数: {len(files)}", "info")
@@ -884,6 +932,7 @@ class MainWindow(QMainWindow):
                 draft_model_id=draft_model,
                 review_model_id=review_model,
                 vision_model_id=vision_model,
+                brain_model_id=brain_model,
                 image_model_id=image_model,
                 batch_size=batch_size,
                 max_workers=max_workers,
@@ -984,12 +1033,13 @@ class MainWindow(QMainWindow):
         self.btn_clear.setEnabled(not running)
         self.draft_combo.setEnabled(not running)
         self.review_combo.setEnabled(not running)
+        self.vision_combo.setEnabled(not running)
+        self.brain_combo.setEnabled(not running)
+        self.image_combo.setEnabled(not running)
         self.lang_combo.setEnabled(not running)
         self.batch_spin.setEnabled(not running)
         self.worker_spin.setEnabled(not running)
         self.log_combo.setEnabled(not running)
-        self.vision_combo.setEnabled(not running)
-        self.image_combo.setEnabled(not running)
         self.format_panel.setEnabled(not running)
 
     def _apply_log_level(self, level_name: str):
