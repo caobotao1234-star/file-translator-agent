@@ -73,16 +73,16 @@ class TranslatorAgent:
         # Router 自动识别 provider 并创建对应的引擎。
         # GUI 传过来的 model_id 可能是 "doubao-seed-1-8" 或 "gemini:gemini-3.1-pro"。
         self.router = LLMRouter(api_key=Config.ARK_API_KEY)
-        self.router.register_model("draft", model_id=draft_model_id or Config.DEFAULT_MODEL_ID)
+        self.router.register_model("draft", model_str=draft_model_id or Config.DEFAULT_MODEL_ID)
         review_id = review_model_id or draft_model_id or Config.DEFAULT_MODEL_ID
-        self.router.register_model("review", model_id=review_id)
+        self.router.register_model("review", model_str=review_id)
 
         # 📘 教学笔记：Vision 模型（排版审校）
         # 多模态模型能"看图"，用于翻译后的排版质量检查。
         # 如果用户没指定 vision_model_id，跳过排版审校。
         self.layout_agent = None
         if vision_model_id:
-            self.router.register_model("vision", model_id=vision_model_id)
+            self.router.register_model("vision", model_str=vision_model_id)
             self.layout_agent = LayoutReviewAgent(
                 vision_llm=self.router.get("vision"),
                 fix_llm=self.router.get("review"),
@@ -93,7 +93,7 @@ class TranslatorAgent:
         # 某些任务（如扫描件中的图表重绘）可能需要图片生成能力。
         # 注册后其他 Agent 可以通过 router.get("image_gen") 获取。
         if image_model_id:
-            self.router.register_model("image_gen", model_id=image_model_id)
+            self.router.register_model("image_gen", model_str=image_model_id)
             logger.info(f"图片生成模型已注册: {image_model_id}")
 
         # 初始化翻译流水线（初翻 + 审校双 Agent）
@@ -117,7 +117,7 @@ class TranslatorAgent:
         if brain_model_id:
             # 📘 GUI 指定了规划者模型 → 直接用 register_model
             try:
-                self.router.register_model("agent_brain", model_id=brain_model_id)
+                self.router.register_model("agent_brain", model_str=brain_model_id)
                 provider, model = Config.parse_model_id(brain_model_id)
                 supported, warning = Config.validate_agent_brain_model(provider, model)
                 if warning:
