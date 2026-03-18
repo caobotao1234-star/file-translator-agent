@@ -1,11 +1,13 @@
 # translator/scan_writer.py
 # =============================================================
-# 📘 教学笔记：扫描件 PDF → Word 写入器（v5.1 — 精确布局还原）
+# 📘 教学笔记：扫描件 PDF → Word 写入器（v7.1 — 精确布局还原）
 # =============================================================
-# 基于 Vision LLM 识别的结构，生成 Word 文档：
-#   - 表格：按列宽比例设置列宽，按边框样式设置边框，合并单元格
-#   - 段落：按字号和对齐方式排版
-#   - 图片区域：从原图裁剪 LOGO/二维码/印章等，嵌入对应位置
+# 📘 v7.1 改进：
+#   - 每个单元格独立控制四条边框（per-cell borders）
+#   - 每行文字独立对齐（per-line alignment）
+#   - 图片按 image_position 放在文字前/后/中间
+#   - 竖版文字支持（vertical text direction）
+#   - 精确列宽比例
 # =============================================================
 
 import io
@@ -49,6 +51,36 @@ def _set_cell_borders(cell, top=None, bottom=None, left=None, right=None):
     tcPr.append(tcBorders)
 
 
+def _set_cell_borders_from_dict(cell, borders: dict):
+    """
+    📘 v7.1 新增：从 Vision LLM 返回的 borders dict 设置边框
+    borders: {"top": true/false, "bottom": true/false, "left": true/false, "right": true/false}
+    """
+    border_on = {"sz": 4, "val": "single", "color": "000000"}
+    _set_cell_borders(
+        cell,
+        top=border_on if borders.get("top", True) else None,
+        bottom=border_on if borders.get("bottom", True) else None,
+        left=border_on if borders.get("left", True) else None,
+        right=border_on if borders.get("right", True) else None,
+    )
+
+
+def _set_cell_vertical_text(cell):
+    """
+    📘 v7.1 新增：设置单元格文字方向为竖版（从上到下）
+
+    📘 教学笔记：
+    Word 中竖版文字通过 tcPr 的 textDirection 属性实现。
+    btLr = Bottom to Top, Left to Right（竖版，从下到上读）
+    tbRl = Top to Bottom, Right to Left（竖版，从上到下读，东亚竖排）
+    """
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    text_dir = parse_xml(f'<w:textDirection {nsdecls("w")} w:val="tbRlV"/>')
+    tcPr.append(text_dir)
+
+
 def _set_cell_width(cell, width_cm: float):
     """📘 设置单元格宽度"""
     width_emu = int(width_cm * 360000)  # 1cm = 360000 EMU
@@ -85,18 +117,14 @@ def _set_run_font(run, bold: bool = False, size_pt: float = 10, font_name: str =
 def _add_image_to_cell(cell, image_bytes: bytes, align: str = "center"):
     """
     📘 v7 新增：把裁剪好的图片嵌入到表格单元格中
-
-    📘 教学笔记：
-    Word 表格单元格里可以放图片，方法是在单元格的段落里添加 InlineShape。
-    图片宽度根据单元格宽度自适应，最大不超过 4cm。
+    返回创建的段落，供调用者决定插入位置
     """
     try:
         from PIL import Image as PILImage
         img = PILImage.open(io.BytesIO(image_bytes))
         w_px, h_px = img.size
-        # 📘 图片宽度限制在 4cm 以内（单元格内不能太大）
         max_w_cm = 4.0
-        w_cm = min(max_w_cm, w_px * 2.54 / 200)  # 200 DPI
+        w_cm = min(max_w_cm, w_px * 2.54 / 200)
 
         para = cell.add_paragraph()
         para.alignment = _get_alignment(align)
@@ -105,26 +133,65 @@ def _add_image_to_cell(cell, image_bytes: bytes, align: str = "center"):
         run = para.add_run()
         img_stream = io.BytesIO(image_bytes)
         run.add_picture(img_stream, width=Cm(w_cm))
+        return para
     except Exception as e:
         logger.warning(f"单元格图片嵌入失败: {e}")
+        return None
+
+
+def _insert_image_in_cell_at_position(cell, image_bytes: bytes, position: str, align: str = "center"):
+    """
+    📘 v7.1 新增：按指定位置把图片插入单元格
+
+    position:
+      - "before": 图片在所有文字段落之前
+      - "after": 图片在所有文字段落之后（默认）
+      - "inline": 图片在文字中间（放在第一个段落之后）
+
+    📘 教学笔记：
+    python-docx 的 cell.add_paragraph() 总是追加到末尾。
+    要把图片放在文字前面，需要用 XML 操作把段落移到前面。
+    """
+    img_para = _add_image_to_cell(cell, image_bytes, align)
+    if not img_para:
+        return
+
+    if position == "before":
+        # 📘 把图片段落移到单元格的第一个位置
+        tc = cell._tc
+        # 图片段落是最后一个 <w:p>，移到第一个 <w:p> 之前
+        p_elements = tc.findall(qn("w:p"))
+        if len(p_elements) > 1:
+            tc.remove(p_elements[-1])  # 移除最后添加的图片段落
+            tc.insert(list(tc).index(p_elements[0]), p_elements[-1])  # 插到第一个段落前
+    elif position == "inline":
+        # 📘 放在第一个文字段落之后
+        tc = cell._tc
+        p_elements = tc.findall(qn("w:p"))
+        if len(p_elements) > 2:
+            # 移到第二个位置（第一个文字段落之后）
+            img_p = p_elements[-1]
+            tc.remove(img_p)
+            tc.insert(list(tc).index(p_elements[1]), img_p)
+    # "after" 不需要移动，已经在末尾
 
 
 def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, str],
                       page_idx: int, elem_idx: int):
     """
-    📘 教学笔记：把结构化表格数据写入 Word 文档（精确布局版）
+    📘 教学笔记：把结构化表格数据写入 Word 文档（v7.1 精确布局版）
 
-    1. 按 col_widths 比例设置列宽
-    2. 按 border 样式设置边框（all/outer/none）
-    3. 处理合并单元格（colspan/rowspan）
-    4. 按每个单元格的 bold/align 设置格式
+    📘 v7.1 改进：
+    1. 每个单元格独立控制四条边框（per-cell borders）
+    2. 每行文字独立对齐（per-line alignment via "lines" array）
+    3. 图片按 image_position 放在文字前/后/中间
+    4. 竖版文字支持（vertical text direction）
     """
     rows_data = table_data.get("rows", [])
     if not rows_data:
         return
 
     col_widths_pct = table_data.get("col_widths", [])
-    border_style = table_data.get("border", "all")
 
     # 📘 计算实际列数（考虑 colspan）
     max_cols = 0
@@ -146,20 +213,16 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
     else:
         col_widths_cm = [PAGE_CONTENT_WIDTH_CM / max_cols] * max_cols
 
-    # 创建表格（不用默认样式，手动控制边框）
+    # 创建表格
     table = doc.add_table(rows=num_rows, cols=max_cols)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
 
     # 📘 设置表格总宽度
     tbl = table._tbl
     tblPr = tbl.tblPr if tbl.tblPr is not None else parse_xml(f'<w:tblPr {nsdecls("w")}/>') 
-    total_width_twips = int(PAGE_CONTENT_WIDTH_CM * 567)  # 1cm ≈ 567 twips
+    total_width_twips = int(PAGE_CONTENT_WIDTH_CM * 567)
     tblW = parse_xml(f'<w:tblW {nsdecls("w")} w:w="{total_width_twips}" w:type="dxa"/>')
     tblPr.append(tblW)
-
-    # 📘 边框样式定义
-    border_on = {"sz": 4, "val": "single", "color": "000000"}
-    border_off = None  # None = 无边框
 
     # 📘 跟踪被 rowspan 占用的位置
     occupied = [[False] * max_cols for _ in range(num_rows)]
@@ -173,26 +236,34 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
         cell_data_idx = 0
 
         for cell_data in cells:
-            # 跳过被 rowspan 占用的列
             while col_cursor < max_cols and occupied[row_idx][col_cursor]:
                 col_cursor += 1
             if col_cursor >= max_cols:
                 break
 
-            cell_text = cell_data.get("text", "").strip()
             colspan = cell_data.get("colspan", 1)
             rowspan = cell_data.get("rowspan", 1)
             cell_bold = cell_data.get("bold", False)
             cell_align = cell_data.get("align", "left")
+            is_vertical = cell_data.get("vertical", False)
+
+            # 📘 获取文字内容：支持 "lines" 数组（per-line alignment）或 "text" 简写
+            cell_lines = cell_data.get("lines")
+            if cell_lines and isinstance(cell_lines, list):
+                # per-line alignment 模式
+                original_text = "\n".join(l.get("text", "") for l in cell_lines)
+            else:
+                original_text = cell_data.get("text", "").strip()
+                cell_lines = None  # 标记为简写模式
 
             # 📘 查找译文
             key = f"pg{page_idx}_e{elem_idx}_r{row_idx}_c{cell_data_idx}"
-            translated = translations.get(key, cell_text)
+            translated = translations.get(key, original_text)
 
             # 获取单元格
             cell = table.cell(row_idx, col_cursor)
 
-            # 📘 合并单元格（必须在写入内容之前）
+            # 📘 合并单元格
             if colspan > 1 or rowspan > 1:
                 end_row = min(row_idx + rowspan - 1, num_rows - 1)
                 end_col = min(col_cursor + colspan - 1, max_cols - 1)
@@ -201,46 +272,71 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
                 except Exception as e:
                     logger.debug(f"合并失败 [{row_idx},{col_cursor}]->[{end_row},{end_col}]: {e}")
 
-            # 写入内容
-            cell.text = ""
-            # 📘 v6.1: 处理多行文本（\n 分隔的行）
-            # 每行一个段落，保持原文的行结构
-            lines = translated.split("\n")
-            for line_idx, line_text in enumerate(lines):
-                if line_idx == 0:
-                    para = cell.paragraphs[0]
-                else:
-                    para = cell.add_paragraph()
-                para.alignment = _get_alignment(cell_align)
-                # 📘 减小段落间距，避免单元格太高
-                para.paragraph_format.space_before = Pt(0)
-                para.paragraph_format.space_after = Pt(1)
-                run = para.add_run(line_text.strip())
-                _set_run_font(run, bold=cell_bold, size_pt=10)
+            # 📘 竖版文字
+            if is_vertical:
+                _set_cell_vertical_text(cell)
 
-            # 📘 v7: 图片嵌入单元格
-            # Vision LLM 标记了 has_image 的单元格，把裁剪好的图片放进去
-            if cell_data.get("has_image") and cell_data.get("cropped_image"):
-                _add_image_to_cell(cell, cell_data["cropped_image"], cell_align)
+            # 📘 图片处理：根据 image_position 决定插入顺序
+            has_image = cell_data.get("has_image", False)
+            cropped_image = cell_data.get("cropped_image")
+            image_position = cell_data.get("image_position", "after")
+
+            # 📘 写入内容
+            cell.text = ""
+
+            # 如果图片在文字前面
+            if has_image and cropped_image and image_position == "before":
+                _add_image_to_cell(cell, cropped_image, cell_align)
+
+            # 📘 写入文字
+            trans_lines = translated.split("\n")
+            if cell_lines and len(cell_lines) == len(trans_lines):
+                # 📘 per-line alignment：每行用原文的对齐方式
+                for line_idx, (trans_text, orig_line) in enumerate(zip(trans_lines, cell_lines)):
+                    line_align = orig_line.get("align", cell_align)
+                    if line_idx == 0:
+                        para = cell.paragraphs[0]
+                    else:
+                        para = cell.add_paragraph()
+                    para.alignment = _get_alignment(line_align)
+                    para.paragraph_format.space_before = Pt(0)
+                    para.paragraph_format.space_after = Pt(1)
+                    run = para.add_run(trans_text.strip())
+                    _set_run_font(run, bold=cell_bold, size_pt=10)
+            else:
+                # 📘 简写模式：所有行用同一个对齐
+                for line_idx, line_text in enumerate(trans_lines):
+                    if line_idx == 0:
+                        para = cell.paragraphs[0]
+                    else:
+                        para = cell.add_paragraph()
+                    para.alignment = _get_alignment(cell_align)
+                    para.paragraph_format.space_before = Pt(0)
+                    para.paragraph_format.space_after = Pt(1)
+                    run = para.add_run(line_text.strip())
+                    _set_run_font(run, bold=cell_bold, size_pt=10)
+
+            # 📘 如果图片在文字中间
+            if has_image and cropped_image and image_position == "inline":
+                _insert_image_in_cell_at_position(cell, cropped_image, "inline", cell_align)
+            # 📘 如果图片在文字后面（默认）
+            elif has_image and cropped_image and image_position in ("after", None):
+                _add_image_to_cell(cell, cropped_image, cell_align)
 
             # 📘 设置列宽（仅第一行设置即可）
             if row_idx == 0 and col_cursor < len(col_widths_cm):
                 w = sum(col_widths_cm[col_cursor:col_cursor + colspan])
                 _set_cell_width(cell, w)
 
-            # 📘 设置边框
-            if border_style == "all":
-                _set_cell_borders(cell, top=border_on, bottom=border_on, left=border_on, right=border_on)
-            elif border_style == "outer":
-                _set_cell_borders(
-                    cell,
-                    top=border_on if row_idx == 0 else border_off,
-                    bottom=border_on if row_idx + rowspan - 1 == num_rows - 1 else border_off,
-                    left=border_on if col_cursor == 0 else border_off,
-                    right=border_on if col_cursor + colspan - 1 == max_cols - 1 else border_off,
-                )
-            else:  # none
-                _set_cell_borders(cell, top=border_off, bottom=border_off, left=border_off, right=border_off)
+            # 📘 v7.1: 每个单元格独立控制边框
+            borders = cell_data.get("borders")
+            if borders and isinstance(borders, dict):
+                _set_cell_borders_from_dict(cell, borders)
+            else:
+                # 📘 fallback: 没有 borders 字段时，默认全部有框线
+                border_on = {"sz": 4, "val": "single", "color": "000000"}
+                _set_cell_borders(cell, top=border_on, bottom=border_on,
+                                  left=border_on, right=border_on)
 
             # 标记被占用的位置
             for r in range(row_idx, min(row_idx + rowspan, num_rows)):
@@ -318,11 +414,11 @@ def write_scan_pdf(
     fixed_fontsize: float = 10.0,
 ):
     """
-    📘 扫描件写入主函数（v5.1 — 精确布局还原）
+    📘 扫描件写入主函数（v7.1 — 精确布局还原）
 
     生成 Word 文档，每页包含：
     1. 原始页面图片（参考）
-    2. 结构化译文（表格按列宽/边框/合并还原，图片裁剪嵌入）
+    2. 结构化译文（per-cell 边框、per-line 对齐、图片位置、竖版文字）
     3. 分页符
     """
     page_structures = parsed_data.get("page_structures", [])

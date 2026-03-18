@@ -318,13 +318,23 @@ HYBRID_STRUCTURE_PROMPT = """\
 ## 你的任务
 结合图片和上述数据，输出完整的文档结构 JSON。
 
-**关键要求：**
+**关键要求（非常重要，请逐条遵守）：**
+
 1. **隐藏列**：很多表格有不画线的内部列分隔（比如"标签: 值"格式），你必须识别出这些隐藏的列。例如一行里"Name"是标签列，"ZHANG SAN"是值列，虽然中间没有画线，但它们是不同的列。
-2. **列宽比例**：col_widths 必须反映原文的视觉比例。标签列通常很窄（如 15-25%），值列较宽。请仔细观察原图中各列的实际宽度比例。
-3. **图片位置**：如果图片（国徽、二维码、照片等）在表格内部，请在对应的单元格中标注 `"has_image": true` 和 `"image_index": N`（N 是上面图片区域列表的序号，从 0 开始）。如果图片在表格外部，作为独立的 image_region 元素。
-4. **文字对齐**：根据文字在单元格内的位置判断对齐方式（left/center/right）。
-5. **合并单元格**：如果一个单元格跨多列或多行，用 colspan/rowspan 表示。被合并覆盖的单元格不要输出。
-6. **文字内容**：优先使用 OCR 数据中的文字（更准确），但结构和分组由你根据图片判断。
+
+2. **列宽比例**：col_widths 必须精确反映原文的视觉比例。仔细测量原图中每列的实际像素宽度。标签列（如"父亲详情""母亲详情"等）通常非常窄（可能只有 8-15%），值列较宽。不要把窄列做宽了。
+
+3. **每个单元格独立控制边框**：原文中有些单元格有框线，有些没有。你必须为每个单元格单独指定四条边的边框状态。用 `"borders"` 字段：`{{"top": true, "bottom": true, "left": true, "right": true}}`。true 表示有线，false 表示无线。请仔细观察原图，只在原文画了线的地方标 true。隐藏的列分隔线（原文没画线的）必须标 false。
+
+4. **合并单元格**：如果一个单元格跨多列或多行，必须用 colspan/rowspan 表示。特别注意文档底部的大段文字区域，通常是跨全部列的合并单元格。被合并覆盖的单元格不要输出。
+
+5. **图片位置**：如果图片在表格内部某个单元格中，用 `"image_index": N` 标注。关键：用 `"image_position"` 指定图片相对于文字的位置：`"before"`（图片在文字上方）、`"after"`（图片在文字下方）、`"inline"`（图片和文字在同一行，图片在左或右）。
+
+6. **每行独立对齐**：一个单元格内可能有多行文字，每行的对齐方式可能不同。用 `"lines"` 数组代替 `"text"` + `"align"`，每个元素是 `{{"text": "...", "align": "left|center|right"}}`。如果所有行对齐一致，也可以用简写 `"text": "...", "align": "left"`。
+
+7. **竖版文字**：如果原文中某个单元格的文字是竖排的（从上到下书写），标注 `"vertical": true`。
+
+8. **文字内容**：优先使用 OCR 数据中的文字（更准确），但结构和分组由你根据图片判断。
 
 ## 输出 JSON 格式
 ```json
@@ -333,13 +343,28 @@ HYBRID_STRUCTURE_PROMPT = """\
   "elements": [
     {{
       "type": "table",
-      "col_widths": [15, 35, 15, 35],
-      "border": "all" | "outer" | "none",
+      "col_widths": [8, 20, 8, 20, 8, 18, 18],
       "rows": [
         {{
           "cells": [
-            {{"text": "单元格内容", "colspan": 1, "rowspan": 1, "bold": false, "align": "left", "has_image": false}},
-            {{"text": "", "colspan": 1, "rowspan": 1, "bold": false, "align": "center", "has_image": true, "image_index": 0}}
+            {{
+              "text": "标签",
+              "colspan": 1, "rowspan": 1, "bold": true,
+              "align": "center",
+              "vertical": false,
+              "borders": {{"top": true, "bottom": true, "left": true, "right": false}},
+              "has_image": false
+            }},
+            {{
+              "lines": [
+                {{"text": "第一行靠左", "align": "left"}},
+                {{"text": "第二行居中", "align": "center"}}
+              ],
+              "colspan": 2, "rowspan": 1, "bold": false,
+              "vertical": false,
+              "borders": {{"top": true, "bottom": true, "left": false, "right": true}},
+              "has_image": true, "image_index": 0, "image_position": "after"
+            }}
           ]
         }}
       ]
@@ -361,11 +386,11 @@ HYBRID_STRUCTURE_PROMPT = """\
 ```
 
 **注意：**
-- col_widths 的总和必须等于 100
+- col_widths 的总和必须等于 100，且必须精确反映原图比例
 - elements 按从上到下排列
 - 只输出 JSON，不要其他文字
-- 每个单元格的 text 用 OCR 数据中对应位置的文字填充
-- 如果一个单元格内有多行文字，用 \\n 连接"""
+- 每个单元格必须有 borders 字段，精确反映原文的框线
+- 不要给所有单元格都加框线，只在原文有线的地方加"""
 
 
 def _call_vision_llm(vision_llm, image_b64: str, prompt: str) -> Optional[str]:
@@ -663,6 +688,12 @@ def _process_with_hybrid_llm(
                             cell["cropped_image"] = image_regions[img_idx].get("cropped_image")
 
                     cell_text = cell.get("text", "").strip()
+                    # 📘 v7.1: 支持 "lines" 数组格式
+                    cell_lines = cell.get("lines")
+                    if cell_lines and isinstance(cell_lines, list):
+                        cell_text = "\n".join(
+                            l.get("text", "") for l in cell_lines
+                        ).strip()
                     if cell_text:
                         key = f"pg{page_idx}_e{elem_idx}_r{row_idx}_c{col_idx}"
                         items.append({
