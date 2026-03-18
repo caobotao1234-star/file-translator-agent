@@ -323,8 +323,13 @@ class ScanAgent:
 
             except Exception as e:
                 # 📘 单页失败不影响其他页面——优雅降级
+                import traceback
                 logger.error(f"第 {page_idx + 1} 页处理失败: {e}")
+                logger.error(f"异常类型: {type(e).__name__}")
+                logger.error(f"完整堆栈:\n{traceback.format_exc()}")
                 print(f"  [⚠️ 第 {page_idx + 1} 页] 处理失败: {e}", flush=True)
+                print(f"  [⚠️ 异常类型] {type(e).__name__}", flush=True)
+                print(f"  [⚠️ 堆栈]\n{traceback.format_exc()}", flush=True)
                 all_page_structures.append({"page_type": "error", "elements": []})
                 self.stats["review_results"].append({
                     "page": page_idx,
