@@ -320,11 +320,13 @@ HYBRID_STRUCTURE_PROMPT = """\
 
 **关键要求：**
 1. **隐藏列**：很多表格有不画线的内部列分隔（比如"标签: 值"格式），你必须识别出这些隐藏的列。
-2. **列宽比例**：col_widths 必须精确反映原文的视觉比例。标签列（如"父亲详情"）通常非常窄（8-15%），值列较宽。仔细测量。
+2. **列宽比例**：col_widths 必须精确反映原文的视觉比例。标签列（如"父亲详情"）通常非常窄（8-15%），值列较宽。仔细测量原图中每列的实际像素宽度比例。
 3. **每个单元格独立控制边框**：用 borders 字段指定四条边是否有线。只在原文画了线的地方标 true，隐藏的列分隔线标 false。
-4. **合并单元格**：跨多列或多行的单元格必须用 colspan/rowspan。底部大段文字通常跨全部列。
-5. **图片位置**：表格内的图片用 has_image + image_index 标注。
-6. **文字内容**：优先使用 OCR 数据中的文字。一个单元格内多行文字用 \\n 连接。
+4. **合并单元格**：跨多列或多行的单元格必须用 colspan/rowspan。底部大段文字通常跨全部列。被合并覆盖的单元格不要输出。
+5. **图片位置**：表格内的图片用 has_image + image_index 标注。用 image_position 指定图片相对于文字的位置："before"（图片在文字上方）、"after"（图片在文字下方）。
+6. **每行独立对齐**：一个单元格内可能有多行文字，每行的对齐方式可能不同。用 lines 数组，每个元素是 {{"text": "...", "align": "left/center/right"}}。如果所有行对齐一致，也可以用简写 "text" + "align"。
+7. **竖版文字**：如果原文中某个单元格的文字是竖排的（从上到下书写），标注 "vertical": true。
+8. **文字内容**：优先使用 OCR 数据中的文字。
 
 ## 输出格式
 ```json
@@ -338,7 +340,8 @@ HYBRID_STRUCTURE_PROMPT = """\
         {{
           "cells": [
             {{"text": "标签", "colspan": 1, "rowspan": 1, "bold": true, "align": "center", "borders": {{"top": true, "bottom": true, "left": true, "right": false}}}},
-            {{"text": "值", "colspan": 2, "rowspan": 1, "bold": false, "align": "left", "borders": {{"top": true, "bottom": true, "left": false, "right": true}}, "has_image": true, "image_index": 0}}
+            {{"text": "值\\n第二行", "colspan": 2, "rowspan": 1, "bold": false, "align": "left", "borders": {{"top": true, "bottom": true, "left": false, "right": true}}, "has_image": true, "image_index": 0, "image_position": "after"}},
+            {{"lines": [{{"text": "靠右", "align": "right"}}, {{"text": "居中", "align": "center"}}], "colspan": 1, "rowspan": 1, "bold": false, "borders": {{"top": true, "bottom": true, "left": true, "right": true}}}}
           ]
         }}
       ]
@@ -689,7 +692,14 @@ def _process_with_hybrid_llm(
                         if 0 <= img_idx < len(image_regions):
                             cell["cropped_image"] = image_regions[img_idx].get("cropped_image")
 
-                    cell_text = cell.get("text", "").strip()
+                    # 📘 v7.1: 支持 "lines" 数组格式（per-line alignment）
+                    cell_lines = cell.get("lines")
+                    if cell_lines and isinstance(cell_lines, list):
+                        cell_text = "\n".join(
+                            l.get("text", "") for l in cell_lines
+                        ).strip()
+                    else:
+                        cell_text = cell.get("text", "").strip()
                     if cell_text:
                         key = f"pg{page_idx}_e{elem_idx}_r{row_idx}_c{col_idx}"
                         items.append({

@@ -141,11 +141,14 @@ def _add_image_to_cell(cell, image_bytes: bytes, align: str = "center"):
 def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, str],
                       page_idx: int, elem_idx: int):
     """
-    📘 教学笔记：把结构化表格数据写入 Word 文档（v7.1 精确布局版）
+    📘 教学笔记：把结构化表格数据写入 Word 文档（v7.1 完整版）
 
-    📘 v7.1 改进：
+    📘 v7.1 全部功能：
     1. 每个单元格独立控制四条边框（per-cell borders）
-    2. 图片嵌入到正确的单元格中
+    2. 每行文字独立对齐（per-line alignment via "lines" array）
+    3. 图片按 image_position 放在文字前/后
+    4. 竖版文字支持（vertical text direction）
+    5. 精确列宽比例
     """
     rows_data = table_data.get("rows", [])
     if not rows_data:
@@ -201,15 +204,23 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
             if col_cursor >= max_cols:
                 break
 
-            cell_text = cell_data.get("text", "").strip()
             colspan = cell_data.get("colspan", 1)
             rowspan = cell_data.get("rowspan", 1)
             cell_bold = cell_data.get("bold", False)
             cell_align = cell_data.get("align", "left")
+            is_vertical = cell_data.get("vertical", False)
+
+            # 📘 获取文字内容：支持 "lines" 数组（per-line alignment）或 "text" 简写
+            cell_lines = cell_data.get("lines")
+            if cell_lines and isinstance(cell_lines, list):
+                original_text = "\n".join(l.get("text", "") for l in cell_lines)
+            else:
+                original_text = cell_data.get("text", "").strip()
+                cell_lines = None
 
             # 📘 查找译文
             key = f"pg{page_idx}_e{elem_idx}_r{row_idx}_c{cell_data_idx}"
-            translated = translations.get(key, cell_text)
+            translated = translations.get(key, original_text)
 
             # 获取单元格
             cell = table.cell(row_idx, col_cursor)
@@ -223,23 +234,53 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
                 except Exception as e:
                     logger.debug(f"合并失败 [{row_idx},{col_cursor}]->[{end_row},{end_col}]: {e}")
 
-            # 📘 写入文字
-            cell.text = ""
-            lines = translated.split("\n")
-            for line_idx, line_text in enumerate(lines):
-                if line_idx == 0:
-                    para = cell.paragraphs[0]
-                else:
-                    para = cell.add_paragraph()
-                para.alignment = _get_alignment(cell_align)
-                para.paragraph_format.space_before = Pt(0)
-                para.paragraph_format.space_after = Pt(1)
-                run = para.add_run(line_text.strip())
-                _set_run_font(run, bold=cell_bold, size_pt=10)
+            # 📘 竖版文字
+            if is_vertical:
+                _set_cell_vertical_text(cell)
 
-            # 📘 v7: 图片嵌入单元格
-            if cell_data.get("has_image") and cell_data.get("cropped_image"):
-                _add_image_to_cell(cell, cell_data["cropped_image"], cell_align)
+            # 📘 图片处理
+            has_image = cell_data.get("has_image", False)
+            cropped_image = cell_data.get("cropped_image")
+            image_position = cell_data.get("image_position", "after")
+
+            # 📘 写入内容
+            cell.text = ""
+
+            # 📘 图片在文字前面
+            if has_image and cropped_image and image_position == "before":
+                _add_image_to_cell(cell, cropped_image, cell_align)
+
+            # 📘 写入文字（支持 per-line alignment）
+            trans_lines = translated.split("\n")
+            if cell_lines and len(cell_lines) == len(trans_lines):
+                # 📘 per-line alignment：每行用原文的对齐方式
+                for line_idx, (trans_text, orig_line) in enumerate(zip(trans_lines, cell_lines)):
+                    line_align = orig_line.get("align", cell_align)
+                    if line_idx == 0:
+                        para = cell.paragraphs[0]
+                    else:
+                        para = cell.add_paragraph()
+                    para.alignment = _get_alignment(line_align)
+                    para.paragraph_format.space_before = Pt(0)
+                    para.paragraph_format.space_after = Pt(1)
+                    run = para.add_run(trans_text.strip())
+                    _set_run_font(run, bold=cell_bold, size_pt=10)
+            else:
+                # 📘 简写模式：所有行用同一个对齐
+                for line_idx, line_text in enumerate(trans_lines):
+                    if line_idx == 0:
+                        para = cell.paragraphs[0]
+                    else:
+                        para = cell.add_paragraph()
+                    para.alignment = _get_alignment(cell_align)
+                    para.paragraph_format.space_before = Pt(0)
+                    para.paragraph_format.space_after = Pt(1)
+                    run = para.add_run(line_text.strip())
+                    _set_run_font(run, bold=cell_bold, size_pt=10)
+
+            # 📘 图片在文字后面（默认）
+            if has_image and cropped_image and image_position != "before":
+                _add_image_to_cell(cell, cropped_image, cell_align)
 
             # 📘 设置列宽（仅第一行设置即可）
             if row_idx == 0 and col_cursor < len(col_widths_cm):
@@ -251,7 +292,6 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
             if borders and isinstance(borders, dict):
                 _set_cell_borders_from_dict(cell, borders)
             else:
-                # 📘 fallback: 没有 borders 字段时，默认全部有框线
                 border_on = {"sz": 4, "val": "single", "color": "000000"}
                 _set_cell_borders(cell, top=border_on, bottom=border_on,
                                   left=border_on, right=border_on)
