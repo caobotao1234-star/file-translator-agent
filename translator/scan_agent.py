@@ -124,7 +124,7 @@ SCAN_AGENT_SYSTEM_PROMPT = """\
 - 只在原文画了线的地方标 borders 为 true
 - key 命名规则：pg{页码}_e{元素索引}_r{行}_c{列}（表格）或 pg{页码}_e{元素索引}_para（段落）
 - 图片区域标记位置即可，不需要识别图片内容
-- 翻译目标语言：{target_lang}
+- 翻译目标语言：{{target_lang}}
 """
 
 # 📘 自我审查提示词
@@ -323,13 +323,8 @@ class ScanAgent:
 
             except Exception as e:
                 # 📘 单页失败不影响其他页面——优雅降级
-                import traceback
-                logger.error(f"第 {page_idx + 1} 页处理失败: {e}")
-                logger.error(f"异常类型: {type(e).__name__}")
-                logger.error(f"完整堆栈:\n{traceback.format_exc()}")
+                logger.error(f"第 {page_idx + 1} 页处理失败: {type(e).__name__}: {e}")
                 print(f"  [⚠️ 第 {page_idx + 1} 页] 处理失败: {e}", flush=True)
-                print(f"  [⚠️ 异常类型] {type(e).__name__}", flush=True)
-                print(f"  [⚠️ 堆栈]\n{traceback.format_exc()}", flush=True)
                 all_page_structures.append({"page_type": "error", "elements": []})
                 self.stats["review_results"].append({
                     "page": page_idx,
@@ -420,7 +415,7 @@ class ScanAgent:
         返回: (page_structure, items, translations)
         """
         # 📘 构建初始消息：system prompt + 页面图片
-        system_prompt = SCAN_AGENT_SYSTEM_PROMPT.format(target_lang=target_lang)
+        system_prompt = SCAN_AGENT_SYSTEM_PROMPT.replace("{{target_lang}}", target_lang)
 
         messages = [
             {"role": "system", "content": system_prompt},
