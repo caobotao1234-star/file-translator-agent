@@ -98,6 +98,30 @@ class TranslatorAgent:
         # 无 COM → 静默降级，只处理段落+表格（python-docx 能力范围）
         self.com_enabled = is_com_available()
 
+        # 📘 教学笔记：Agent Brain（扫描件翻译大脑）
+        # 外部高能力模型（Gemini/Claude/GPT/NanoBanana）用于扫描件分析。
+        # 未配置时自动回退到 v7.1 固定流水线，不影响其他功能。
+        brain_config = Config.get_agent_brain_config()
+        if brain_config:
+            try:
+                self.router.register_external(
+                    name="agent_brain",
+                    provider=brain_config["provider"],
+                    model_id=brain_config["model"],
+                    api_key=brain_config["api_key"],
+                    max_retries=brain_config.get("max_retries", 3),
+                )
+                supported, warning = Config.validate_agent_brain_model(
+                    brain_config["provider"], brain_config["model"]
+                )
+                if warning:
+                    logger.warning(f"Agent Brain 模型警告: {warning}")
+                logger.info(
+                    f"Agent Brain 已启用: {brain_config['provider']}/{brain_config['model']}"
+                )
+            except Exception as e:
+                logger.warning(f"Agent Brain 注册失败，将使用 v7.1 流水线: {e}")
+
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         logger.info(f"翻译 Agent 初始化完成 (COM 增强: {'✅ 开启' if self.com_enabled else '❌ 关闭'})")
 
@@ -154,19 +178,42 @@ class TranslatorAgent:
             # 后续翻译流程完全一样，只有写入策略不同。
             is_scan = detect_scan_pdf(input_path)
             if is_scan:
-                print(f"[🔍 检测到扫描件] CV + OCR + Vision LLM 混合识别...", flush=True)
-                # 📘 v7: Vision LLM 是核心（理解隐藏列、图片位置等），
-                # CV/OCR 提供精确数据辅助。必须有 Vision 模型。
+                # 📘 扫描件输出 .docx 而不是 .pdf
+                base, _ = os.path.splitext(output_path)
+                output_path = base + ".docx"
+
+                # 📘 教学笔记：Agent Brain 模式 vs v7.1 固定流水线
+                # 如果配置了 Agent Brain（Gemini/Claude/GPT），用 ScanAgent 端到端处理。
+                # ScanAgent 内部完成分析+翻译+Word生成，直接返回输出路径。
+                # 未配置时回退到 v7.1 固定流水线（CV + OCR + Vision LLM）。
+                if "agent_brain" in self.router.engines:
+                    print(f"[🤖 Agent 模式] 使用 Agent Brain 处理扫描件...", flush=True)
+                    try:
+                        from translator.scan_agent import ScanAgent
+                        scan_agent = ScanAgent(
+                            brain_engine=self.router.get("agent_brain"),
+                            translate_pipeline=self.pipeline,
+                            format_engine=self.format_engine,
+                        )
+                        result = scan_agent.process_scan_pdf(
+                            filepath=input_path,
+                            output_path=output_path,
+                            target_lang=target_lang,
+                        )
+                        # 📘 Agent 模式端到端完成，直接返回
+                        return result["output_path"]
+                    except Exception as e:
+                        logger.error(f"Agent 模式失败，回退到 v7.1: {e}")
+                        print(f"[⚠️ Agent 回退] {e}，使用 v7.1 流水线...", flush=True)
+
+                # 📘 v7.1 固定流水线（Agent Brain 未配置或 Agent 模式失败时的回退）
+                print(f"[🔍 v7.1 模式] CV + OCR + Vision LLM 混合识别...", flush=True)
                 vision_engine = None
                 if "vision" in self.router.engines:
                     vision_engine = self.router.get("vision")
                 elif self.router.get("draft"):
-                    # 📘 fallback: 用 draft 模型（如果它支持多模态）
                     vision_engine = self.router.get("draft")
                 parsed_data = parse_scan_pdf(input_path, vision_llm=vision_engine)
-                # 📘 扫描件输出 .docx 而不是 .pdf
-                base, _ = os.path.splitext(output_path)
-                output_path = base + ".docx"
             else:
                 parsed_data = parse_pdf(input_path)
             para_count = sum(1 for i in parsed_data["items"]

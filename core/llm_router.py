@@ -1,6 +1,7 @@
 # core/llm_router.py
 from typing import Dict, Optional
 from core.llm_engine import ArkLLMEngine
+from core.external_llm_engine import ExternalLLMEngine, create_external_engine, PROVIDER_CONFIG
 from core.logger import get_logger
 
 # =============================================================
@@ -109,3 +110,46 @@ class LLMRouter:
             name: engine.model_id
             for name, engine in self.engines.items()
         }
+
+    def register_external(
+        self,
+        name: str,
+        provider: str,
+        model_id: str,
+        api_key: str = None,
+        max_retries: int = 3,
+        retry_base_delay: float = 1.0,
+    ) -> "LLMRouter":
+        """
+        📘 教学笔记：注册一个外部模型引擎（Gemini/Claude/GPT/NanoBanana）
+
+        与 register() 的区别：
+        - register() 创建 ArkLLMEngine（火山引擎）
+        - register_external() 创建 ExternalLLMEngine（外部模型）
+        - 但 get() 返回的引擎都有 stream_chat 方法，调用方不需要关心区别
+
+        📘 这就是"鸭子类型"（Duck Typing）：
+        只要有 stream_chat 方法，就能当 LLM 引擎用。
+
+        参数：
+            name: 别名（如 "agent_brain"）
+            provider: 提供商（"gemini" / "claude" / "openai" / "nanobanana"）
+            model_id: 模型名称（如 "gemini-2.5-pro"）
+            api_key: API 密钥，为 None 时从 .env 自动读取
+            max_retries: 最大重试次数
+            retry_base_delay: 重试初始等待秒数
+        """
+        engine = create_external_engine(
+            provider=provider,
+            model_id=model_id,
+            api_key=api_key,
+            max_retries=max_retries,
+            retry_base_delay=retry_base_delay,
+        )
+        self.engines[name] = engine
+        logger.info(f"已注册外部 LLM 模型: {name} -> {provider}/{model_id}")
+
+        if self.default_name is None:
+            self.default_name = name
+
+        return self
