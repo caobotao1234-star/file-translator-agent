@@ -153,3 +153,40 @@ class LLMRouter:
             self.default_name = name
 
         return self
+
+    def register_model(
+        self,
+        name: str,
+        model_str: str,
+        max_retries: int = 3,
+        retry_base_delay: float = 1.0,
+    ) -> "LLMRouter":
+        """
+        📘 教学笔记：智能模型注册（自动识别 provider）
+
+        根据 model_str 格式自动选择引擎类型：
+        - "gemini:gemini-3.1-pro-preview" → ExternalLLMEngine
+        - "doubao-seed-1-8-251228" → ArkLLMEngine（向后兼容）
+
+        这样 GUI 传过来的模型标识不需要额外处理，
+        Router 自己判断该用哪种引擎。
+        """
+        from config.settings import Config
+        provider, model_id = Config.parse_model_id(model_str)
+
+        if provider == "ark":
+            return self.register(
+                name=name,
+                model_id=model_id,
+                max_retries=max_retries,
+                retry_base_delay=retry_base_delay,
+            )
+        else:
+            return self.register_external(
+                name=name,
+                provider=provider,
+                model_id=model_id,
+                max_retries=max_retries,
+                retry_base_delay=retry_base_delay,
+            )
+

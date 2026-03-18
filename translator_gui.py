@@ -593,7 +593,7 @@ class MainWindow(QMainWindow):
         lang_row.addWidget(self.lang_combo, 1)
         sg_layout.addLayout(lang_row)
 
-        # 初翻模型
+        # 初翻模型（📘 统一列表：火山引擎 + Gemini 等外部模型）
         draft_row = QHBoxLayout()
         draft_row.addWidget(QLabel("初翻模型"))
         self.draft_combo = QComboBox()
@@ -606,7 +606,7 @@ class MainWindow(QMainWindow):
         draft_row.addWidget(self.draft_combo, 1)
         sg_layout.addLayout(draft_row)
 
-        # 审校模型
+        # 审校模型（📘 同样的统一列表）
         review_row = QHBoxLayout()
         review_row.addWidget(QLabel("审校模型"))
         self.review_combo = QComboBox()
@@ -651,7 +651,7 @@ class MainWindow(QMainWindow):
         log_row.addWidget(self.log_combo, 1)
         sg_layout.addLayout(log_row)
 
-        # 📘 排版审校（Vision 模型下拉框）
+        # 📘 排版审校（Vision 模型下拉框 — 统一列表：火山引擎 + 外部模型）
         layout_row = QHBoxLayout()
         layout_row.addWidget(QLabel("排版审校"))
         self.vision_combo = QComboBox()
@@ -666,6 +666,22 @@ class MainWindow(QMainWindow):
             self.vision_combo.addItem(f"✅ {name}", mid)
         layout_row.addWidget(self.vision_combo, 1)
         sg_layout.addLayout(layout_row)
+
+        # 📘 图片生成模型（如 gemini-3-pro-image-preview）
+        # Agent 可以自主决定是否调用图片生成能力来处理特定任务。
+        image_row = QHBoxLayout()
+        image_row.addWidget(QLabel("图片生成"))
+        self.image_combo = QComboBox()
+        self.image_combo.setToolTip(
+            "注册图片生成模型后，Agent 可自主决定是否调用。\n"
+            "适用于扫描件中图表重绘等场景。"
+        )
+        self.image_combo.addItem("关闭", "__off__")
+        image_models = Config.get_image_gen_models()
+        for name, mid in image_models.items():
+            self.image_combo.addItem(name, mid)
+        image_row.addWidget(self.image_combo, 1)
+        sg_layout.addLayout(image_row)
 
         left_layout.addWidget(settings_group)
 
@@ -839,13 +855,17 @@ class MainWindow(QMainWindow):
         vision_choice = self.vision_combo.currentData()
         vision_model = None if vision_choice == "__off__" else vision_choice
 
-        # 扫描件排版模式（已移除，v5 自动生成 Word）
+        # 图片生成模型
+        image_choice = self.image_combo.currentData()
+        image_model = None if image_choice == "__off__" else image_choice
 
         self._append_log(f"初翻模型: {draft_model}", "info")
         self._append_log(f"审校模型: {review_model or '跳过'}", "info")
         self._append_log(f"目标语言: {target_lang}  |  批量: {batch_size}  |  线程: {max_workers}", "info")
         if vision_model:
             self._append_log(f"排版审校: {vision_model}", "info")
+        if image_model:
+            self._append_log(f"图片生成: {image_model}", "info")
         self._append_log(f"文件数: {len(files)}", "info")
         self._append_log("─" * 50, "info")
 
@@ -864,6 +884,7 @@ class MainWindow(QMainWindow):
                 draft_model_id=draft_model,
                 review_model_id=review_model,
                 vision_model_id=vision_model,
+                image_model_id=image_model,
                 batch_size=batch_size,
                 max_workers=max_workers,
                 debug=True,
@@ -968,6 +989,7 @@ class MainWindow(QMainWindow):
         self.worker_spin.setEnabled(not running)
         self.log_combo.setEnabled(not running)
         self.vision_combo.setEnabled(not running)
+        self.image_combo.setEnabled(not running)
         self.format_panel.setEnabled(not running)
 
     def _apply_log_level(self, level_name: str):

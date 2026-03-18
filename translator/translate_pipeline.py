@@ -5,7 +5,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 from typing import Dict, Any, List, Optional, Tuple
 from core.agent import BaseAgent
-from core.llm_engine import ArkLLMEngine
 from core.agent_config import AgentConfig
 from core.logger import get_logger
 
@@ -324,8 +323,8 @@ class TranslatePipeline:
 
     def __init__(
         self,
-        draft_llm: ArkLLMEngine,
-        review_llm: ArkLLMEngine = None,
+        draft_llm,
+        review_llm=None,
         batch_size: int = 10,
         max_workers: int = 1,
         debug: bool = False,

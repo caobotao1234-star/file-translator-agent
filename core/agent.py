@@ -2,7 +2,7 @@
 import json
 from typing import Generator, List
 
-from core.llm_engine import ArkLLMEngine, LLMRetryError
+from core.llm_engine import LLMRetryError
 from core.memory import ConversationMemory
 from core.agent_config import AgentConfig
 from core.agent_events import AgentEvent
@@ -30,7 +30,7 @@ class BaseAgent:
 
     def __init__(
         self,
-        llm_engine: ArkLLMEngine,
+        llm_engine,
         tools: List[BaseTool],
         config: AgentConfig | None = None,
         session_id: str | None = None,

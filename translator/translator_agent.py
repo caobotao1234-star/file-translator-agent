@@ -48,40 +48,51 @@ class TranslatorAgent:
         draft_model_id: str = None,
         review_model_id: str = None,
         vision_model_id: str = None,
+        image_model_id: str = None,
         batch_size: int = 10,
         max_workers: int = 1,
         debug: bool = False,
     ):
         """
         参数：
-            draft_model_id: 初翻模型 ID（默认用 Config 中的模型）
-            review_model_id: 审校模型 ID（为 None 则跳过审校）
-            vision_model_id: 排版审校 Vision 模型 ID（为 None 则跳过排版审校）
+            draft_model_id: 初翻模型（支持 "provider:model" 或纯模型ID）
+            review_model_id: 审校模型（为 None 则跳过审校）
+            vision_model_id: 排版审校 Vision 模型
+            image_model_id: 图片生成模型（如 gemini-3-pro-image-preview）
             batch_size: 每批翻译的段落数
-            max_workers: 并行线程数（同时发多少个LLM请求）
+            max_workers: 并行线程数
             debug: 调试模式
         """
         self.debug = debug
         self.format_engine = FormatEngine()
 
-        # 初始化 LLM 路由
+        # 📘 教学笔记：统一模型路由
+        # 所有模型（火山引擎 + Gemini + Claude 等）通过 register_model 注册，
+        # Router 自动识别 provider 并创建对应的引擎。
+        # GUI 传过来的 model_id 可能是 "doubao-seed-1-8" 或 "gemini:gemini-3.1-pro"。
         self.router = LLMRouter(api_key=Config.ARK_API_KEY)
-        self.router.register("draft", model_id=draft_model_id or Config.DEFAULT_MODEL_ID)
-        # 审校模型：如果没有单独指定，默认和初翻用同一个模型
+        self.router.register_model("draft", model_id=draft_model_id or Config.DEFAULT_MODEL_ID)
         review_id = review_model_id or draft_model_id or Config.DEFAULT_MODEL_ID
-        self.router.register("review", model_id=review_id)
+        self.router.register_model("review", model_id=review_id)
 
         # 📘 教学笔记：Vision 模型（排版审校）
         # 多模态模型能"看图"，用于翻译后的排版质量检查。
         # 如果用户没指定 vision_model_id，跳过排版审校。
         self.layout_agent = None
         if vision_model_id:
-            self.router.register("vision", model_id=vision_model_id)
+            self.router.register_model("vision", model_id=vision_model_id)
             self.layout_agent = LayoutReviewAgent(
                 vision_llm=self.router.get("vision"),
-                fix_llm=self.router.get("review"),  # 复用审校模型做译文精简
+                fix_llm=self.router.get("review"),
             )
             logger.info(f"排版审校 Agent 已启用 (Vision: {vision_model_id})")
+
+        # 📘 教学笔记：图片生成模型（如 gemini-3-pro-image-preview）
+        # 某些任务（如扫描件中的图表重绘）可能需要图片生成能力。
+        # 注册后其他 Agent 可以通过 router.get("image_gen") 获取。
+        if image_model_id:
+            self.router.register_model("image_gen", model_id=image_model_id)
+            logger.info(f"图片生成模型已注册: {image_model_id}")
 
         # 初始化翻译流水线（初翻 + 审校双 Agent）
         self.pipeline = TranslatePipeline(
