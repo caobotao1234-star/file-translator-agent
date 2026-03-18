@@ -318,28 +318,18 @@ HYBRID_STRUCTURE_PROMPT = """\
 ## 你的任务
 结合图片和上述数据，输出完整的文档结构 JSON。
 
-**关键要求（非常重要，请逐条遵守）：**
+**关键要求：**
+1. **隐藏列**：很多表格有不画线的内部列分隔（比如"标签: 值"格式），你必须识别出这些隐藏的列。
+2. **列宽比例**：col_widths 必须精确反映原文的视觉比例。标签列（如"父亲详情"）通常非常窄（8-15%），值列较宽。仔细测量。
+3. **每个单元格独立控制边框**：用 borders 字段指定四条边是否有线。只在原文画了线的地方标 true，隐藏的列分隔线标 false。
+4. **合并单元格**：跨多列或多行的单元格必须用 colspan/rowspan。底部大段文字通常跨全部列。
+5. **图片位置**：表格内的图片用 has_image + image_index 标注。
+6. **文字内容**：优先使用 OCR 数据中的文字。一个单元格内多行文字用 \\n 连接。
 
-1. **隐藏列**：很多表格有不画线的内部列分隔（比如"标签: 值"格式），你必须识别出这些隐藏的列。例如一行里"Name"是标签列，"ZHANG SAN"是值列，虽然中间没有画线，但它们是不同的列。
-
-2. **列宽比例**：col_widths 必须精确反映原文的视觉比例。仔细测量原图中每列的实际像素宽度。标签列（如"父亲详情""母亲详情"等）通常非常窄（可能只有 8-15%），值列较宽。不要把窄列做宽了。
-
-3. **每个单元格独立控制边框**：原文中有些单元格有框线，有些没有。你必须为每个单元格单独指定四条边的边框状态。用 `"borders"` 字段：`{{"top": true, "bottom": true, "left": true, "right": true}}`。true 表示有线，false 表示无线。请仔细观察原图，只在原文画了线的地方标 true。隐藏的列分隔线（原文没画线的）必须标 false。
-
-4. **合并单元格**：如果一个单元格跨多列或多行，必须用 colspan/rowspan 表示。特别注意文档底部的大段文字区域，通常是跨全部列的合并单元格。被合并覆盖的单元格不要输出。
-
-5. **图片位置**：如果图片在表格内部某个单元格中，用 `"image_index": N` 标注。关键：用 `"image_position"` 指定图片相对于文字的位置：`"before"`（图片在文字上方）、`"after"`（图片在文字下方）、`"inline"`（图片和文字在同一行，图片在左或右）。
-
-6. **每行独立对齐**：一个单元格内可能有多行文字，每行的对齐方式可能不同。用 `"lines"` 数组代替 `"text"` + `"align"`，每个元素是 `{{"text": "...", "align": "left|center|right"}}`。如果所有行对齐一致，也可以用简写 `"text": "...", "align": "left"`。
-
-7. **竖版文字**：如果原文中某个单元格的文字是竖排的（从上到下书写），标注 `"vertical": true`。
-
-8. **文字内容**：优先使用 OCR 数据中的文字（更准确），但结构和分组由你根据图片判断。
-
-## 输出 JSON 格式
+## 输出格式
 ```json
 {{
-  "page_type": "table" | "mixed" | "text",
+  "page_type": "table",
   "elements": [
     {{
       "type": "table",
@@ -347,49 +337,22 @@ HYBRID_STRUCTURE_PROMPT = """\
       "rows": [
         {{
           "cells": [
-            {{
-              "text": "标签",
-              "colspan": 1, "rowspan": 1, "bold": true,
-              "align": "center",
-              "vertical": false,
-              "borders": {{"top": true, "bottom": true, "left": true, "right": false}},
-              "has_image": false
-            }},
-            {{
-              "lines": [
-                {{"text": "第一行靠左", "align": "left"}},
-                {{"text": "第二行居中", "align": "center"}}
-              ],
-              "colspan": 2, "rowspan": 1, "bold": false,
-              "vertical": false,
-              "borders": {{"top": true, "bottom": true, "left": false, "right": true}},
-              "has_image": true, "image_index": 0, "image_position": "after"
-            }}
+            {{"text": "标签", "colspan": 1, "rowspan": 1, "bold": true, "align": "center", "borders": {{"top": true, "bottom": true, "left": true, "right": false}}}},
+            {{"text": "值", "colspan": 2, "rowspan": 1, "bold": false, "align": "left", "borders": {{"top": true, "bottom": true, "left": false, "right": true}}, "has_image": true, "image_index": 0}}
           ]
         }}
       ]
     }},
-    {{
-      "type": "paragraph",
-      "text": "段落文字",
-      "bold": false,
-      "align": "center",
-      "font_size": "normal"
-    }},
-    {{
-      "type": "image_region",
-      "image_index": 1,
-      "description": "二维码"
-    }}
+    {{"type": "paragraph", "text": "段落文字", "bold": false, "align": "center", "font_size": "normal"}},
+    {{"type": "image_region", "image_index": 1, "description": "二维码"}}
   ]
 }}
 ```
 
 **注意：**
-- col_widths 的总和必须等于 100，且必须精确反映原图比例
-- elements 按从上到下排列
+- col_widths 总和必须等于 100
 - 只输出 JSON，不要其他文字
-- 每个单元格必须有 borders 字段，精确反映原文的框线
+- 每个单元格必须有 borders 字段
 - 不要给所有单元格都加框线，只在原文有线的地方加"""
 
 
@@ -419,18 +382,57 @@ def _call_vision_llm(vision_llm, image_b64: str, prompt: str) -> Optional[str]:
 
 
 def _parse_structure_json(response: str) -> Optional[dict]:
-    """📘 从 Vision LLM 响应中提取 JSON"""
+    """
+    📘 从 Vision LLM 响应中提取 JSON（增强容错版）
+
+    📘 教学笔记：LLM 返回的 JSON 经常有各种小问题：
+    1. 前后有多余文字（"好的，这是结构：{...}"）
+    2. 被 markdown code block 包裹（```json ... ```）
+    3. 有 trailing comma（最后一个元素后面多了逗号）
+    4. 有注释（// 或 /* */）
+    所以需要多种策略尝试提取。
+    """
     text = response.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        text = "\n".join(lines).strip()
+
+    # 📘 策略1：去掉 markdown code block
+    if "```" in text:
+        # 找到第一个 ``` 和最后一个 ``` 之间的内容
+        parts = text.split("```")
+        for part in parts:
+            part = part.strip()
+            # 去掉 ```json 的 "json" 标记
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("{"):
+                text = part
+                break
+
+    # 📘 策略2：找到第一个 { 和最后一个 } 之间的内容
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        text = text[first_brace:last_brace + 1]
+
+    # 📘 策略3：直接尝试解析
     try:
         result = json.loads(text)
         if isinstance(result, dict) and "elements" in result:
             return result
     except json.JSONDecodeError:
-        logger.warning(f"JSON 解析失败: {text[:500]}...")
+        pass
+
+    # 📘 策略4：修复 trailing comma（JSON 标准不允许，但 LLM 经常生成）
+    import re
+    fixed = re.sub(r',\s*([}\]])', r'\1', text)
+    try:
+        result = json.loads(fixed)
+        if isinstance(result, dict) and "elements" in result:
+            logger.debug("JSON 通过 trailing comma 修复后解析成功")
+            return result
+    except json.JSONDecodeError as e:
+        logger.warning(f"JSON 解析失败（已尝试修复）: {e}")
+        logger.debug(f"JSON 原文前 800 字符: {text[:800]}")
+
     return None
 
 
@@ -688,12 +690,6 @@ def _process_with_hybrid_llm(
                             cell["cropped_image"] = image_regions[img_idx].get("cropped_image")
 
                     cell_text = cell.get("text", "").strip()
-                    # 📘 v7.1: 支持 "lines" 数组格式
-                    cell_lines = cell.get("lines")
-                    if cell_lines and isinstance(cell_lines, list):
-                        cell_text = "\n".join(
-                            l.get("text", "") for l in cell_lines
-                        ).strip()
                     if cell_text:
                         key = f"pg{page_idx}_e{elem_idx}_r{row_idx}_c{col_idx}"
                         items.append({

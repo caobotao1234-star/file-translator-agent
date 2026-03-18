@@ -117,7 +117,6 @@ def _set_run_font(run, bold: bool = False, size_pt: float = 10, font_name: str =
 def _add_image_to_cell(cell, image_bytes: bytes, align: str = "center"):
     """
     📘 v7 新增：把裁剪好的图片嵌入到表格单元格中
-    返回创建的段落，供调用者决定插入位置
     """
     try:
         from PIL import Image as PILImage
@@ -139,43 +138,6 @@ def _add_image_to_cell(cell, image_bytes: bytes, align: str = "center"):
         return None
 
 
-def _insert_image_in_cell_at_position(cell, image_bytes: bytes, position: str, align: str = "center"):
-    """
-    📘 v7.1 新增：按指定位置把图片插入单元格
-
-    position:
-      - "before": 图片在所有文字段落之前
-      - "after": 图片在所有文字段落之后（默认）
-      - "inline": 图片在文字中间（放在第一个段落之后）
-
-    📘 教学笔记：
-    python-docx 的 cell.add_paragraph() 总是追加到末尾。
-    要把图片放在文字前面，需要用 XML 操作把段落移到前面。
-    """
-    img_para = _add_image_to_cell(cell, image_bytes, align)
-    if not img_para:
-        return
-
-    if position == "before":
-        # 📘 把图片段落移到单元格的第一个位置
-        tc = cell._tc
-        # 图片段落是最后一个 <w:p>，移到第一个 <w:p> 之前
-        p_elements = tc.findall(qn("w:p"))
-        if len(p_elements) > 1:
-            tc.remove(p_elements[-1])  # 移除最后添加的图片段落
-            tc.insert(list(tc).index(p_elements[0]), p_elements[-1])  # 插到第一个段落前
-    elif position == "inline":
-        # 📘 放在第一个文字段落之后
-        tc = cell._tc
-        p_elements = tc.findall(qn("w:p"))
-        if len(p_elements) > 2:
-            # 移到第二个位置（第一个文字段落之后）
-            img_p = p_elements[-1]
-            tc.remove(img_p)
-            tc.insert(list(tc).index(p_elements[1]), img_p)
-    # "after" 不需要移动，已经在末尾
-
-
 def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, str],
                       page_idx: int, elem_idx: int):
     """
@@ -183,9 +145,7 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
 
     📘 v7.1 改进：
     1. 每个单元格独立控制四条边框（per-cell borders）
-    2. 每行文字独立对齐（per-line alignment via "lines" array）
-    3. 图片按 image_position 放在文字前/后/中间
-    4. 竖版文字支持（vertical text direction）
+    2. 图片嵌入到正确的单元格中
     """
     rows_data = table_data.get("rows", [])
     if not rows_data:
@@ -241,24 +201,15 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
             if col_cursor >= max_cols:
                 break
 
+            cell_text = cell_data.get("text", "").strip()
             colspan = cell_data.get("colspan", 1)
             rowspan = cell_data.get("rowspan", 1)
             cell_bold = cell_data.get("bold", False)
             cell_align = cell_data.get("align", "left")
-            is_vertical = cell_data.get("vertical", False)
-
-            # 📘 获取文字内容：支持 "lines" 数组（per-line alignment）或 "text" 简写
-            cell_lines = cell_data.get("lines")
-            if cell_lines and isinstance(cell_lines, list):
-                # per-line alignment 模式
-                original_text = "\n".join(l.get("text", "") for l in cell_lines)
-            else:
-                original_text = cell_data.get("text", "").strip()
-                cell_lines = None  # 标记为简写模式
 
             # 📘 查找译文
             key = f"pg{page_idx}_e{elem_idx}_r{row_idx}_c{cell_data_idx}"
-            translated = translations.get(key, original_text)
+            translated = translations.get(key, cell_text)
 
             # 获取单元格
             cell = table.cell(row_idx, col_cursor)
@@ -272,56 +223,23 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
                 except Exception as e:
                     logger.debug(f"合并失败 [{row_idx},{col_cursor}]->[{end_row},{end_col}]: {e}")
 
-            # 📘 竖版文字
-            if is_vertical:
-                _set_cell_vertical_text(cell)
-
-            # 📘 图片处理：根据 image_position 决定插入顺序
-            has_image = cell_data.get("has_image", False)
-            cropped_image = cell_data.get("cropped_image")
-            image_position = cell_data.get("image_position", "after")
-
-            # 📘 写入内容
-            cell.text = ""
-
-            # 如果图片在文字前面
-            if has_image and cropped_image and image_position == "before":
-                _add_image_to_cell(cell, cropped_image, cell_align)
-
             # 📘 写入文字
-            trans_lines = translated.split("\n")
-            if cell_lines and len(cell_lines) == len(trans_lines):
-                # 📘 per-line alignment：每行用原文的对齐方式
-                for line_idx, (trans_text, orig_line) in enumerate(zip(trans_lines, cell_lines)):
-                    line_align = orig_line.get("align", cell_align)
-                    if line_idx == 0:
-                        para = cell.paragraphs[0]
-                    else:
-                        para = cell.add_paragraph()
-                    para.alignment = _get_alignment(line_align)
-                    para.paragraph_format.space_before = Pt(0)
-                    para.paragraph_format.space_after = Pt(1)
-                    run = para.add_run(trans_text.strip())
-                    _set_run_font(run, bold=cell_bold, size_pt=10)
-            else:
-                # 📘 简写模式：所有行用同一个对齐
-                for line_idx, line_text in enumerate(trans_lines):
-                    if line_idx == 0:
-                        para = cell.paragraphs[0]
-                    else:
-                        para = cell.add_paragraph()
-                    para.alignment = _get_alignment(cell_align)
-                    para.paragraph_format.space_before = Pt(0)
-                    para.paragraph_format.space_after = Pt(1)
-                    run = para.add_run(line_text.strip())
-                    _set_run_font(run, bold=cell_bold, size_pt=10)
+            cell.text = ""
+            lines = translated.split("\n")
+            for line_idx, line_text in enumerate(lines):
+                if line_idx == 0:
+                    para = cell.paragraphs[0]
+                else:
+                    para = cell.add_paragraph()
+                para.alignment = _get_alignment(cell_align)
+                para.paragraph_format.space_before = Pt(0)
+                para.paragraph_format.space_after = Pt(1)
+                run = para.add_run(line_text.strip())
+                _set_run_font(run, bold=cell_bold, size_pt=10)
 
-            # 📘 如果图片在文字中间
-            if has_image and cropped_image and image_position == "inline":
-                _insert_image_in_cell_at_position(cell, cropped_image, "inline", cell_align)
-            # 📘 如果图片在文字后面（默认）
-            elif has_image and cropped_image and image_position in ("after", None):
-                _add_image_to_cell(cell, cropped_image, cell_align)
+            # 📘 v7: 图片嵌入单元格
+            if cell_data.get("has_image") and cell_data.get("cropped_image"):
+                _add_image_to_cell(cell, cell_data["cropped_image"], cell_align)
 
             # 📘 设置列宽（仅第一行设置即可）
             if row_idx == 0 and col_cursor < len(col_widths_cm):
