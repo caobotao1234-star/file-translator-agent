@@ -9,34 +9,27 @@ from core.agent_config import AgentConfig
 from core.logger import get_logger
 
 # =============================================================
-# 📘 教学笔记：翻译流水线（Translation Pipeline v4 — 多线程并行）
+# 📘 教学笔记：翻译流水线（Translation Pipeline v5 — 纯翻译）
 # =============================================================
-# v1~v2: 串行 → B1初翻→B1审校→B2初翻→B2审校
-# v3: 流水线 → [B1审校∥B2初翻]，2路并行
-# v4: 全并行 → N个线程同时跑，分两阶段：
-#   阶段1: 所有batch的初翻并行（N路同时发LLM请求）
-#   阶段2: 所有batch的审校并行（N路同时发LLM请求）
+# v5 架构简化：
+#   - 流水线只负责翻译（原"初翻"），不再有独立审校阶段
+#   - 审校职责统一交给规划者（Agent Brain）管理
+#   - 规划者同时负责内容审校 + 排版审校，可多轮迭代
 #
-# 📘 为什么能多线程并行调LLM？
-# LLM调用本质是HTTP请求（I/O密集型），Python的GIL只限制CPU密集型并行。
-# 5个线程同时发5个HTTP请求，服务端会并行处理，完全没问题。
+# 📘 为什么去掉独立审校？
+#   1. 规划者（Gemini）能力更强，能同时审内容和排版
+#   2. 独立审校只能看文本，规划者能看图+文本（多模态）
+#   3. 减少一个模型角色，降低 token 消耗和复杂度
+#   4. 规划者统管翻译/审校/图片生成，多轮迭代更灵活
 #
-# 📘 为什么每个线程需要独立的Agent？
-# _call_llm_translate会操作agent.memory（清空消息），
-# 多线程共享同一个Agent会互相覆盖memory。
-# 所以每个worker线程用自己的Agent实例，但共享同一个LLM engine
-# （HTTP client是线程安全的）。
-#
-# 📘 为什么分两阶段而不是初翻完一个立刻审校？
-# 分阶段更简单、更可控：
-#   - 阶段1全部完成后，所有初翻结果都在内存里
-#   - 阶段2可以安全地读取初翻结果，不需要复杂的依赖管理
-#   - 进度报告更清晰（初翻50%→100%→审校50%→100%）
+# 📘 多线程并行仍然保留：
+#   N个线程同时发翻译请求，I/O密集型任务不受GIL限制。
+#   每个线程独立Agent实例（memory隔离），共享LLM engine。
 # =============================================================
 
 logger = get_logger("translate_pipeline")
 
-DRAFT_SYSTEM_PROMPT = """你是专业翻译专家。将收到的JSON数组逐段翻译，保持段落数量和顺序严格一致。
+TRANSLATE_SYSTEM_PROMPT = """你是专业翻译专家。将收到的JSON数组逐段翻译，保持段落数量和顺序严格一致。
 
 核心要求⚠️：
 1. 输入N个元素，输出必须恰好N个元素，一一对应，不允许合并或拆分。
@@ -63,28 +56,6 @@ DRAFT_SYSTEM_PROMPT = """你是专业翻译专家。将收到的JSON数组逐段
 
 输出：严格JSON数组，每个元素是纯译文字符串（不含任何标签或标记）。"""
 
-REVIEW_SYSTEM_PROMPT = """你是翻译审校专家。你会收到译文列表（附原文摘要供参考），逐条审校并输出修正后的最终版本。
-
-核心要求⚠️：
-1. 输入N条，输出必须恰好N个元素的JSON数组，一一对应，不允许合并或拆分。
-2. 逐条检查译文：语法是否正确、表达是否自然、术语是否统一。
-3. 参考原文摘要判断：是否漏译、误译、语义偏差。
-4. 所有译文必须是用户指定的目标语言。如果发现某条未翻译，你必须翻译它。
-
-审校原则：纠正语法错误、提升流畅度、统一术语、修正漏译误译。
-格式标记：保留所有<rN>标记，数量编号不变，只改标记内译文。
-
-排版审校：
-- 如果某条译文附带了字符限制提示但明显超长，请适当精简，但保持可读性。
-- 标题类译文应简洁有力，但不要过度缩写成不可读的形式。
-- 保持全文术语一致性（同一个专有名词在不同段落应翻译一致）。
-- 不要使用不常见的缩写（如 Co. Hons, Ind Stds, ServFlow 等），要用完整可读的表达。
-
-⚠️ 关键：输出的译文中绝对不要包含任何标签或标记（如 <<ROLE:...>>、[Body]、[Label] 等）。
-也不要输出%%%等分隔符。只输出纯译文。
-
-输出：严格JSON数组，每个元素是审校后的纯译文字符串。"""
-
 MAX_BATCH_RETRIES = 2
 
 # =============================================================
@@ -103,7 +74,7 @@ MAX_BATCH_RETRIES = 2
 #   3. 页面上下文：告诉 LLM 这批文字来自哪一页、文档类型
 #
 # 这些信息通过 prompt 传递给 LLM，不需要新 Agent，
-# 只是让现有的初翻/审校 Agent 做出更好的决策。
+# 只是让翻译 Agent 做出更好的决策。
 # =============================================================
 
 
@@ -141,8 +112,6 @@ def _classify_text_role(item: dict) -> str:
         return "title"
 
     # 规则 2：极短文本 → 标签（仅限纯数字、页码等）
-    # 📘 v2: 阈值从 8 降到 4，避免把"公司简介"(4字)这种正常短文本标为 label
-    # label 应该只用于页码、编号等极短的非语义文本
     if char_count <= 4 and not any('\u4e00' <= c <= '\u9fff' for c in clean_text):
         return "label"
 
@@ -178,13 +147,6 @@ def _estimate_max_chars(item: dict, target_lang: str) -> Optional[int]:
     - PDF: 有 text_bbox，可以精确计算可用宽度 / 目标字号
     - PPT/Word: 没有精确 bbox，用原文字符数 × 膨胀系数估算
 
-    📘 v2 修正：中→英膨胀系数大幅上调
-    之前用 1.3（标题）/ 1.8（正文），导致 LLM 被迫极度缩写。
-    实际上中文→英文的膨胀比约 2.5~3.5 倍：
-      "公司简介" (4字) → "Company Introduction" (22字符)
-      "装配式建筑" (5字) → "Prefabricated Buildings" (23字符)
-    现在用 3.0（标题）/ 2.5（正文），给 LLM 足够空间写出正常译文。
-
     返回 None 表示不限制（正文段落通常不需要限制）。
     """
     text = item.get("full_text", "")
@@ -193,7 +155,6 @@ def _estimate_max_chars(item: dict, target_lang: str) -> Optional[int]:
     item_type = item.get("type", "")
 
     # 📘 正文段落（>50字符）通常不需要长度限制
-    # 因为正文有足够的空间换行，不会溢出
     if char_count > 50:
         return None
 
@@ -207,8 +168,6 @@ def _estimate_max_chars(item: dict, target_lang: str) -> Optional[int]:
             is_multiline = item.get("is_multiline", False)
 
             if is_multiline:
-                # 多行文本：可用面积 / 每字符面积
-                # 📘 英文字符宽度 ≈ 0.55 × 字号（比 0.5 宽松一点）
                 char_width = font_size * 0.55
                 line_height = font_size * 1.3
                 if char_width > 0 and line_height > 0:
@@ -216,18 +175,16 @@ def _estimate_max_chars(item: dict, target_lang: str) -> Optional[int]:
                     num_lines = max(1, int(height / line_height))
                     return chars_per_line * num_lines
             else:
-                # 单行文本：可用宽度 / 字符宽度
                 char_width = font_size * 0.55
                 if char_width > 0:
                     return int(width / char_width)
 
     # PPT/Word: 用膨胀系数估算
-    # 📘 v2: 大幅上调膨胀系数，避免过度缩写
     role = item.get("text_role", "body")
     if role in ("title", "subtitle"):
-        factor = 3.0  # 标题：中文4字 → 英文12字符，合理
+        factor = 3.0
     elif role in ("caption", "label"):
-        factor = 2.5  # 标签：稍紧凑但不至于缩写
+        factor = 2.5
     else:
         factor = 2.5
 
@@ -238,17 +195,11 @@ def _estimate_max_chars(item: dict, target_lang: str) -> Optional[int]:
     return None
 
 
-
 def _build_context_hint(items: List[dict], doc_type: str) -> str:
     """
     📘 教学笔记：构建页面上下文提示
 
-    给 LLM 一段简短的上下文描述，帮助它理解这批文字的来源：
-    - 文档类型（PDF宣传册/PPT演示/Word文档）
-    - 当前页码/幻灯片号
-    - 这批文字的角色分布（几个标题、几个正文等）
-
-    这段提示加在翻译 prompt 的开头，不影响 JSON 输出格式。
+    给 LLM 一段简短的上下文描述，帮助它理解这批文字的来源。
     """
     doc_type_names = {
         "pdf_block": "PDF文档（可能是宣传册/手册）",
@@ -257,7 +208,6 @@ def _build_context_hint(items: List[dict], doc_type: str) -> str:
         "table_cell": "表格",
     }
 
-    # 统计角色分布
     role_counts = {}
     pages = set()
     for item in items:
@@ -265,10 +215,8 @@ def _build_context_hint(items: List[dict], doc_type: str) -> str:
         role_counts[role] = role_counts.get(role, 0) + 1
         key = item.get("key", "")
         if key.startswith("pg"):
-            # PDF: pg0_b1 → page 0
             pages.add(key.split("_")[0])
         elif key.startswith("s"):
-            # PPT: s0_sh1_p0 → slide 0
             pages.add(key.split("_")[0])
 
     type_name = doc_type_names.get(doc_type, "文档")
@@ -281,15 +229,6 @@ def _build_context_hint(items: List[dict], doc_type: str) -> str:
 def _enrich_text_for_prompt(text: str, item: dict) -> str:
     """
     📘 教学笔记：给翻译文本附加角色和长度提示
-
-    在原文前面加上角色标签和长度限制，例如：
-      "<<ROLE:标题>> <<LIMIT:30>> 装配式建筑全生态产业链服务商"
-      "<<ROLE:正文>> 东方建科代表案例：河南省直青年人才公寓..."
-
-    📘 v2: 改用 <<ROLE:...>> 格式代替 [角色] 格式
-    之前用 [标题/口号] 这种方括号格式，LLM 容易把它当成内容的一部分
-    翻译成 [Body]、[Label] 等混入输出。
-    改用 <<...>> 格式更明确是元数据，LLM 不太会保留在输出中。
     """
     role = item.get("text_role", "body")
     max_chars = item.get("max_chars")
@@ -312,19 +251,18 @@ def _enrich_text_for_prompt(text: str, item: dict) -> str:
 
 class TranslatePipeline:
     """
-    翻译流水线：初翻 → 审校，多线程并行。
+    📘 翻译流水线 v5：纯翻译，多线程并行。
+    审校职责统一交给规划者（Agent Brain）管理。
 
     📘 教学笔记：max_workers 控制并行度
     - max_workers=1: 串行（兼容模式，适合调试）
-    - max_workers=2: 等同于 v3 流水线（初翻+审校各1线程）
     - max_workers=3~5: 推荐值，多batch并行，速度提升明显
     - max_workers>5: 可能触发API限流，视服务端配额而定
     """
 
     def __init__(
         self,
-        draft_llm,
-        review_llm=None,
+        translate_llm,
         batch_size: int = 10,
         max_workers: int = 1,
         debug: bool = False,
@@ -332,8 +270,7 @@ class TranslatePipeline:
         self.batch_size = batch_size
         self.max_workers = max(1, max_workers)
         self.debug = debug
-        self.draft_llm = draft_llm
-        self.review_llm = review_llm
+        self.translate_llm = translate_llm
 
         # 📘 教学笔记：优雅停止机制
         self._stop_event = threading.Event()
@@ -341,38 +278,22 @@ class TranslatePipeline:
         # 📘 教学笔记：Agent 池
         # 每个worker线程需要独立的Agent实例（memory不是线程安全的）。
         # 但它们共享同一个LLM engine（HTTP client是线程安全的）。
-        # draft_agent / review_agent 保留为"主Agent"，用于token统计汇总。
-        self.draft_agent = self._make_draft_agent()
-        self.review_agent = self._make_review_agent()
+        self.translate_agent = self._make_translate_agent()
 
         # 额外的worker Agent（多线程时使用）
-        self._draft_pool: List[BaseAgent] = [self.draft_agent]
-        self._review_pool: List[BaseAgent] = [self.review_agent] if self.review_agent else []
+        self._translate_pool: List[BaseAgent] = [self.translate_agent]
         for _ in range(self.max_workers - 1):
-            self._draft_pool.append(self._make_draft_agent())
-            if self.review_llm:
-                self._review_pool.append(self._make_review_agent())
+            self._translate_pool.append(self._make_translate_agent())
 
         # 📘 线程安全的Agent分配：用锁保护的索引
-        self._draft_lock = threading.Lock()
-        self._draft_idx = 0
-        self._review_lock = threading.Lock()
-        self._review_idx = 0
+        self._translate_lock = threading.Lock()
+        self._translate_idx = 0
 
-    def _acquire_draft_agent(self) -> BaseAgent:
-        """线程安全地获取一个draft Agent"""
-        with self._draft_lock:
-            agent = self._draft_pool[self._draft_idx % len(self._draft_pool)]
-            self._draft_idx += 1
-            return agent
-
-    def _acquire_review_agent(self) -> Optional[BaseAgent]:
-        """线程安全地获取一个review Agent"""
-        if not self._review_pool:
-            return None
-        with self._review_lock:
-            agent = self._review_pool[self._review_idx % len(self._review_pool)]
-            self._review_idx += 1
+    def _acquire_translate_agent(self) -> BaseAgent:
+        """线程安全地获取一个翻译 Agent"""
+        with self._translate_lock:
+            agent = self._translate_pool[self._translate_idx % len(self._translate_pool)]
+            self._translate_idx += 1
             return agent
 
     def request_stop(self):
@@ -389,38 +310,20 @@ class TranslatePipeline:
         return self._stop_event.is_set()
 
     @property
-    def total_draft_tokens(self) -> int:
-        """汇总所有draft Agent的token用量"""
-        return sum(a.total_tokens for a in self._draft_pool)
+    def total_translate_tokens(self) -> int:
+        """汇总所有翻译 Agent 的 token 用量"""
+        return sum(a.total_tokens for a in self._translate_pool)
 
-    @property
-    def total_review_tokens(self) -> int:
-        """汇总所有review Agent的token用量"""
-        return sum(a.total_tokens for a in self._review_pool)
-
-    def _make_draft_agent(self) -> BaseAgent:
+    def _make_translate_agent(self) -> BaseAgent:
         return BaseAgent(
-            llm_engine=self.draft_llm,
+            llm_engine=self.translate_llm,
             tools=[],
             config=AgentConfig(max_loops=1, debug=self.debug, show_usage=False),
-            system_prompt=DRAFT_SYSTEM_PROMPT,
-            agent_name="draft_translator",
-        )
-
-    def _make_review_agent(self) -> Optional[BaseAgent]:
-        if self.review_llm is None:
-            return None
-        return BaseAgent(
-            llm_engine=self.review_llm,
-            tools=[],
-            config=AgentConfig(max_loops=1, debug=self.debug, show_usage=False),
-            system_prompt=REVIEW_SYSTEM_PROMPT,
-            agent_name="reviewer",
+            system_prompt=TRANSLATE_SYSTEM_PROMPT,
+            agent_name="translator",
         )
 
     # 📘 教学笔记：清理 LLM 译文中泄漏的元数据标签
-    # prompt 中给 LLM 的角色提示（如 <<ROLE:标题>>）和长度限制（<<LIMIT:30>>）
-    # 有时会被 LLM 保留在输出中。旧格式 [Body]、[Label] 也要兼容清理。
     _ROLE_TAG_RE = re.compile(
         r'<<(?:ROLE|LIMIT):[^>]*>>\s*|'
         r'\[(?:Body|Label|Subtitle|Caption|Title|'
@@ -474,7 +377,7 @@ class TranslatePipeline:
         response = agent.run(prompt)
         return self._parse_json_response(response)
 
-    def _draft_batch(
+    def _translate_batch(
         self,
         texts: List[str],
         target_lang: str,
@@ -483,7 +386,7 @@ class TranslatePipeline:
         items: List[dict] = None,
     ) -> List[str]:
         """
-        初翻一批文本，带智能重试。返回长度 == len(texts) 的结果列表。
+        翻译一批文本，带智能重试。返回长度 == len(texts) 的结果列表。
         agent: 指定使用的Agent实例（多线程时每个线程用不同的Agent）
         items: 对应的 parsed item 列表（用于上下文感知翻译）
         """
@@ -491,19 +394,15 @@ class TranslatePipeline:
             return []
 
         if agent is None:
-            agent = self._acquire_draft_agent()
+            agent = self._acquire_translate_agent()
 
         results = list(texts)  # 原文兜底
         pending_indices = list(range(len(texts)))
 
         # 📘 教学笔记：构建上下文感知的翻译输入
-        # 如果有 items 元数据，给每段文本附加角色和长度提示。
-        # LLM 看到的输入从 "装配式建筑" 变成 "[标题][限30字符] 装配式建筑"，
-        # 这样它就知道要用简洁的翻译风格，并控制长度。
         has_context = items is not None and len(items) == len(texts)
         if has_context:
             enriched_texts = [_enrich_text_for_prompt(t, it) for t, it in zip(texts, items)]
-            # 构建页面上下文提示
             doc_type = items[0].get("type", "paragraph") if items else "paragraph"
             context_hint = _build_context_hint(items, doc_type)
         else:
@@ -521,129 +420,65 @@ class TranslatePipeline:
             count = len(pending_texts)
 
             if attempt == 0:
-                print(f"  [📝 初翻中] {count} 个段落...", flush=True)
+                print(f"  [📝 翻译中] {count} 个段落...", flush=True)
             else:
-                print(f"  [🔄 重试初翻] 第{attempt}次，{count} 个漏翻段落...", flush=True)
+                print(f"  [🔄 重试翻译] 第{attempt}次，{count} 个漏翻段落...", flush=True)
 
-            logger.debug(f"初翻请求: {count} 段, 目标语言={target_lang}({lang_english}), attempt={attempt}")
-            logger.debug(f"初翻输入摘要: {[t[:30] for t in pending_texts[:3]]}{'...' if count > 3 else ''}")
+            logger.debug(f"翻译请求: {count} 段, 目标语言={target_lang}({lang_english}), attempt={attempt}")
+            logger.debug(f"翻译输入摘要: {[t[:30] for t in pending_texts[:3]]}{'...' if count > 3 else ''}")
 
-            draft_prompt = (
+            translate_prompt = (
                 f"将以下{count}个段落翻译成{target_lang}({lang_english})。"
                 f"必须输出恰好{count}个元素的JSON数组，一一对应。"
                 f"每一段都必须输出{target_lang}，不允许保留原文语言。\n"
             )
             if context_hint:
-                draft_prompt += f"{context_hint}\n"
-            # 📘 用 enriched_texts（带角色/长度提示）而不是原始 texts
+                translate_prompt += f"{context_hint}\n"
             prompt_texts = [enriched_texts[i] for i in pending_indices] if has_context else pending_texts
-            draft_prompt += f"输入：{json.dumps(prompt_texts, ensure_ascii=False)}"
+            translate_prompt += f"输入：{json.dumps(prompt_texts, ensure_ascii=False)}"
 
-            draft_results = self._call_llm_translate(agent, draft_prompt)
+            translate_results = self._call_llm_translate(agent, translate_prompt)
 
-            if draft_results and len(draft_results) == count:
-                for idx, translated in zip(pending_indices, draft_results):
+            if translate_results and len(translate_results) == count:
+                for idx, translated in zip(pending_indices, translate_results):
                     results[idx] = translated
-                logger.debug(f"初翻输出摘要: {[t[:30] for t in draft_results[:3]]}{'...' if count > 3 else ''}")
-                print(f"  [✅ 初翻完成]", flush=True)
+                logger.debug(f"翻译输出摘要: {[t[:30] for t in translate_results[:3]]}{'...' if count > 3 else ''}")
+                print(f"  [✅ 翻译完成]", flush=True)
                 pending_indices = []
                 break
 
-            if draft_results:
-                got = len(draft_results)
-                logger.warning(f"初翻结果数量不匹配: 期望 {count}，得到 {got}")
+            if translate_results:
+                got = len(translate_results)
+                logger.warning(f"翻译结果数量不匹配: 期望 {count}，得到 {got}")
                 if got > count:
                     if attempt < MAX_BATCH_RETRIES:
                         logger.info(f"返回多了 {got}>{count}，整批重试")
                     else:
                         logger.warning(f"最后一次重试仍多了，截断取前 {count} 个")
                         for j in range(count):
-                            results[pending_indices[j]] = draft_results[j]
+                            results[pending_indices[j]] = translate_results[j]
                         pending_indices = []
                 else:
                     new_pending = []
                     for j in range(count):
                         if j < got:
-                            results[pending_indices[j]] = draft_results[j]
+                            results[pending_indices[j]] = translate_results[j]
                         else:
                             new_pending.append(pending_indices[j])
                     pending_indices = new_pending
                     logger.info(f"部分匹配 {got}/{count}，剩余 {len(pending_indices)} 个待重试")
             else:
-                logger.warning(f"初翻完全失败（JSON 解析错误），{count} 个段落将重试")
+                logger.warning(f"翻译完全失败（JSON 解析错误），{count} 个段落将重试")
 
             if not pending_indices:
-                print(f"  [✅ 初翻完成（部分匹配）]", flush=True)
+                print(f"  [✅ 翻译完成（部分匹配）]", flush=True)
                 break
 
         if pending_indices:
-            logger.warning(f"初翻最终仍有 {len(pending_indices)} 个段落未翻译，使用原文兜底")
+            logger.warning(f"翻译最终仍有 {len(pending_indices)} 个段落未翻译，使用原文兜底")
             print(f"  [⚠️ {len(pending_indices)} 个段落使用原文兜底]", flush=True)
 
         return results
-
-    def _review_batch(
-        self,
-        texts: List[str],
-        draft_results: List[str],
-        target_lang: str,
-        lang_english: str,
-        agent: BaseAgent = None,
-        items: List[dict] = None,
-    ) -> List[str]:
-        """
-        审校一批文本。返回审校后的结果，失败则返回初翻结果。
-
-        📘 教学笔记：审校 token 优化 + 上下文感知
-        原文只发前 50 字符作为"锚点"，足够审校 agent
-        判断译文是否对齐、是否漏译，但 token 消耗大幅降低。
-        新增：附带角色和长度提示，让审校也能控制译文长度。
-        """
-        if agent is None:
-            agent = self._acquire_review_agent()
-        if agent is None:
-            return draft_results
-
-        SRC_ANCHOR_LEN = 50
-        has_context = items is not None and len(items) == len(texts)
-        pairs = []
-        for idx, (src, tgt) in enumerate(zip(texts, draft_results)):
-            anchor = src[:SRC_ANCHOR_LEN]
-            if len(src) > SRC_ANCHOR_LEN:
-                anchor += "…"
-            pair = {"原文摘要": anchor, "译文": tgt}
-            # 📘 附加角色和长度提示给审校
-            if has_context:
-                item = items[idx]
-                role = item.get("text_role", "body")
-                max_chars = item.get("max_chars")
-                if role != "body":
-                    pair["角色"] = role
-                if max_chars and role != "body":
-                    pair["限字符"] = max_chars
-            pairs.append(pair)
-
-        n = len(pairs)
-        review_prompt = (
-            f"以下是{n}条翻译结果（含原文摘要供参考）。"
-            f"逐条审校译文，确保是准确的{target_lang}({lang_english})，"
-            f"修正漏译、误译、语法错误、术语不一致。"
-            f"输出恰好{n}个元素的JSON数组（只含修正后的译文）。\n"
-            f"对照表：{json.dumps(pairs, ensure_ascii=False)}"
-        )
-
-        print(f"  [🔍 审校中] 对照原文检查译文质量...", flush=True)
-        logger.debug(f"审校请求: {n} 段（原文摘要+译文对照）")
-        review_results = self._call_llm_translate(agent, review_prompt)
-
-        if review_results and len(review_results) == n:
-            logger.debug(f"审校输出摘要: {[t[:30] for t in review_results[:3]]}{'...' if n > 3 else ''}")
-            print(f"  [✅ 审校完成]", flush=True)
-            return review_results
-        else:
-            logger.warning("审校结果解析失败或数量不匹配，使用初翻结果")
-            print(f"  [⚠️ 审校失败] 使用初翻结果", flush=True)
-            return draft_results
 
     def translate_batch(
         self,
@@ -651,7 +486,7 @@ class TranslatePipeline:
         target_lang: str = "英文",
     ) -> List[str]:
         """
-        翻译一批文本（初翻 + 审校）。
+        翻译一批文本（纯翻译，无审校）。
         📘 保留此方法供 COM 增强等外部调用（非流水线模式）。
         """
         if not texts:
@@ -664,8 +499,7 @@ class TranslatePipeline:
         }
         lang_english = lang_hint.get(target_lang, target_lang)
 
-        draft_results = self._draft_batch(texts, target_lang, lang_english)
-        return self._review_batch(texts, draft_results, target_lang, lang_english)
+        return self._translate_batch(texts, target_lang, lang_english)
 
     def translate_document(
         self,
@@ -674,24 +508,13 @@ class TranslatePipeline:
         on_progress=None,
     ) -> Dict[str, str]:
         """
-        翻译整个文档（v4 多线程并行版）。
+        翻译整个文档（v5 多线程并行版 — 纯翻译，无审校）。
 
-        📘 教学笔记：两阶段多线程并行
-
-        阶段1 — 初翻（N路并行）：
-          线程1: B1初翻    线程2: B2初翻    线程3: B3初翻 ...
-          所有batch同时发LLM请求，服务端并行处理。
-
-        阶段2 — 审校（N路并行）：
-          线程1: B1审校    线程2: B2审校    线程3: B3审校 ...
-
-        总时间 ≈ ceil(batch数/N) × (单batch初翻 + 单batch审校)
-        对比v3: N × 单batch初翻 + 单batch审校
-        当N=5、4个batch时: v4≈1轮初翻+1轮审校, v3≈4轮初翻+1轮审校
+        📘 教学笔记：多线程并行翻译
+        所有batch同时发LLM请求，服务端并行处理。
+        总时间 ≈ ceil(batch数/N) × 单batch翻译时间
         """
         # 📘 教学笔记：上下文感知预处理
-        # 在翻译前，给每个 item 标注文本角色和长度约束。
-        # 这些元数据会被 _enrich_text_for_prompt 用来构建增强 prompt。
         for item in parsed_data["items"]:
             if item.get("is_empty"):
                 continue
@@ -711,7 +534,6 @@ class TranslatePipeline:
             logger.log(5, f"文本角色分类: {role_stats}")  # TRACE level = 5
 
         to_translate = []
-        # 📘 保存 item 引用，后续构建 prompt 时需要元数据
         item_map: Dict[str, dict] = {}
         for item in parsed_data["items"]:
             if item.get("is_empty"):
@@ -732,7 +554,7 @@ class TranslatePipeline:
         lang_english = lang_hint.get(target_lang, target_lang)
 
         # 切分所有 batch
-        batches: List[Tuple[List[str], List[str], List[dict]]] = []  # (keys, texts, items)
+        batches: List[Tuple[List[str], List[str], List[dict]]] = []
         for i in range(0, total, self.batch_size):
             batch = to_translate[i:i + self.batch_size]
             batch_keys = [key for key, _ in batch]
@@ -742,30 +564,27 @@ class TranslatePipeline:
 
         num_batches = len(batches)
         translations = {}
-        draft_results_map: Dict[int, List[str]] = {}  # batch_idx -> draft results
         stopped_early = False
 
         # ============================================================
-        # 阶段1：初翻（多线程并行）
+        # 翻译（多线程并行）
         # ============================================================
-        print(f"  [🚀 阶段1] 初翻 {num_batches} 个批次（{workers} 线程并行）", flush=True)
-        completed_draft = 0
+        print(f"  [🚀 翻译] {num_batches} 个批次（{workers} 线程并行）", flush=True)
+        completed_count = 0
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            # 提交所有初翻任务
             future_to_idx: Dict[Future, int] = {}
             for batch_idx, (batch_keys, batch_texts, batch_items) in enumerate(batches):
                 if self._stop_event.is_set():
                     stopped_early = True
                     break
-                agent = self._acquire_draft_agent()
+                agent = self._acquire_translate_agent()
                 future = executor.submit(
-                    self._draft_batch, batch_texts, target_lang, lang_english, agent,
+                    self._translate_batch, batch_texts, target_lang, lang_english, agent,
                     batch_items,
                 )
                 future_to_idx[future] = batch_idx
 
-            # 收集初翻结果（按完成顺序）
             for future in as_completed(future_to_idx):
                 if self._stop_event.is_set():
                     stopped_early = True
@@ -773,63 +592,17 @@ class TranslatePipeline:
                 batch_idx = future_to_idx[future]
                 batch_keys, batch_texts, batch_items = batches[batch_idx]
                 try:
-                    draft_results = future.result()
-                    draft_results_map[batch_idx] = draft_results
-                    # 先写入初翻结果作为兜底
+                    results = future.result()
                     for j, key in enumerate(batch_keys):
-                        translations[key] = draft_results[j] if j < len(draft_results) else batch_texts[j]
+                        translations[key] = results[j] if j < len(results) else batch_texts[j]
                 except Exception as e:
-                    logger.error(f"初翻批次 {batch_idx} 异常: {e}")
-                    # 异常时用原文兜底
+                    logger.error(f"翻译批次 {batch_idx} 异常: {e}")
                     for j, key in enumerate(batch_keys):
                         translations[key] = batch_texts[j]
-                    draft_results_map[batch_idx] = list(batch_texts)
 
-                completed_draft += len(batch_keys)
+                completed_count += len(batch_keys)
                 if on_progress:
-                    on_progress(completed_draft, total)
-
-        if stopped_early and not translations:
-            logger.info("用户在初翻阶段停止，无翻译结果")
-            return translations
-
-        # ============================================================
-        # 阶段2：审校（多线程并行）
-        # ============================================================
-        if self.review_agent is not None and not self._stop_event.is_set():
-            completed_batches = sorted(draft_results_map.keys())
-            review_count = len(completed_batches)
-            print(f"  [🚀 阶段2] 审校 {review_count} 个批次（{workers} 线程并行）", flush=True)
-
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                future_to_idx: Dict[Future, int] = {}
-                for batch_idx in completed_batches:
-                    if self._stop_event.is_set():
-                        stopped_early = True
-                        break
-                    batch_keys, batch_texts, batch_items = batches[batch_idx]
-                    draft_results = draft_results_map[batch_idx]
-                    agent = self._acquire_review_agent()
-                    future = executor.submit(
-                        self._review_batch,
-                        batch_texts, draft_results, target_lang, lang_english, agent,
-                        batch_items,
-                    )
-                    future_to_idx[future] = batch_idx
-
-                for future in as_completed(future_to_idx):
-                    if self._stop_event.is_set():
-                        stopped_early = True
-                        break
-                    batch_idx = future_to_idx[future]
-                    batch_keys, batch_texts, batch_items = batches[batch_idx]
-                    try:
-                        reviewed = future.result()
-                        for j, key in enumerate(batch_keys):
-                            translations[key] = reviewed[j] if j < len(reviewed) else translations.get(key, batch_texts[j])
-                    except Exception as e:
-                        logger.error(f"审校批次 {batch_idx} 异常: {e}")
-                        # 审校失败，保留初翻结果（已在translations里）
+                    on_progress(completed_count, total)
 
         if stopped_early:
             logger.info(f"文档翻译被中断: 已完成 {len(translations)}/{total} 个翻译单元")

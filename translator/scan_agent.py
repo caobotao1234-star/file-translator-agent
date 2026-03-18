@@ -127,20 +127,24 @@ SCAN_AGENT_SYSTEM_PROMPT = """\
 - 翻译目标语言：{{target_lang}}
 """
 
-# 📘 自我审查提示词
+# 📘 教学笔记：统一审查提示词（v5 — 内容+排版+翻译质量）
+# v5 架构中，审校职责统一由规划者管理。
+# 自我审查同时检查：结构完整性、翻译质量、排版合理性。
 SELF_REVIEW_PROMPT = """\
 请审查以下文档分析和翻译结果的质量。对比原始页面图片，检查：
 
-1. **文字提取完整性**：是否有遗漏的文字？
-2. **翻译覆盖率**：所有文字都翻译了吗？
-3. **结构正确性**：表格行列数对吗？合并单元格对吗？
-4. **边框准确性**：只在原文有线的地方标了 true 吗？
+1. **文字提取完整性**：是否有遗漏的文字？OCR 结果是否完整？
+2. **翻译质量**：译文是否准确？是否有漏译、误译、语法错误？术语是否统一？
+3. **翻译覆盖率**：所有文字都翻译了吗？是否有原文残留？
+4. **结构正确性**：表格行列数对吗？合并单元格对吗？
+5. **边框准确性**：只在原文有线的地方标了 true 吗？
+6. **排版合理性**：译文长度是否合理？标题是否简洁？正文是否通顺？
 
 当前结果：
 {result_json}
 
 如果结果质量合格，回复 JSON：{{"passed": true, "reason": ""}}
-如果有问题需要修正，回复 JSON：{{"passed": false, "reason": "具体问题描述", "fix_actions": ["需要重新OCR第X区域", "需要补充翻译"]}}
+如果有问题需要修正，回复 JSON：{{"passed": false, "reason": "具体问题描述", "fix_actions": ["需要重新OCR第X区域", "需要补充翻译", "需要修正译文"]}}
 """
 
 
@@ -166,7 +170,7 @@ class ScanAgent:
         format_engine,
         image_gen_engine=None,
         max_tool_calls: int = 10,
-        max_review_retries: int = 2,
+        max_review_retries: int = 3,
     ):
         """
         📘 参数说明：
@@ -184,11 +188,17 @@ class ScanAgent:
         self.max_tool_calls = max_tool_calls
         self.max_review_retries = max_review_retries
 
-        # 📘 统计信息
+        # 📘 统计信息（v5: 4 个维度 — planner/translate/image_gen/reviewer）
+        # planner = Agent Brain 的 token（分析+决策+审查）
+        # translate = TranslationTool 调用的翻译模型 token
+        # image_gen = ImageGenTool 调用的图片生成模型 token
+        # reviewer = 自我审查阶段的 Brain token（从 planner 中拆分）
         self.stats = {
             "total_time_seconds": 0,
-            "brain_tokens": {"prompt": 0, "completion": 0},
+            "planner_tokens": {"prompt": 0, "completion": 0},
             "translate_tokens": {"prompt": 0, "completion": 0},
+            "image_gen_tokens": {"prompt": 0, "completion": 0},
+            "reviewer_tokens": {"prompt": 0, "completion": 0},
             "tool_calls": {"ocr": 0, "cv": 0, "translate": 0, "word_writer": 0, "image_gen": 0},
             "review_results": [],
         }
@@ -358,6 +368,11 @@ class ScanAgent:
         # ── 5. 统计 ──
         self.stats["total_time_seconds"] = round(time.time() - start_time, 1)
 
+        # 📘 从 TranslatePipeline 收集翻译模型的 token 用量
+        if self.translate_pipeline:
+            self.stats["translate_tokens"]["prompt"] += self.translate_pipeline.total_translate_tokens
+            # 📘 pipeline 只暴露 total，无法拆分 prompt/completion，全计入 prompt
+
         self._emit_event(on_event, "complete", {
             "progress_pct": 100,
             "stats": self.stats,
@@ -468,8 +483,8 @@ class ScanAgent:
                     elif chunk["type"] == "tool_call":
                         tool_calls_in_turn.append(chunk)
                     elif chunk["type"] == "usage":
-                        self.stats["brain_tokens"]["prompt"] += chunk.get("prompt_tokens", 0)
-                        self.stats["brain_tokens"]["completion"] += chunk.get("completion_tokens", 0)
+                        self.stats["planner_tokens"]["prompt"] += chunk.get("prompt_tokens", 0)
+                        self.stats["planner_tokens"]["completion"] += chunk.get("completion_tokens", 0)
             except Exception as e:
                 logger.error(f"Agent Brain 调用失败: {e}")
                 logger.error(f"已收集的文本: {text_in_turn[:200] if text_in_turn else '(空)'}")
@@ -569,8 +584,8 @@ class ScanAgent:
                 if chunk["type"] == "text":
                     final_text += chunk["content"]
                 elif chunk["type"] == "usage":
-                    self.stats["brain_tokens"]["prompt"] += chunk.get("prompt_tokens", 0)
-                    self.stats["brain_tokens"]["completion"] += chunk.get("completion_tokens", 0)
+                    self.stats["planner_tokens"]["prompt"] += chunk.get("prompt_tokens", 0)
+                    self.stats["planner_tokens"]["completion"] += chunk.get("completion_tokens", 0)
 
         # 📘 解析 Brain 输出的 JSON
         logger.info(f"第 {page_idx} 页: Brain 输出 {len(final_text)} 字符")
@@ -774,8 +789,8 @@ class ScanAgent:
                     if chunk["type"] == "text":
                         review_text += chunk["content"]
                     elif chunk["type"] == "usage":
-                        self.stats["brain_tokens"]["prompt"] += chunk.get("prompt_tokens", 0)
-                        self.stats["brain_tokens"]["completion"] += chunk.get("completion_tokens", 0)
+                        self.stats["reviewer_tokens"]["prompt"] += chunk.get("prompt_tokens", 0)
+                        self.stats["reviewer_tokens"]["completion"] += chunk.get("completion_tokens", 0)
             except Exception as e:
                 logger.warning(f"第 {page_idx} 页审查调用失败: {e}")
                 # 📘 审查失败不阻塞流程，标记并继续
