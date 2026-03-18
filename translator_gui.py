@@ -734,6 +734,28 @@ class MainWindow(QMainWindow):
         log_row.addWidget(self.log_combo, 1)
         sg_layout.addLayout(log_row)
 
+        # 📘 代理设置：企业网络访问外部 API 需要代理
+        proxy_row = QHBoxLayout()
+        self.proxy_check = QCheckBox("代理")
+        self.proxy_check.setToolTip(
+            "启用 HTTP 代理访问外部 API（Gemini/Claude/GPT）。\n"
+            "火山引擎内网 API 自动跳过代理。"
+        )
+        self.proxy_check.setChecked(
+            os.getenv("ENABLE_PROXY", "true").strip().lower() in ("true", "1", "yes", "on")
+        )
+        proxy_row.addWidget(self.proxy_check)
+        self.proxy_input = QLineEdit()
+        self.proxy_input.setPlaceholderText("http://host:port")
+        self.proxy_input.setText(os.getenv("PROXY_URL", "").strip())
+        self.proxy_input.setEnabled(self.proxy_check.isChecked())
+        proxy_row.addWidget(self.proxy_input, 1)
+        sg_layout.addLayout(proxy_row)
+
+        # 📘 代理开关联动：勾选/取消时立即更新环境变量
+        self.proxy_check.toggled.connect(self._on_proxy_toggled)
+        self.proxy_input.editingFinished.connect(self._on_proxy_changed)
+
         left_layout.addWidget(settings_group)
 
         # 格式映射面板
@@ -1049,6 +1071,8 @@ class MainWindow(QMainWindow):
         self.batch_spin.setEnabled(not running)
         self.worker_spin.setEnabled(not running)
         self.log_combo.setEnabled(not running)
+        self.proxy_check.setEnabled(not running)
+        self.proxy_input.setEnabled(not running and self.proxy_check.isChecked())
         self.format_panel.setEnabled(not running)
 
     def _apply_log_level(self, level_name: str):
@@ -1091,6 +1115,78 @@ class MainWindow(QMainWindow):
         ]
         for name in noisy_loggers:
             logging.getLogger(name).setLevel(logging.WARNING)
+
+    # ---------------------------------------------------------
+    # 代理设置
+    # ---------------------------------------------------------
+    def _on_proxy_toggled(self, checked: bool):
+        """
+        📘 教学笔记：代理开关实时生效
+
+        勾选/取消时立即更新进程级环境变量，
+        这样后续创建的 HTTP 客户端（openai SDK、httpx）自动感知。
+        同时持久化到 .env，下次启动也保持设置。
+        """
+        self.proxy_input.setEnabled(checked)
+        self._apply_proxy(checked, self.proxy_input.text().strip())
+
+    def _on_proxy_changed(self):
+        """代理地址编辑完成时更新"""
+        if self.proxy_check.isChecked():
+            self._apply_proxy(True, self.proxy_input.text().strip())
+
+    def _apply_proxy(self, enabled: bool, proxy_url: str):
+        """更新进程环境变量 + 持久化到 .env"""
+        if enabled and proxy_url:
+            os.environ["HTTP_PROXY"] = proxy_url
+            os.environ["HTTPS_PROXY"] = proxy_url
+            os.environ.setdefault("NO_PROXY", "open.volcengineapi.com,visual.volcengineapi.com")
+            self._append_log(f"代理已启用: {proxy_url}", "info")
+        else:
+            os.environ.pop("HTTP_PROXY", None)
+            os.environ.pop("HTTPS_PROXY", None)
+            if not enabled:
+                self._append_log("代理已禁用", "info")
+
+        # 📘 持久化到 .env（纯 ASCII，避免编码问题）
+        self._save_proxy_to_env(enabled, proxy_url)
+
+    def _save_proxy_to_env(self, enabled: bool, proxy_url: str):
+        """
+        📘 教学笔记：安全更新 .env 文件
+
+        只修改 ENABLE_PROXY 和 PROXY_URL 两行，保留其他内容不变。
+        如果这两行不存在则追加。
+        """
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            lines = []
+
+        # 📘 替换或追加
+        found_enable = False
+        found_url = False
+        new_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("ENABLE_PROXY="):
+                new_lines.append(f"ENABLE_PROXY={'true' if enabled else 'false'}\n")
+                found_enable = True
+            elif stripped.startswith("PROXY_URL="):
+                new_lines.append(f"PROXY_URL={proxy_url}\n")
+                found_url = True
+            else:
+                new_lines.append(line)
+
+        if not found_enable:
+            new_lines.append(f"ENABLE_PROXY={'true' if enabled else 'false'}\n")
+        if not found_url:
+            new_lines.append(f"PROXY_URL={proxy_url}\n")
+
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
 
     def closeEvent(self, event):
         """关闭窗口时恢复 stdout"""
