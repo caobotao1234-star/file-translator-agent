@@ -419,7 +419,7 @@ def _parse_structure_json(response: str) -> Optional[dict]:
     # 📘 策略3：直接尝试解析
     try:
         result = json.loads(text)
-        if isinstance(result, dict) and "elements" in result:
+        if isinstance(result, dict):
             return result
     except json.JSONDecodeError:
         pass
@@ -429,7 +429,7 @@ def _parse_structure_json(response: str) -> Optional[dict]:
     fixed = re.sub(r',\s*([}\]])', r'\1', text)
     try:
         result = json.loads(fixed)
-        if isinstance(result, dict) and "elements" in result:
+        if isinstance(result, dict):
             logger.debug("JSON 通过 trailing comma 修复后解析成功")
             return result
     except json.JSONDecodeError as e:

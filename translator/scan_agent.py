@@ -472,6 +472,7 @@ class ScanAgent:
                         self.stats["brain_tokens"]["completion"] += chunk.get("completion_tokens", 0)
             except Exception as e:
                 logger.error(f"Agent Brain 调用失败: {e}")
+                logger.error(f"已收集的文本: {text_in_turn[:200] if text_in_turn else '(空)'}")
                 raise
 
             # 📘 情况1：Brain 返回了工具调用 → 执行工具，继续循环
@@ -566,6 +567,8 @@ class ScanAgent:
                     self.stats["brain_tokens"]["completion"] += chunk.get("completion_tokens", 0)
 
         # 📘 解析 Brain 输出的 JSON
+        logger.info(f"第 {page_idx} 页: Brain 输出 {len(final_text)} 字符")
+        logger.debug(f"第 {page_idx} 页 Brain 原始输出前 500 字符: {final_text[:500]}")
         page_structure, items, translations = self._parse_brain_output(
             final_text, page_idx
         )
