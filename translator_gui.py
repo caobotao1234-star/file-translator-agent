@@ -807,6 +807,7 @@ class MainWindow(QMainWindow):
         for name in [
             "httpcore", "httpcore.http11", "httpcore.connection",
             "httpx", "volcenginesdkarkruntime", "urllib3",
+            "openai", "openai._base_client",
             "hpack", "h2", "h11",
         ]:
             logging.getLogger(name).setLevel(logging.WARNING)
@@ -1020,6 +1021,7 @@ class MainWindow(QMainWindow):
         noisy_loggers = [
             "httpcore", "httpcore.http11", "httpcore.connection",
             "httpx", "volcenginesdkarkruntime", "urllib3",
+            "openai", "openai._base_client",
             "hpack", "h2", "h11",
         ]
         for name in noisy_loggers:
