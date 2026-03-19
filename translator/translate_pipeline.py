@@ -432,6 +432,10 @@ class TranslatePipeline:
                 f"必须输出恰好{count}个元素的JSON数组，一一对应。"
                 f"每一段都必须输出{target_lang}，不允许保留原文语言。\n"
             )
+            # 📘 客户特殊需求注入（如有）
+            user_inst = getattr(self, '_current_user_instruction', '')
+            if user_inst:
+                translate_prompt += f"⚠️ 客户特殊要求：{user_inst}\n"
             if context_hint:
                 translate_prompt += f"{context_hint}\n"
             prompt_texts = [enriched_texts[i] for i in pending_indices] if has_context else pending_texts
@@ -506,6 +510,7 @@ class TranslatePipeline:
         parsed_data: Dict[str, Any],
         target_lang: str = "英文",
         on_progress=None,
+        user_instruction: str = "",
     ) -> Dict[str, str]:
         """
         翻译整个文档（v5 多线程并行版 — 纯翻译，无审校）。
@@ -545,6 +550,9 @@ class TranslatePipeline:
         total = len(to_translate)
         workers = self.max_workers
         logger.info(f"开始翻译文档: {total} 个翻译单元, batch_size={self.batch_size}, workers={workers}")
+
+        # 📘 教学笔记：客户特殊需求暂存（供 _translate_batch 使用）
+        self._current_user_instruction = user_instruction
 
         lang_hint = {
             "英文": "English", "中文": "Chinese", "日文": "Japanese",

@@ -301,6 +301,7 @@ class ScanAgent:
         filepath: str,
         output_path: str,
         target_lang: str = "英文",
+        user_instruction: str = "",
         on_event: Callable[[AgentEvent], None] = None,
     ) -> Dict[str, Any]:
         """
@@ -323,6 +324,9 @@ class ScanAgent:
         # ── 1. PDF 渲染 ──
         logger.info(f"开始 Agent 模式处理扫描件: {filepath}")
         print(f"[🤖 Agent 模式] 扫描件翻译 Agent 启动...", flush=True)
+        if user_instruction:
+            logger.info(f"客户特殊需求: {user_instruction[:200]}")
+            print(f"[💬 客户需求] {user_instruction[:100]}{'...' if len(user_instruction) > 100 else ''}", flush=True)
 
         doc = fitz.open(filepath)
         num_pages = len(doc)
@@ -428,6 +432,7 @@ class ScanAgent:
                     page_idx=page_idx,
                     page_image_b64=page_images_b64[page_idx],
                     target_lang=target_lang,
+                    user_instruction=user_instruction,
                     on_event=on_event,
                 )
 
@@ -666,6 +671,7 @@ class ScanAgent:
         page_idx: int,
         page_image_b64: str,
         target_lang: str,
+        user_instruction: str = "",
         on_event: Callable[[AgentEvent], None] = None,
     ) -> Tuple[dict, List[dict], Dict[str, str]]:
         """
@@ -687,6 +693,16 @@ class ScanAgent:
         """
         # 📘 构建初始消息：system prompt + 页面图片
         system_prompt = SCAN_AGENT_SYSTEM_PROMPT.replace("{{target_lang}}", target_lang)
+
+        # 📘 教学笔记：客户特殊需求注入
+        # 客户可能对某个文件有特殊要求（如人名翻译、公章处理方式等），
+        # 这些需求在 GUI 层由 Brain 分发到各文件，这里注入到 system prompt 中。
+        # 放在 prompt 最后、规则之后，确保 Brain 优先遵守。
+        if user_instruction:
+            system_prompt += (
+                f"\n\n## ⚠️ 客户特殊需求（必须严格遵守）\n"
+                f"{user_instruction}\n"
+            )
 
         # 📘 教学笔记：预执行 OCR + CV，减少 ReAct 循环次数
         # 之前 Brain 每页要调 2-4 次工具（OCR、CV），每次都要重发图片 + 对话历史，

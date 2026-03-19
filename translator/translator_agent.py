@@ -120,11 +120,90 @@ class TranslatorAgent:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         logger.info(f"翻译 Agent 初始化完成 (COM 增强: {'✅ 开启' if self.com_enabled else '❌ 关闭'})")
 
+    def dispatch_user_instructions(self, user_prompt: str, files: list) -> dict:
+        """
+        📘 教学笔记：客户特殊需求分发
+
+        用户输入自由文本描述多个文件的不同需求，
+        Brain 解析后分发到各个文件。
+
+        📘 策略：
+        - 单文件：直接把整个提示词给这个文件
+        - 多文件 + 有 Brain：调 Brain 做智能分发
+        - 多文件 + 无 Brain：所有文件都用原始提示词
+
+        返回: {文件名: 该文件的特殊指令}
+        """
+        if not user_prompt:
+            return {}
+
+        filenames = [os.path.basename(f) for f in files]
+
+        # 📘 单文件：直接分配
+        if len(filenames) == 1:
+            return {filenames[0]: user_prompt}
+
+        # 📘 多文件：尝试用 Brain 智能分发
+        if "agent_brain" not in self.router.engines:
+            # 没有 Brain，所有文件都用原始提示词
+            return {fn: user_prompt for fn in filenames}
+
+        try:
+            import json
+            brain = self.router.get("agent_brain")
+            file_list_str = "\n".join(f"{i+1}. {fn}" for i, fn in enumerate(filenames))
+
+            dispatch_prompt = (
+                f"你是翻译项目的需求分析助手。客户提交了 {len(filenames)} 个文件进行翻译，"
+                f"并附带了以下特殊需求：\n\n"
+                f"【客户需求】\n{user_prompt}\n\n"
+                f"【文件列表】\n{file_list_str}\n\n"
+                f"请将客户需求分发到对应的文件。规则：\n"
+                f"- 如果需求明确指定了文件（如"第一个文件"、"毕业证"），分配给对应文件\n"
+                f"- 如果需求是通用的（如"所有文件中 XX 翻译为 YY"），分配给所有文件\n"
+                f"- 一个文件可以有多条需求，用换行分隔\n"
+                f"- 如果某个文件没有特殊需求，不要包含它\n\n"
+                f"输出严格 JSON（不要 markdown code block）：\n"
+                f'{{"文件名1": "该文件的需求", "文件名2": "该文件的需求"}}'
+            )
+
+            messages = [{"role": "user", "content": dispatch_prompt}]
+            result_text = ""
+            for chunk in brain.stream_chat(messages, max_tokens=2048):
+                if chunk["type"] == "text":
+                    result_text += chunk["content"]
+
+            # 📘 解析 JSON
+            from translator.scan_parser import _parse_structure_json
+            parsed = _parse_structure_json(result_text)
+            if not parsed:
+                parsed = json.loads(result_text.strip())
+
+            # 📘 验证返回的文件名是否在列表中
+            result = {}
+            for key, instruction in parsed.items():
+                if key in filenames:
+                    result[key] = str(instruction)
+                else:
+                    # 📘 模糊匹配：Brain 可能返回部分文件名
+                    for fn in filenames:
+                        if key in fn or fn in key:
+                            result[fn] = str(instruction)
+                            break
+
+            logger.info(f"需求分发完成: {len(result)} 个文件有特殊指令")
+            return result
+
+        except Exception as e:
+            logger.warning(f"智能需求分发失败: {e}，回退到全局分配")
+            return {fn: user_prompt for fn in filenames}
+
     def translate_file(
         self,
         input_path: str,
         output_path: str = None,
         target_lang: str = "英文",
+        user_instruction: str = "",
     ) -> str:
         """
         翻译文档（支持 .docx、.pptx、.pdf）。
@@ -193,6 +272,7 @@ class TranslatorAgent:
                             filepath=input_path,
                             output_path=output_path,
                             target_lang=target_lang,
+                            user_instruction=user_instruction,
                         )
                         # 📘 最终缓存 ScanAgent 的 stats
                         self._last_scan_stats = scan_agent.stats
@@ -225,6 +305,7 @@ class TranslatorAgent:
             parsed_data,
             target_lang=target_lang,
             on_progress=on_progress,
+            user_instruction=user_instruction,
         )
 
         was_stopped = self.pipeline.is_stopped

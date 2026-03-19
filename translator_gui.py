@@ -62,11 +62,13 @@ class TranslateWorker(QThread):
     finished_signal = pyqtSignal(str)       # 输出文件路径
     error_signal = pyqtSignal(str)          # 错误信息
 
-    def __init__(self, agent: TranslatorAgent, files: list, target_lang: str):
+    def __init__(self, agent: TranslatorAgent, files: list, target_lang: str,
+                 user_prompt: str = ""):
         super().__init__()
         self.agent = agent
         self.files = files
         self.target_lang = target_lang
+        self.user_prompt = user_prompt
 
     def _emit_token_usage(self):
         """
@@ -106,6 +108,25 @@ class TranslateWorker(QThread):
         self.token_signal.emit(planner_t, translate_t, image_gen_t, reviewer_t)
 
     def run(self):
+        # 📘 教学笔记：客户特殊需求分发
+        # 用户可能输入自由文本描述多个文件的不同需求。
+        # Brain 先做一次"需求分发"，把自由文本解析成每个文件的具体指令。
+        per_file_instructions = {}
+        if self.user_prompt:
+            try:
+                per_file_instructions = self.agent.dispatch_user_instructions(
+                    self.user_prompt, self.files
+                )
+                if per_file_instructions:
+                    self.log_signal.emit(
+                        f"客户需求已分发到 {len(per_file_instructions)} 个文件", "info"
+                    )
+            except Exception as e:
+                self.log_signal.emit(f"需求分发失败（将作为全局提示使用）: {e}", "warning")
+                # 📘 fallback: 所有文件都用原始提示词
+                for f in self.files:
+                    per_file_instructions[os.path.basename(f)] = self.user_prompt
+
         for filepath in self.files:
             if self.agent.pipeline.is_stopped:
                 break
@@ -113,14 +134,18 @@ class TranslateWorker(QThread):
                 self.log_signal.emit(f"开始翻译: {os.path.basename(filepath)}", "info")
 
                 # 📘 教学笔记：实时 token 更新
-                # ScanAgent 每次 token 变化时通过回调链更新 _last_scan_stats，
-                # 我们在 agent 上挂一个 GUI 回调，每次 stats 更新时自动 emit。
                 worker_ref = self
                 self.agent._gui_token_callback = lambda: worker_ref._emit_token_usage()
+
+                # 📘 查找该文件的特殊指令
+                file_instruction = per_file_instructions.get(
+                    os.path.basename(filepath), ""
+                )
 
                 output = self.agent.translate_file(
                     filepath,
                     target_lang=self.target_lang,
+                    user_instruction=file_instruction,
                 )
                 self.agent._gui_token_callback = None
                 self._emit_token_usage()
@@ -738,6 +763,21 @@ class MainWindow(QMainWindow):
 
         left_layout.addWidget(settings_group)
 
+        # 📘 客户特殊需求提示词
+        prompt_group = QGroupBox("💬 客户特殊需求（可选）")
+        prompt_gl = QVBoxLayout(prompt_group)
+        self.user_prompt = QTextEdit()
+        self.user_prompt.setPlaceholderText(
+            "输入针对文件的特殊翻译需求，例如：\n"
+            "• 第一个文件的人名 gaoshen 翻译成"高申"\n"
+            "• 第三个文件的公章不需要裁剪，用红字标注即可\n"
+            "• 所有文件中 ABC Corp 统一翻译为"爱必思公司"\n\n"
+            "Brain 会自动将需求分发到对应文件。"
+        )
+        self.user_prompt.setMaximumHeight(100)
+        prompt_gl.addWidget(self.user_prompt)
+        left_layout.addWidget(prompt_group)
+
         # 格式映射面板
         self.format_panel = FormatMappingPanel(self.format_engine)
         left_layout.addWidget(self.format_panel, 1)
@@ -923,6 +963,9 @@ class MainWindow(QMainWindow):
         if image_model:
             self._append_log(f"图片生成: {image_model}", "info")
         self._append_log(f"文件数: {len(files)}", "info")
+        user_prompt = self.user_prompt.toPlainText().strip()
+        if user_prompt:
+            self._append_log(f"客户需求: {user_prompt[:100]}{'...' if len(user_prompt) > 100 else ''}", "info")
         self._append_log("─" * 50, "info")
 
         self._set_running(True)
@@ -948,18 +991,19 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("初始化失败")
             return
 
-        self.worker = TranslateWorker(self.agent, files, target_lang)
+        self.worker = TranslateWorker(self.agent, files, target_lang,
+                                       user_prompt=self.user_prompt.toPlainText().strip())
 
         original_translate_document = self.agent.pipeline.translate_document
         worker_ref = self.worker
 
-        def patched_translate_document(parsed_data, target_lang="英文", on_progress=None):
+        def patched_translate_document(parsed_data, target_lang="英文", on_progress=None, user_instruction=""):
             def gui_progress(completed, total):
                 worker_ref.progress_signal.emit(completed, total)
                 worker_ref._emit_token_usage()
                 if on_progress:
                     on_progress(completed, total)
-            return original_translate_document(parsed_data, target_lang, gui_progress)
+            return original_translate_document(parsed_data, target_lang, gui_progress, user_instruction=user_instruction)
 
         self.agent.pipeline.translate_document = patched_translate_document
 
