@@ -292,7 +292,7 @@ class ExternalLLMEngine:
             # 📘 工具调用输出
             if delta.tool_calls:
                 for tc in delta.tool_calls:
-                    idx = tc.index
+                    idx = tc.index if tc.index is not None else 0
                     # 📘 教学笔记：Gemini 重复 index 防御
                     # Gemini 有时对多个不同的 tool_call 返回相同的 index（都是 0），
                     # 但每个 tool_call 有不同的 tc.id。如果检测到同一个 index
@@ -300,7 +300,8 @@ class ExternalLLMEngine:
                     # 需要分配新的 index 避免名字被拼接（如 5 个工具名连在一起）。
                     if idx in tool_calls_dict and tc.id and tool_calls_dict[idx]["id"] and tc.id != tool_calls_dict[idx]["id"]:
                         # 📘 同一个 index 但不同 id → 新工具调用，分配新 index
-                        idx = max(tool_calls_dict.keys()) + 1
+                        next_idx = max((k for k in tool_calls_dict if isinstance(k, int)), default=0) + 1
+                        idx = next_idx
                     if idx not in tool_calls_dict:
                         tool_calls_dict[idx] = {"id": "", "name": "", "arguments": ""}
                     if tc.id:
