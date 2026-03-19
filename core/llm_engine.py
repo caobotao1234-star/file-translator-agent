@@ -148,10 +148,14 @@ class ArkLLMEngine:
         tool_calls_dict = {}
         full_text = ""  # 收集完整响应文本，用于 TRACE 输出
 
+        # 📘 教学笔记：只取最后一次 usage（防止 Gemini 兼容层重复计数）
+        # 详见 external_llm_engine.py 的注释。火山引擎虽然只在最后一个 chunk
+        # 返回 usage，但统一用 last_usage 模式更安全。
+        last_usage = None
+
         for chunk in stream:
             if chunk.usage:
-                yield {
-                    "type": "usage",
+                last_usage = {
                     "prompt_tokens": chunk.usage.prompt_tokens,
                     "completion_tokens": chunk.usage.completion_tokens,
                     "total_tokens": chunk.usage.total_tokens,
@@ -187,6 +191,15 @@ class ArkLLMEngine:
             self.logger.trace(f"LLM 响应 [text]\n{full_text}")
         if tool_calls_dict:
             self.logger.trace(f"LLM 响应 [tool_calls]\n{_json.dumps(dict(tool_calls_dict), ensure_ascii=False, indent=2)}")
+
+        # 📘 流结束后 yield 最终 usage（只 yield 一次，取最后一个 chunk 的值）
+        if last_usage:
+            self.logger.debug(
+                f"usage (final): prompt={last_usage['prompt_tokens']}, "
+                f"completion={last_usage['completion_tokens']}, "
+                f"total={last_usage['total_tokens']}"
+            )
+            yield {"type": "usage", **last_usage}
 
         # 3. 流结束后，抛出收集到的工具调用
         for idx, tc_data in tool_calls_dict.items():

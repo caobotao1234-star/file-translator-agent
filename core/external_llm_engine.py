@@ -262,11 +262,18 @@ class ExternalLLMEngine:
         tool_calls_dict = {}
         full_text = ""
 
+        # 📘 教学笔记：Gemini usage 重复问题修复
+        # OpenAI 规范：usage 只在最后一个 chunk 中返回。
+        # 但 Gemini 的 OpenAI 兼容层在每个 chunk 都返回 usage，
+        # 且值是累计的（不是增量的）。如果每个 chunk 都 += 累加，
+        # 会导致 50-60 倍的 token 膨胀（用户看到 6M 实际只有 ~100K）。
+        # 修复：只记录最后一次 usage，流结束后 yield 一次。
+        last_usage = None
+
         for chunk in stream:
-            # 📘 usage 信息（token 消耗统计）
+            # 📘 usage 信息（每个 chunk 都可能带，取最后一个）
             if chunk.usage:
-                yield {
-                    "type": "usage",
+                last_usage = {
                     "prompt_tokens": chunk.usage.prompt_tokens,
                     "completion_tokens": chunk.usage.completion_tokens,
                     "total_tokens": chunk.usage.total_tokens,
@@ -311,6 +318,17 @@ class ExternalLLMEngine:
                 f"外部模型响应 [tool_calls]\n"
                 f"{_json.dumps(dict(tool_calls_dict), ensure_ascii=False, indent=2)}"
             )
+
+        # 📘 教学笔记：流结束后 yield 最终 usage（只 yield 一次）
+        # Gemini 每个 chunk 都带 usage（累计值），我们只取最后一个。
+        # 火山引擎/OpenAI 只在最后一个 chunk 带 usage，效果一样。
+        if last_usage:
+            self.logger.debug(
+                f"usage (final): prompt={last_usage['prompt_tokens']}, "
+                f"completion={last_usage['completion_tokens']}, "
+                f"total={last_usage['total_tokens']}"
+            )
+            yield {"type": "usage", **last_usage}
 
         # 📘 流结束后，yield 收集到的工具调用
         for idx, tc_data in tool_calls_dict.items():
