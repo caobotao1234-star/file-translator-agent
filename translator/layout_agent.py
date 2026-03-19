@@ -38,6 +38,7 @@ from tools.layout_tools import (
     RenderPageTool,
     SaveLayoutRuleTool,
 )
+from tools.dynamic_tools import DynamicToolRegistry, CreateCustomToolTool
 
 logger = get_logger("layout_agent")
 
@@ -72,6 +73,14 @@ LAYOUT_AGENT_SYSTEM_PROMPT = """\
 ## 输出格式
 当你完成所有修正后，输出 JSON：
 {"status": "done", "fixed_count": N, "summary": "修正摘要"}
+
+## 创建自定义工具
+如果你发现现有工具无法解决某个问题，可以调用 create_custom_tool 创建新工具。
+- 代码必须定义 run(params, context) 函数，返回 JSON 字符串
+- context 包含: translations, overrides, parsed_data 等共享数据
+- 只能使用安全模块: json, re, math, string, collections, itertools 等
+- 创建后的工具立即可用，并会持久化保存供未来复用
+- 典型场景：批量按规则调整字号、检测特定语言对的字符宽度比、按文本角色分组处理等
 
 ## 重要规则
 - 不要过度缩小字号，最小 5pt
@@ -162,6 +171,19 @@ class PDFLayoutAgent:
             "render_page_preview": RenderPageTool(context=context),
             "save_layout_rule": SaveLayoutRuleTool(context=context),
         }
+
+        # 📘 动态工具系统：加载已有 + 注册创建工具
+        self.dynamic_registry = DynamicToolRegistry()
+        dynamic_tools = self.dynamic_registry.load_tools(context=context)
+        if dynamic_tools:
+            tools.update(dynamic_tools)
+            logger.info(f"已加载 {len(dynamic_tools)} 个动态工具")
+
+        # 📘 注册 create_custom_tool（让 Brain 可以创建新工具）
+        if self.brain_engine:
+            tools["create_custom_tool"] = CreateCustomToolTool(
+                registry=self.dynamic_registry, context=context,
+            )
 
         # ── 零成本快速路径：纯算法检测 ──
         measure_result = tools["measure_overflow"].execute({"page_index": -1})
@@ -378,10 +400,18 @@ class PDFLayoutAgent:
                         if tool_name in tools:
                             tool_result = tools[tool_name].execute(tool_params)
                         else:
-                            tool_result = json.dumps(
-                                {"error": f"未知工具: {tool_name}"},
-                                ensure_ascii=False,
-                            )
+                            # 📘 检查是否是刚创建的动态工具
+                            dynamic_tool = self.dynamic_registry.get_tool(tool_name) if hasattr(self, 'dynamic_registry') else None
+                            if dynamic_tool:
+                                tools[tool_name] = dynamic_tool
+                                tool_result = dynamic_tool.execute(tool_params)
+                                # 📘 动态工具创建后需要更新 tool_schemas
+                                tool_schemas = [t.get_api_format() for t in tools.values()]
+                            else:
+                                tool_result = json.dumps(
+                                    {"error": f"未知工具: {tool_name}"},
+                                    ensure_ascii=False,
+                                )
 
                         # 📘 统计修正数量（resize_font 和 retranslate_shorter）
                         if tool_name in ("resize_font", "retranslate_shorter"):

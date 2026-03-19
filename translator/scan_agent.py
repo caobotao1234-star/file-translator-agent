@@ -38,6 +38,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from core.agent_events import AgentEvent
 from core.logger import get_logger
 from tools.scan_tools import OCRTool, CVTool, TranslationTool, WordWriterTool, ImageGenTool
+from tools.dynamic_tools import DynamicToolRegistry, CreateCustomToolTool
 
 logger = get_logger("scan_agent")
 
@@ -125,6 +126,13 @@ SCAN_AGENT_SYSTEM_PROMPT = """\
 - key 命名规则：pg{页码}_e{元素索引}_r{行}_c{列}（表格）或 pg{页码}_e{元素索引}_para（段落）
 - 图片区域标记位置即可，不需要识别图片内容
 - 翻译目标语言：{{target_lang}}
+
+## 创建自定义工具
+如果你发现现有工具无法解决某个问题，可以调用 create_custom_tool 创建新工具。
+- 代码必须定义 run(params, context) 函数，返回 JSON 字符串
+- context 包含 page_images 等共享数据
+- 只能使用安全模块: json, re, math, string, collections, itertools 等
+- 创建后的工具立即可用，并会持久化保存供未来复用
 """
 
 # 📘 教学笔记：统一审查提示词（v5 — 内容+排版+翻译质量）
@@ -275,6 +283,16 @@ class ScanAgent:
                 context=context,
             )
             logger.info("图片生成工具已注册，Agent Brain 可自主调用")
+
+        # 📘 动态工具系统：加载已有 + 注册创建工具
+        self.dynamic_registry = DynamicToolRegistry()
+        dynamic_tools = self.dynamic_registry.load_tools(context=context)
+        if dynamic_tools:
+            self.tools.update(dynamic_tools)
+            logger.info(f"已加载 {len(dynamic_tools)} 个动态工具")
+        self.tools["create_custom_tool"] = CreateCustomToolTool(
+            registry=self.dynamic_registry, context=context,
+        )
 
         # ── 2. 逐页处理 ──
         all_items = []
@@ -466,6 +484,11 @@ class ScanAgent:
             tool_schemas.append(
                 self.tools["generate_translated_image"].get_api_format()
             )
+        # 📘 动态工具：create_custom_tool + 已加载的动态工具
+        if "create_custom_tool" in self.tools:
+            tool_schemas.append(self.tools["create_custom_tool"].get_api_format())
+        if hasattr(self, 'dynamic_registry'):
+            tool_schemas.extend(self.dynamic_registry.get_tool_schemas())
 
         # 📘 ReAct 循环
         tool_call_count = 0
@@ -544,10 +567,21 @@ class ScanAgent:
                     if tool_name in self.tools:
                         tool_result = self.tools[tool_name].execute(tool_params)
                     else:
-                        tool_result = json.dumps(
-                            {"error": f"未知工具: {tool_name}"},
-                            ensure_ascii=False,
-                        )
+                        # 📘 检查是否是刚创建的动态工具
+                        dynamic_tool = self.dynamic_registry.get_tool(tool_name) if hasattr(self, 'dynamic_registry') else None
+                        if dynamic_tool:
+                            self.tools[tool_name] = dynamic_tool
+                            tool_result = dynamic_tool.execute(tool_params)
+                            # 📘 更新 tool_schemas 让 Brain 知道新工具可用
+                            tool_schemas = [
+                                t.get_api_format() for name, t in self.tools.items()
+                                if name != "generate_word_document"
+                            ]
+                        else:
+                            tool_result = json.dumps(
+                                {"error": f"未知工具: {tool_name}"},
+                                ensure_ascii=False,
+                            )
 
                     # 📘 把工具结果作为 tool message 反馈给 Brain
                     messages.append({
