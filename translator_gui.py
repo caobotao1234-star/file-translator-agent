@@ -768,11 +768,11 @@ class MainWindow(QMainWindow):
         prompt_gl = QVBoxLayout(prompt_group)
         self.user_prompt = QTextEdit()
         self.user_prompt.setPlaceholderText(
-            "输入针对文件的特殊翻译需求，例如：\n"
-            "• 第一个文件的人名 gaoshen 翻译成"高申"\n"
-            "• 第三个文件的公章不需要裁剪，用红字标注即可\n"
-            "• 所有文件中 ABC Corp 统一翻译为"爱必思公司"\n\n"
-            "Brain 会自动将需求分发到对应文件。"
+            '输入针对文件的特殊翻译需求，例如：\n'
+            '• 第一个文件的人名 gaoshen 翻译成「高申」\n'
+            '• 第三个文件的公章不需要裁剪，用红字标注即可\n'
+            '• 所有文件中 ABC Corp 统一翻译为「爱必思公司」\n\n'
+            'Brain 会自动将需求分发到对应文件。'
         )
         self.user_prompt.setMaximumHeight(100)
         prompt_gl.addWidget(self.user_prompt)
