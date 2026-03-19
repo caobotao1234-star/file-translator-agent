@@ -1,18 +1,22 @@
 # core/external_llm_engine.py
 # =============================================================
-# 📘 教学笔记：外部模型引擎（ExternalLLMEngine）
+# 📘 教学笔记：统一 LLM 引擎（Unified LLM Engine）
 # =============================================================
-# 为什么需要这个？
-#   现有的 ArkLLMEngine 只能调用火山引擎（Volcengine）的模型。
-#   但 Agent 大脑需要更强的模型（Gemini/Claude/GPT/NanoBanana）。
+# v6 统一架构：所有模型都走这一个引擎。
 #
-# 📘 关键设计：用 openai 包统一调用所有外部模型
-#   Gemini、Claude、GPT、NanoBanana 都支持 OpenAI 兼容协议。
-#   只需要不同的 base_url + api_key，就能用同一套代码调用。
+# 📘 核心理念：模型不分内部外部，能力等价
+#   火山引擎（doubao）、Gemini、Claude、GPT、NanoBanana
+#   都是 OpenAI 兼容协议，只是 base_url 和 api_key 不同。
+#   用同一套代码调用，所有模型都支持：
+#   - 流式输出（streaming）
+#   - 工具调用（tool_call）
+#   - 多模态输入（vision / image_url）
+#   - extra_content 透传（Gemini thought_signature）
 #
-# 📘 与 ArkLLMEngine 的关系：
-#   stream_chat() 的输出格式完全一致（鸭子类型），
-#   所以 LLMRouter 不关心引擎类型，get() 返回的引擎都能用。
+# 📘 与旧架构的区别：
+#   旧: ArkLLMEngine（火山引擎专用）+ ExternalLLMEngine（外部模型）
+#   新: ExternalLLMEngine 统一处理所有 provider（包括 ark）
+#   ArkLLMEngine 保留但不再使用，仅作为向后兼容的类型引用。
 # =============================================================
 
 import os
@@ -29,7 +33,17 @@ logger = get_logger("external_llm_engine")
 # 📘 教学笔记：Provider 配置映射
 # 每个 provider 有自己的 API 地址和环境变量名。
 # 新增 provider 只需要在这里加一行，不用改其他代码。
+#
+# 📘 v6 统一架构：火山引擎（ark）也是一个 provider
+# 之前 ark 用独立的 ArkLLMEngine（volcenginesdkarkruntime），
+# 但火山引擎 API 也是 OpenAI 兼容协议，完全可以用 openai SDK 调用。
+# 统一后所有模型都走 ExternalLLMEngine，能力完全等价：
+# vision、tool_call、extra_content 全部支持。
 PROVIDER_CONFIG = {
+    "ark": {
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "env_key": "ARK_API_KEY",
+    },
     "gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "env_key": "GEMINI_API_KEY",
@@ -51,14 +65,15 @@ PROVIDER_CONFIG = {
 
 class ExternalLLMEngine:
     """
-    📘 教学笔记：基于 openai 包的外部模型引擎
+    📘 教学笔记：统一 LLM 引擎（v6）
 
-    与 ArkLLMEngine 保持完全相同的 stream_chat 输出格式：
+    所有模型（火山引擎 + Gemini + Claude + GPT + NanoBanana）都走这个引擎。
+    基于 openai SDK，通过不同的 base_url 区分 provider。
+
+    输出格式：
     - {"type": "text", "content": "..."}
-    - {"type": "tool_call", "id": "...", "name": "...", "arguments": "..."}
+    - {"type": "tool_call", "id": "...", "name": "...", "arguments": "...", "extra_content": ...}
     - {"type": "usage", "prompt_tokens": N, "completion_tokens": N, "total_tokens": N}
-
-    这样 LLMRouter 和 ScanAgent 不需要关心底层是火山引擎还是外部模型。
     """
 
     def __init__(

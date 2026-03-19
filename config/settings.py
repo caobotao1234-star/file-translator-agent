@@ -27,7 +27,7 @@ if _proxy_enabled and _proxy_url:
     os.environ["HTTP_PROXY"] = _proxy_url
     os.environ["HTTPS_PROXY"] = _proxy_url
     # 📘 NO_PROXY: 火山引擎 API 走内网，不需要代理
-    os.environ.setdefault("NO_PROXY", "open.volcengineapi.com,visual.volcengineapi.com")
+    os.environ.setdefault("NO_PROXY", "ark.cn-beijing.volces.com,open.volcengineapi.com,visual.volcengineapi.com")
 elif not _proxy_enabled:
     # 📘 显式禁用：清除可能已存在的代理环境变量
     os.environ.pop("HTTP_PROXY", None)
@@ -214,10 +214,14 @@ class Config:
         返回: (supported: bool, warning: str or None)
         """
         KNOWN_CAPABLE_PATTERNS = [
+            # 📘 v6 统一架构：所有模型都走 ExternalLLMEngine，能力等价
+            # 火山引擎 doubao-seed-2.0 系列支持 vision + tool_call
+            "doubao-seed-2-0", "doubao-seed-1-8",
             "gemini-3", "gemini-2.5", "gemini-2.0", "gemini-1.5-pro",
             "claude-sonnet", "claude-opus", "claude-3.5", "claude-3-5",
             "gpt-4o", "gpt-4-turbo", "gpt-4.1",
             "nanobanana-pro",
+            "deepseek",
         ]
 
         if not provider or not model:
@@ -234,9 +238,8 @@ class Config:
 
         warning = (
             f"模型 '{model}' 不在已知支持视觉+工具调用的列表中。"
-            f"扫描件处理需要规划者能看图片(vision)并调用工具(tool_call)，"
-            f"doubao 等纯文本模型无法胜任。"
-            f"建议使用 gemini:gemini-2.5-pro、gemini:gemini-2.5-flash、"
-            f"claude:claude-sonnet-4 或 openai:gpt-4o。"
+            f"扫描件处理需要规划者能看图片(vision)并调用工具(tool_call)。"
+            f"建议使用 doubao-seed-2-0-pro、gemini-2.5-pro、"
+            f"claude-sonnet-4 或 gpt-4o。"
         )
         return False, warning

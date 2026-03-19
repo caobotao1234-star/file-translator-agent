@@ -1,5 +1,5 @@
 # core/llm_router.py
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 from core.llm_engine import ArkLLMEngine
 from core.external_llm_engine import ExternalLLMEngine, create_external_engine, PROVIDER_CONFIG
 from core.logger import get_logger
@@ -10,18 +10,19 @@ from core.logger import get_logger
 # 为什么需要多模型管理？
 #
 # 不同任务对模型的要求不同：
-#   - 初翻/草稿 → 便宜快速的模型（如 doubao-lite），降低成本
-#   - 审校/精翻 → 贵但精准的模型（如 doubao-pro），保证质量
-#   - 格式分析 → 可能用专门的模型或同一个模型的不同参数
+#   - 翻译 → doubao-seed-2-0-pro（高质量翻译）
+#   - 规划者 → gemini-2.5-pro（vision + tool_call）
+#   - 图片生成 → gemini-3-pro-image-preview
+#
+# 📘 v6 统一架构：
+#   所有模型（火山引擎 + Gemini + Claude + GPT）都走 ExternalLLMEngine。
+#   火山引擎 API 也是 OpenAI 兼容协议，不需要单独的 ArkLLMEngine。
+#   统一后所有模型能力等价：vision、tool_call、extra_content 全部支持。
 #
 # LLMRouter 就是一个"模型调度中心"：
-#   - 注册多个模型（每个有一个别名，如 "fast", "quality"）
+#   - 注册多个模型（每个有一个别名，如 "translate", "agent_brain"）
 #   - 通过别名获取对应的 LLM 引擎实例
-#   - 设置一个默认模型，不指定时自动使用
-#
-# 这样 Agent 代码里不需要硬编码 model_id，
-# 只需要说"我要用 quality 模型"就行了。
-# 换模型只需要改配置，不用改业务代码。
+#   - 所有引擎都有相同的 stream_chat 接口
 # =============================================================
 
 logger = get_logger("llm_router")
@@ -29,21 +30,26 @@ logger = get_logger("llm_router")
 
 class LLMRouter:
     """
-    LLM 模型路由器：管理多个 LLM 引擎实例，按别名调度。
+    📘 LLM 模型路由器：管理多个 LLM 引擎实例，按别名调度。
+
+    v6 统一架构：所有模型都走 ExternalLLMEngine（OpenAI 兼容协议），
+    火山引擎和外部模型不再区分，能力完全等价。
 
     用法：
         router = LLMRouter(api_key="xxx")
-        router.register("fast", model_id="ep-xxx-lite")
-        router.register("quality", model_id="ep-xxx-pro")
-        router.set_default("fast")
+        router.register_model("translate", model_str="doubao-seed-2-0-pro-260215")
+        router.register_model("agent_brain", model_str="gemini:gemini-2.5-pro")
 
-        llm = router.get("quality")  # 获取指定模型
-        llm = router.get()           # 获取默认模型
+        llm = router.get("translate")     # 获取翻译模型
+        llm = router.get("agent_brain")   # 获取规划者
     """
+
+    # 📘 LLMEngine 类型：统一为 ExternalLLMEngine（鸭子类型兼容 ArkLLMEngine）
+    LLMEngine = Union[ExternalLLMEngine, ArkLLMEngine]
 
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.engines: Dict[str, ArkLLMEngine] = {}
+        self.engines: Dict[str, "LLMRouter.LLMEngine"] = {}
         self.default_name: Optional[str] = None
 
     def register(
@@ -54,27 +60,25 @@ class LLMRouter:
         retry_base_delay: float = 1.0,
     ) -> "LLMRouter":
         """
-        注册一个 LLM 模型。
+        📘 注册一个火山引擎模型。
+
+        v6 统一架构：内部也走 ExternalLLMEngine（OpenAI 兼容协议），
+        这样火山引擎模型也支持 vision + tool_call + extra_content。
 
         参数：
-            name: 别名（如 "fast", "quality", "review"）
-            model_id: 火山引擎的 endpoint ID
-            max_retries: 最大重试次数
-            retry_base_delay: 重试初始等待秒数
-
-        返回 self，支持链式调用：
-            router.register("fast", "ep-xxx").register("quality", "ep-yyy")
+            name: 别名（如 "translate", "agent_brain"）
+            model_id: 火山引擎的模型 ID（如 "doubao-seed-2-0-pro-260215"）
         """
-        engine = ArkLLMEngine(
-            api_key=self.api_key,
+        engine = create_external_engine(
+            provider="ark",
             model_id=model_id,
+            api_key=self.api_key,
             max_retries=max_retries,
             retry_base_delay=retry_base_delay,
         )
         self.engines[name] = engine
         logger.info(f"已注册 LLM 模型: {name} -> {model_id}")
 
-        # 如果是第一个注册的模型，自动设为默认
         if self.default_name is None:
             self.default_name = name
 
@@ -90,12 +94,12 @@ class LLMRouter:
         logger.info(f"默认 LLM 模型设为: {name}")
         return self
 
-    def get(self, name: str = None) -> ArkLLMEngine:
+    def get(self, name: str = None) -> "LLMRouter.LLMEngine":
         """
         获取一个 LLM 引擎实例。
 
-        参数：
-            name: 模型别名，为 None 时返回默认模型
+        📘 v6: 返回的引擎都是 ExternalLLMEngine，
+        支持 vision + tool_call + extra_content。
         """
         if name is None:
             name = self.default_name
@@ -121,23 +125,10 @@ class LLMRouter:
         retry_base_delay: float = 1.0,
     ) -> "LLMRouter":
         """
-        📘 教学笔记：注册一个外部模型引擎（Gemini/Claude/GPT/NanoBanana）
+        📘 注册一个外部模型引擎（Gemini/Claude/GPT/NanoBanana）。
 
-        与 register() 的区别：
-        - register() 创建 ArkLLMEngine（火山引擎）
-        - register_external() 创建 ExternalLLMEngine（外部模型）
-        - 但 get() 返回的引擎都有 stream_chat 方法，调用方不需要关心区别
-
-        📘 这就是"鸭子类型"（Duck Typing）：
-        只要有 stream_chat 方法，就能当 LLM 引擎用。
-
-        参数：
-            name: 别名（如 "agent_brain"）
-            provider: 提供商（"gemini" / "claude" / "openai" / "nanobanana"）
-            model_id: 模型名称（如 "gemini-2.5-pro"）
-            api_key: API 密钥，为 None 时从 .env 自动读取
-            max_retries: 最大重试次数
-            retry_base_delay: 重试初始等待秒数
+        📘 v6 统一架构：register() 和 register_external() 内部都用 ExternalLLMEngine，
+        区别只是 provider 不同。保留此方法是为了向后兼容 .env 配置方式。
         """
         engine = create_external_engine(
             provider=provider,
@@ -164,12 +155,11 @@ class LLMRouter:
         """
         📘 教学笔记：智能模型注册（自动识别 provider）
 
-        根据 model_str 格式自动选择引擎类型：
-        - "gemini:gemini-3.1-pro-preview" → ExternalLLMEngine
-        - "doubao-seed-1-8-251228" → ArkLLMEngine（向后兼容）
+        根据 model_str 格式自动选择 provider：
+        - "gemini:gemini-2.5-pro" → provider=gemini
+        - "doubao-seed-2-0-pro-260215" → provider=ark（向后兼容）
 
-        这样 GUI 传过来的模型标识不需要额外处理，
-        Router 自己判断该用哪种引擎。
+        📘 v6 统一架构：无论哪个 provider，内部都走 ExternalLLMEngine。
         """
         from config.settings import Config
         provider, model_id = Config.parse_model_id(model_str)
