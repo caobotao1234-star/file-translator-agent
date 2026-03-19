@@ -129,9 +129,10 @@ class ArkLLMEngine:
         # 这里输出发给模型的完整 messages，包括 system prompt 和用户输入。
         # 排查"模型不听话"问题时，第一步就是看它到底收到了什么。
         import json as _json
+        from core.external_llm_engine import _sanitize_for_log
         self.logger.trace(
             f"LLM 请求 [model={self.model_id}]\n"
-            f"messages={_json.dumps(messages, ensure_ascii=False, indent=2)}"
+            f"messages={_json.dumps(_sanitize_for_log(messages), ensure_ascii=False, indent=2)}"
         )
         if tools:
             self.logger.trace(f"tools={_json.dumps(tools, ensure_ascii=False, indent=2)}")

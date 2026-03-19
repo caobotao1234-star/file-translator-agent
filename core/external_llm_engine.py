@@ -30,6 +30,40 @@ from core.llm_engine import LLMRetryError
 
 logger = get_logger("external_llm_engine")
 
+
+def _sanitize_for_log(messages):
+    """
+    📘 清理 messages 中的 base64 图片数据，避免污染日志。
+    图片内容替换为 "[image base64, {size}KB]" 占位符。
+    """
+    cleaned = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            # 📘 多模态消息：content 是 [{type: "text"}, {type: "image_url"}] 数组
+            new_parts = []
+            for part in content:
+                if (isinstance(part, dict)
+                        and part.get("type") == "image_url"
+                        and isinstance(part.get("image_url"), dict)):
+                    url = part["image_url"].get("url", "")
+                    if url.startswith("data:") and ";base64," in url:
+                        b64_data = url.split(";base64,", 1)[1]
+                        size_kb = round(len(b64_data) * 3 / 4 / 1024, 1)
+                        new_parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"[image base64, {size_kb}KB]"},
+                        })
+                    else:
+                        new_parts.append(part)
+                else:
+                    new_parts.append(part)
+            cleaned.append({**msg, "content": new_parts})
+        else:
+            cleaned.append(msg)
+    return cleaned
+
+
 # 📘 教学笔记：Provider 配置映射
 # 每个 provider 有自己的 API 地址和环境变量名。
 # 新增 provider 只需要在这里加一行，不用改其他代码。
@@ -200,7 +234,7 @@ class ExternalLLMEngine:
 
         self.logger.trace(
             f"外部模型请求 [model={self.model_id}]\n"
-            f"messages={_json.dumps(messages, ensure_ascii=False, indent=2)}"
+            f"messages={_json.dumps(_sanitize_for_log(messages), ensure_ascii=False, indent=2)}"
         )
 
         kwargs = {
