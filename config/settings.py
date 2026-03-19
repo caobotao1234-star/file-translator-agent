@@ -234,6 +234,9 @@ class Config:
 
         warning = (
             f"模型 '{model}' 不在已知支持视觉+工具调用的列表中。"
-            f"建议使用 gemini-2.5-pro、claude-sonnet-4、gpt-4o 或 nanobanana-pro。"
+            f"扫描件处理需要规划者能看图片(vision)并调用工具(tool_call)，"
+            f"doubao 等纯文本模型无法胜任。"
+            f"建议使用 gemini:gemini-2.5-pro、gemini:gemini-2.5-flash、"
+            f"claude:claude-sonnet-4 或 openai:gpt-4o。"
         )
         return False, warning
