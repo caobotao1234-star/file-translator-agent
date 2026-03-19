@@ -251,7 +251,7 @@ class ScanAgent:
         translate_pipeline,
         format_engine,
         image_gen_engine=None,
-        max_tool_calls: int = 5,
+        max_tool_calls: int = 10,
         max_review_retries: int = 2,
         on_token_update: Callable[["ScanAgent"], None] = None,
     ):
