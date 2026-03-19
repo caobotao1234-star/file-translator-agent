@@ -82,10 +82,12 @@ OCR 的核心价值是提供文字的坐标位置。OCR 经常识别错字，当
 - 页脚（左右分布）→ 1行2列无边框表格
 
 ### 如何判断布局
-1. 看 OCR 结果中文字的 Y 坐标（垂直位置）
-2. Y 坐标接近的文字 = 同一行 → 必须放在同一个 table row 的不同 cell 中
-3. Y 坐标差距大的文字 = 不同行 → 放在不同的 element 或不同的 table row 中
+1. 看 OCR 结果中文字的 bbox（[x1, y1, x2, y2]，像素坐标）
+2. y1 接近的文字（差值 < 页面高度的 2%）= 同一行 → 必须放在同一个 table row 的不同 cell 中
+3. y1 差距大的文字 = 不同行 → 放在不同的 element 或不同的 table row 中
 4. **绝不要把不同视觉行的文字用 \\n 合并成一个 paragraph**
+5. 示例：如果 OCR 返回 "姓名" bbox=[50,100,120,130] 和 "张三" bbox=[300,105,400,130]，
+   它们 y1 接近（100 vs 105），说明是同一行左右并排 → 用 2 列无边框表格
 
 ### 常见文档类型的处理策略
 - 证书/证明：通常是"标签+值"的键值对布局 → 大量使用无边框表格
@@ -104,9 +106,14 @@ OCR 的核心价值是提供文字的坐标位置。OCR 经常识别错字，当
 {
   "page_type": "table_document" | "certificate" | "text_document" | "mixed",
   "elements": [
-    {"type": "table", "col_widths": [30, 40, 30], "rows": [
-      {"cells": [{"text": "内容", "colspan": 1, "rowspan": 1, "bold": false,
-        "align": "center", "borders": {"top": true, "bottom": true, "left": true, "right": true}}]}
+    {"type": "table", "borders": false, "col_widths": [50, 50], "rows": [
+      {"cells": [{"text": "标签", "bold": true, "align": "left"},
+                  {"text": "值", "align": "left"}]}
+    ]},
+    {"type": "table", "borders": true, "col_widths": [30, 40, 30], "rows": [
+      {"cells": [{"text": "表头1", "bold": true, "align": "center"},
+                  {"text": "表头2", "bold": true, "align": "center"},
+                  {"text": "表头3", "bold": true, "align": "center"}]}
     ]},
     {"type": "paragraph", "text": "独立段落文字", "bold": false, "align": "left", "font_size": "normal"},
     {"type": "image_region", "image_index": 0, "description": "图片描述"}
@@ -118,8 +125,10 @@ OCR 的核心价值是提供文字的坐标位置。OCR 经常识别错字，当
 }
 
 ## 规则
+- borders: false = 无边框布局网格（用于并排内容、页眉页脚、签名区域等）
+- borders: true = 有可见边框的真实表格
+- 单元格可用 colspan/rowspan 合并
 - col_widths 总和 = 100，按原文中各列的视觉宽度比例设置
-- borders: true 仅在原文中有可见线条时使用，否则 false
 - elements 中的 text 放原文，items 中放原文+译文对应关系
 - 翻译目标语言：{{target_lang}}
 """

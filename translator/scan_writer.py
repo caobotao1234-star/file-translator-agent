@@ -141,20 +141,25 @@ def _add_image_to_cell(cell, image_bytes: bytes, align: str = "center"):
 def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, str],
                       page_idx: int, elem_idx: int):
     """
-    📘 教学笔记：把结构化表格数据写入 Word 文档（v7.1 完整版）
+    📘 教学笔记：把结构化表格数据写入 Word 文档（v7.2 完整版）
 
-    📘 v7.1 全部功能：
-    1. 每个单元格独立控制四条边框（per-cell borders）
-    2. 每行文字独立对齐（per-line alignment via "lines" array）
-    3. 图片按 image_position 放在文字前/后
-    4. 竖版文字支持（vertical text direction）
-    5. 精确列宽比例
+    📘 v7.2 改进：
+    1. 支持表格级 borders（true/false），作为所有单元格的默认值
+    2. 单元格级 borders 可覆盖表格级设置
+    3. 无边框表格 = 布局网格（"一切布局皆表格"方法论的核心）
+    4. 每行文字独立对齐（per-line alignment via "lines" array）
+    5. 图片按 image_position 放在文字前/后
+    6. 竖版文字支持（vertical text direction）
+    7. 精确列宽比例
     """
     rows_data = table_data.get("rows", [])
     if not rows_data:
         return
 
     col_widths_pct = table_data.get("col_widths", [])
+
+    # 📘 表格级 borders 默认值（Brain 可能在 table 级别设置 borders: true/false）
+    table_borders_default = table_data.get("borders", True)
 
     # 📘 计算实际列数（考虑 colspan）
     max_cols = 0
@@ -186,6 +191,18 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
     total_width_twips = int(PAGE_CONTENT_WIDTH_CM * 567)
     tblW = parse_xml(f'<w:tblW {nsdecls("w")} w:w="{total_width_twips}" w:type="dxa"/>')
     tblPr.append(tblW)
+
+    # 📘 v7.2: 无边框表格 = 布局网格，减小单元格内边距使布局更紧凑
+    if table_borders_default is False:
+        cell_margin_xml = (
+            f'<w:tblCellMar {nsdecls("w")}>'
+            f'<w:top w:w="0" w:type="dxa"/>'
+            f'<w:left w:w="28" w:type="dxa"/>'
+            f'<w:bottom w:w="0" w:type="dxa"/>'
+            f'<w:right w:w="28" w:type="dxa"/>'
+            f'</w:tblCellMar>'
+        )
+        tblPr.append(parse_xml(cell_margin_xml))
 
     # 📘 跟踪被 rowspan 占用的位置
     occupied = [[False] * max_cols for _ in range(num_rows)]
@@ -287,11 +304,19 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
                 w = sum(col_widths_cm[col_cursor:col_cursor + colspan])
                 _set_cell_width(cell, w)
 
-            # 📘 v7.1: 每个单元格独立控制边框
-            borders = cell_data.get("borders")
-            if borders and isinstance(borders, dict):
-                _set_cell_borders_from_dict(cell, borders)
+            # 📘 v7.2: 边框处理（3 层优先级）
+            # 1. 单元格级 borders dict → 最高优先级，per-cell 精确控制
+            # 2. 单元格级 borders bool → 覆盖表格默认
+            # 3. 表格级 table_borders_default → 全局默认
+            # 📘 "一切布局皆表格"方法论的关键：borders: false = 无边框布局网格
+            cell_borders = cell_data.get("borders")
+            if isinstance(cell_borders, dict):
+                _set_cell_borders_from_dict(cell, cell_borders)
+            elif cell_borders is False or (cell_borders is None and table_borders_default is False):
+                # 📘 无边框 = 布局网格
+                _set_cell_borders(cell, top=None, bottom=None, left=None, right=None)
             else:
+                # 📘 有边框（cell_borders=True 或 table_borders_default=True）
                 border_on = {"sz": 4, "val": "single", "color": "000000"}
                 _set_cell_borders(cell, top=border_on, bottom=border_on,
                                   left=border_on, right=border_on)
@@ -305,8 +330,9 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
             col_cursor += colspan
             cell_data_idx += 1
 
-    # 表格后加间距
-    doc.add_paragraph()
+    # 📘 v7.2: 有边框表格后加间距，无边框布局表格不加（避免布局间隙）
+    if table_borders_default is not False:
+        doc.add_paragraph()
 
 
 def _add_paragraph_to_doc(doc: Document, elem: dict, translations: Dict[str, str],
