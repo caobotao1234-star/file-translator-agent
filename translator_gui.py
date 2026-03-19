@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QGroupBox, QSpinBox, QSplitter, QListWidget,
     QListWidgetItem, QAbstractItemView, QStatusBar, QTabWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit,
-    QDialog, QDialogButtonBox, QFormLayout, QCheckBox,
+    QDialog, QDialogButtonBox, QFormLayout, QCheckBox, QScrollArea,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMimeData
 from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent, QColor, QIcon
@@ -602,16 +602,22 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         root_layout.addWidget(splitter, 1)
 
-        # == 左侧面板 ==
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
+        # == 左侧面板（可滚动） ==
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        left_inner = QWidget()
+        left_layout = QVBoxLayout(left_inner)
+        left_layout.setContentsMargins(0, 0, 4, 0)
         left_layout.setSpacing(6)
 
         # 文件列表
         file_group = QGroupBox("📁 待翻译文件")
         file_gl = QVBoxLayout(file_group)
         self.file_list = FileListWidget()
+        self.file_list.setMinimumHeight(80)
+        self.file_list.setMaximumHeight(140)
         file_gl.addWidget(self.file_list)
         btn_row = QHBoxLayout()
         self.btn_add = QPushButton("添加文件")
@@ -774,13 +780,22 @@ class MainWindow(QMainWindow):
             '• 所有文件中 ABC Corp 统一翻译为「爱必思公司」\n\n'
             'Brain 会自动将需求分发到对应文件。'
         )
-        self.user_prompt.setMaximumHeight(100)
+        self.user_prompt.setMinimumHeight(60)
+        self.user_prompt.setMaximumHeight(80)
         prompt_gl.addWidget(self.user_prompt)
         left_layout.addWidget(prompt_group)
 
-        # 格式映射面板
+        # 格式映射面板（可折叠）
         self.format_panel = FormatMappingPanel(self.format_engine)
-        left_layout.addWidget(self.format_panel, 1)
+        format_group = QGroupBox("🔤 格式映射（点击展开）")
+        format_group.setCheckable(True)
+        format_group.setChecked(False)
+        fg_layout = QVBoxLayout(format_group)
+        fg_layout.setContentsMargins(2, 2, 2, 2)
+        fg_layout.addWidget(self.format_panel)
+        self.format_panel.setVisible(False)
+        format_group.toggled.connect(self.format_panel.setVisible)
+        left_layout.addWidget(format_group)
 
         # 操作按钮
         self.btn_start = QPushButton("▶  开始翻译")
@@ -796,7 +811,8 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         left_layout.addWidget(self.btn_stop)
 
-        splitter.addWidget(left_panel)
+        left_scroll.setWidget(left_inner)
+        splitter.addWidget(left_scroll)
 
         # == 右侧面板（日志 + 进度）==
         right_panel = QWidget()
