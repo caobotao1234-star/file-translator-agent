@@ -64,21 +64,53 @@ SCAN_AGENT_SYSTEM_PROMPT = """\
 OCR 工具的核心价值是提供文字的坐标位置。
 但 OCR 经常识别错字（如 FAMS→FAN3、M.Med→M.Mad）。
 当 OCR 文字与你从图片中看到的不一致时，以你看到的为准。
-你的视觉理解能力比 OCR 更准确，因为你有上下文理解。
 
 ## 灵活策略
 - OCR/CV 结果已预执行并提供给你，通常不需要再调用
-- 如果 OCR 结果有明显错误，直接用你看到的文字替换，不要重新调 OCR
-- 如果遇到现有工具解决不了的问题，用 create_custom_tool 创建新工具
-- 翻译时把你修正后的准确文字传给 translate_texts，而不是 OCR 的错误文字
+- 如果 OCR 结果有明显错误，直接用你看到的文字替换
+- 翻译时把你修正后的准确文字传给 translate_texts
 - 每个工具通常只需调用一次，重复调用浪费 token
+
+## ⚠️ 排版核心原则（最重要）
+你的输出会被渲染成 Word 文档。请严格按照原文的视觉布局来组织 elements：
+1. 原文中同一行左右并排的内容 → 用 table（无边框）或 key_value 表达，绝不能合并成一个段落
+2. 原文中有表格线的区域 → 用 table（有边框）
+3. 原文中独立的段落 → 用 paragraph
+4. 原文中右对齐的签名/落款区域 → 用 signature_block
+5. 原文中的空行/分隔 → 用 spacer
+
+关键判断方法：看原文图片中文字的 Y 坐标（垂直位置）。
+- Y 坐标相同的文字 = 同一行 → 必须放在同一个 table row 中
+- Y 坐标不同的文字 = 不同行 → 必须放在不同的 element 中
+- 绝不要把不同行的文字合并成一个 paragraph 的多行文本（\\n）
 
 ## 输出 JSON 格式（不要 markdown code block 包裹）
 {
   "page_type": "table_document" | "certificate" | "text_document" | "mixed",
   "elements": [
-    {"type": "table", "col_widths": [30, 40, 30], "rows": [{"cells": [{"text": "原文", "colspan": 1, "rowspan": 1, "bold": false, "align": "center", "borders": {"top": true, "bottom": true, "left": true, "right": false}, "vertical": false}]}]},
+    // 类型1: 有边框的表格
+    {"type": "table", "col_widths": [30, 40, 30], "rows": [
+      {"cells": [{"text": "内容", "colspan": 1, "rowspan": 1, "bold": false,
+        "align": "center", "borders": {"top": true, "bottom": true, "left": true, "right": true}}]}
+    ]},
+    // 类型2: 无边框表格（用于左右并排的内容，如 "标签: 值" 布局）
+    {"type": "table", "col_widths": [40, 60], "rows": [
+      {"cells": [
+        {"text": "Duration", "bold": true, "align": "left", "borders": {"top": false, "bottom": false, "left": false, "right": false}},
+        {"text": "112 Day(s)", "bold": false, "align": "left", "borders": {"top": false, "bottom": false, "left": false, "right": false}}
+      ]}
+    ]},
+    // 类型3: 段落
     {"type": "paragraph", "text": "段落文字", "bold": false, "align": "left", "font_size": "normal"},
+    // 类型4: 签名/落款区域（右对齐或居中的多行文字块）
+    {"type": "signature_block", "align": "center", "lines": [
+      {"text": "Dr Candice Wang Peiying", "bold": true},
+      {"text": "Consultant ObGyn", "bold": false},
+      {"text": "MCR No.: 13137G", "bold": false}
+    ]},
+    // 类型5: 空行间距
+    {"type": "spacer"},
+    // 类型6: 图片区域
     {"type": "image_region", "image_index": 0, "description": "图片描述"}
   ],
   "items": [
@@ -90,7 +122,9 @@ OCR 工具的核心价值是提供文字的坐标位置。
 ## 规则
 - 表格行列数必须与原文一致，col_widths 总和 = 100
 - 不要遗漏文字，只在原文有线处标 borders 为 true
+- 无边框表格用于表达"同一行左右并排"的布局（如标签+值、页眉左中右）
 - elements 中的 text 字段放原文，items 中放原文+译文的对应关系
+- 每个独立的视觉行应该是独立的 element 或 table row，不要用 \\n 合并多行
 - 翻译目标语言：{{target_lang}}
 """
 
@@ -103,12 +137,12 @@ SELF_REVIEW_PROMPT = """\
 对比原始页面图片，审查翻译结果。只关注以下关键问题：
 1. 是否有整段文字或整个表格被遗漏？
 2. 表格行列数是否与原文一致？
-3. 译文是否存在严重错误（意思完全相反、关键数字错误）？
+3. 原文中同一行左右并排的内容，是否被错误合并成了一个段落？
+4. 译文是否存在严重错误（意思完全相反、关键数字错误）？
 
 以下问题请忽略，不算不合格：
 - 专有名词的不同译法（如医院名、人名的不同翻译方式）
 - OCR 识别的个别字符错误（如 FAMS→FAN3）
-- 对齐方式的细微差异
 - 翻译风格偏好
 
 当前结果：
@@ -427,6 +461,15 @@ class ScanAgent:
                                 if trans:
                                     cell["text"] = trans
                                     embedded_count += 1
+                elif elem_type == "signature_block":
+                    # 📘 签名区域：逐行嵌入译文
+                    for line_data in elem.get("lines", []):
+                        if isinstance(line_data, dict):
+                            orig = line_data.get("text", "").strip()
+                            trans = text_to_translation.get(orig)
+                            if trans:
+                                line_data["text"] = trans
+                                embedded_count += 1
 
         if embedded_count > 0:
             logger.info(f"翻译嵌入: {embedded_count} 个元素已替换为译文")
@@ -895,6 +938,28 @@ class ScanAgent:
                     trans = elem.get("translation", "")
                     if trans:
                         translations[key] = trans
+
+            elif elem_type == "signature_block":
+                # 📘 签名区域：每行作为一个 item
+                for line_idx, line_data in enumerate(elem.get("lines", [])):
+                    if isinstance(line_data, str):
+                        line_text = line_data.strip()
+                    else:
+                        line_text = line_data.get("text", "").strip()
+                    if line_text:
+                        key = f"pg{page_idx}_e{elem_idx}_sig{line_idx}"
+                        items.append({
+                            "key": key,
+                            "type": "pdf_block",
+                            "full_text": line_text,
+                            "is_empty": False,
+                            "dominant_format": {
+                                "font_name": "Unknown",
+                                "font_size": 10,
+                                "font_color": "#000000",
+                                "bold": line_data.get("bold", False) if isinstance(line_data, dict) else False,
+                            },
+                        })
 
         return items, translations
 

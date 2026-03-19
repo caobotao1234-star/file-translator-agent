@@ -313,16 +313,67 @@ def _add_paragraph_to_doc(doc: Document, elem: dict, translations: Dict[str, str
                           page_idx: int, elem_idx: int):
     """📘 把段落文本写入 Word 文档（带格式）"""
     key = f"pg{page_idx}_e{elem_idx}_para"
-    # 📘 教学笔记：翻译查找优先级
-    # 1. 先按 key 查 translations（Brain 输出的 items 映射）
-    # 2. 如果 key 没命中，直接用 elem["text"]（可能已被嵌入步骤替换为译文）
     text = translations.get(key, elem.get("text", "").strip())
 
-    para = doc.add_paragraph()
-    para.alignment = _get_alignment(elem.get("align", "left"))
-    run = para.add_run(text)
+    # 📘 教学笔记：段落中的 \n 拆分为多个 Word 段落
+    # Brain 有时仍会用 \n 分隔多行内容。拆分后每行独立段落，
+    # 避免 Word 中出现一个超长段落。
+    lines = text.split("\n") if "\n" in text else [text]
+    align = _get_alignment(elem.get("align", "left"))
     size_pt = _get_font_size(elem.get("font_size", "normal"))
-    _set_run_font(run, bold=elem.get("bold", False), size_pt=size_pt)
+    is_bold = elem.get("bold", False)
+
+    for line_text in lines:
+        line_text = line_text.strip()
+        if not line_text:
+            continue
+        para = doc.add_paragraph()
+        para.alignment = align
+        para.paragraph_format.space_before = Pt(1)
+        para.paragraph_format.space_after = Pt(1)
+        run = para.add_run(line_text)
+        _set_run_font(run, bold=is_bold, size_pt=size_pt)
+
+
+def _add_signature_block_to_doc(doc: Document, elem: dict, translations: Dict[str, str],
+                                 page_idx: int, elem_idx: int):
+    """
+    📘 教学笔记：签名/落款区域写入
+
+    签名区域通常是居中或右对齐的多行文字块，
+    如医生签名、公司落款、日期等。
+    Brain 输出 {"type": "signature_block", "align": "center", "lines": [...]}
+    """
+    align = _get_alignment(elem.get("align", "center"))
+    sig_lines = elem.get("lines", [])
+
+    # 📘 签名区域前加一个空行
+    doc.add_paragraph()
+
+    for line_data in sig_lines:
+        if isinstance(line_data, str):
+            line_text = line_data
+            line_bold = False
+        else:
+            line_text = line_data.get("text", "").strip()
+            line_bold = line_data.get("bold", False)
+
+        if not line_text:
+            continue
+
+        para = doc.add_paragraph()
+        para.alignment = align
+        para.paragraph_format.space_before = Pt(0)
+        para.paragraph_format.space_after = Pt(1)
+        run = para.add_run(line_text)
+        _set_run_font(run, bold=line_bold, size_pt=10)
+
+
+def _add_spacer_to_doc(doc: Document):
+    """📘 添加空行间距"""
+    para = doc.add_paragraph()
+    para.paragraph_format.space_before = Pt(2)
+    para.paragraph_format.space_after = Pt(2)
 
 
 def _add_image_to_doc(doc: Document, elem: dict):
@@ -474,6 +525,18 @@ def write_scan_pdf(
                     para_text = elem.get("text", "").strip()
                     if para_text:
                         embedded_count += 1
+
+            elif elem_type == "signature_block":
+                # 📘 签名/落款区域
+                _add_signature_block_to_doc(doc, elem, translations, page_idx, elem_idx)
+                for line_data in elem.get("lines", []):
+                    line_text = line_data.get("text", "") if isinstance(line_data, dict) else str(line_data)
+                    if line_text.strip():
+                        embedded_count += 1
+
+            elif elem_type == "spacer":
+                # 📘 空行间距
+                _add_spacer_to_doc(doc)
 
             elif elem_type == "image_region":
                 _add_image_to_doc(doc, elem)
