@@ -114,16 +114,17 @@ def _set_run_font(run, bold: bool = False, size_pt: float = 10, font_name: str =
     run._element.rPr.rFonts.set(qn("w:eastAsia"), font_name)
 
 
-def _add_image_to_cell(cell, image_bytes: bytes, align: str = "center"):
+def _add_image_to_cell(cell, image_bytes: bytes, align: str = "center", max_width_cm: float = None):
     """
-    📘 v7 新增：把裁剪好的图片嵌入到表格单元格中
+    📘 v7.2 改进：把裁剪好的图片嵌入到表格单元格中
+    max_width_cm 可由调用方指定，默认 4cm
     """
     try:
         from PIL import Image as PILImage
         img = PILImage.open(io.BytesIO(image_bytes))
         w_px, h_px = img.size
-        max_w_cm = 4.0
-        w_cm = min(max_w_cm, w_px * 2.54 / 200)
+        max_w = max_width_cm or 4.0
+        w_cm = min(max_w, w_px * 2.54 / 200)
 
         para = cell.add_paragraph()
         para.alignment = _get_alignment(align)
@@ -406,27 +407,47 @@ def _add_image_to_doc(doc: Document, elem: dict):
     """
     📘 教学笔记：嵌入裁剪的图片到 Word 文档
 
-    如果 Vision LLM 返回了 bbox_pct 且裁剪成功，
-    elem["cropped_image"] 里就有裁剪后的 JPEG bytes。
-    直接嵌入 Word，宽度按裁剪图片的宽高比自适应。
+    📘 v7.2 改进：支持 crop_key 引用 + bbox_pct 自动裁剪
+    Brain 通过 crop_image_region 工具裁剪后，图片 bytes 在后处理阶段
+    被嵌入到 elem["cropped_image"] 中。
+
+    图片宽度根据 bbox_pct 的宽度比例自适应：
+    - 小图（< 30% 页宽）→ 限制 5cm
+    - 中图（30-60%）→ 限制 10cm
+    - 大图（> 60%）→ 限制 16cm
     """
     cropped = elem.get("cropped_image")
     description = elem.get("description", "图片区域")
+    bbox_pct = elem.get("bbox_pct")
 
     if cropped:
         para = doc.add_paragraph()
-        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        # 📘 根据 bbox_pct 推断对齐方式
+        align = "center"
+        if bbox_pct and len(bbox_pct) == 4:
+            center_x = (bbox_pct[0] + bbox_pct[2]) / 2
+            if center_x < 35:
+                align = "left"
+            elif center_x > 65:
+                align = "right"
+        para.alignment = _get_alignment(align)
+
         run = para.add_run()
         img_stream = io.BytesIO(cropped)
-        # 📘 图片宽度限制在 8cm 以内，避免太大
         try:
             from PIL import Image
             img = Image.open(io.BytesIO(cropped))
             w_px, h_px = img.size
-            # 按比例缩放，最大宽度 8cm
-            max_w_cm = 8.0
-            aspect = h_px / w_px if w_px > 0 else 1
-            w_cm = min(max_w_cm, w_px * 2.54 / 200)  # 200 DPI
+
+            # 📘 根据 bbox_pct 宽度比例决定 Word 中的图片宽度
+            if bbox_pct and len(bbox_pct) == 4:
+                region_width_pct = bbox_pct[2] - bbox_pct[0]
+                max_w_cm = PAGE_CONTENT_WIDTH_CM * region_width_pct / 100
+                max_w_cm = max(2.0, min(max_w_cm, 16.0))  # 至少 2cm，最多 16cm
+            else:
+                max_w_cm = 8.0
+
+            w_cm = min(max_w_cm, w_px * 2.54 / 200)
             run.add_picture(img_stream, width=Cm(w_cm))
         except Exception:
             run.add_picture(img_stream, width=Cm(6))

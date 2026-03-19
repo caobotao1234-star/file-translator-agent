@@ -31,13 +31,14 @@
 
 import json
 import time
+import io
 import base64
 import fitz  # PyMuPDF
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.agent_events import AgentEvent
 from core.logger import get_logger
-from tools.scan_tools import OCRTool, CVTool, TranslationTool, WordWriterTool, ImageGenTool
+from tools.scan_tools import OCRTool, CVTool, TranslationTool, WordWriterTool, ImageGenTool, CropImageTool
 from tools.dynamic_tools import DynamicToolRegistry, CreateCustomToolTool
 
 logger = get_logger("scan_agent")
@@ -57,6 +58,7 @@ SCAN_AGENT_SYSTEM_PROMPT = """\
 - ocr_extract_text: OCR 文字识别（返回文字和坐标位置）
 - cv_detect_layout: 表格线和图片区域检测
 - translate_texts: 文本翻译（使用专业翻译模型，便宜且准确）
+- crop_image_region: 从页面裁剪图片区域（保留签名、盖章、logo、照片等不可翻译元素）
 - generate_translated_image: 图片生成（可选，仅排版极复杂时使用）
 - create_custom_tool: 创建自定义工具（遇到现有工具解决不了的问题时使用）
 
@@ -102,6 +104,31 @@ OCR 的核心价值是提供文字的坐标位置。OCR 经常识别错字，当
 只有当文字在原文中是独立的一行、没有与其他文字左右并排时，才用 paragraph。
 如果你不确定，用无边框表格更安全——它永远不会破坏布局。
 
+### 非文字视觉元素的保留（签名、盖章、logo、照片等）
+原文中的非文字视觉元素必须保留在译文中的原始位置，这是排版一致的关键部分。
+
+**你能看到但 OCR 看不到的元素：**
+- 手写签名（笔迹）
+- 红色/蓝色公章、印章
+- 公司 logo、徽标
+- 证件照片、头像
+- 装饰性图案、水印
+- 条形码、二维码
+
+**处理方法：**
+1. 仔细观察图片，识别所有非文字视觉元素
+2. 估算每个元素在页面中的位置（百分比坐标 bbox_pct = [left%, top%, right%, bottom%]）
+3. 调用 crop_image_region 工具裁剪该区域
+4. 在输出 JSON 中用 image_region 元素标记位置，设置 crop_key（工具返回的 key）
+
+**image_region 放置规则：**
+- 如果图片独立占一行 → 用独立的 image_region 元素
+- 如果图片与文字并排（如证件照在右上角）→ 放在无边框表格的某个 cell 中，设置 has_image: true + crop_key
+- 如果图片在表格内部 → 在对应 cell 中设置 has_image: true + crop_key
+
+**示例：** 证件右上角有一张证件照
+→ 用无边框表格，左列放文字信息，右列放 image_region（has_image: true, crop_key: "cropped_0_75_5_95_35"）
+
 ## 输出 JSON 格式（不要 markdown code block 包裹）
 {
   "page_type": "table_document" | "certificate" | "text_document" | "mixed",
@@ -116,7 +143,7 @@ OCR 的核心价值是提供文字的坐标位置。OCR 经常识别错字，当
                   {"text": "表头3", "bold": true, "align": "center"}]}
     ]},
     {"type": "paragraph", "text": "独立段落文字", "bold": false, "align": "left", "font_size": "normal"},
-    {"type": "image_region", "image_index": 0, "description": "图片描述"}
+    {"type": "image_region", "bbox_pct": [75, 5, 95, 30], "crop_key": "cropped_0_75_5_95_30", "description": "证件照片"}
   ],
   "items": [
     {"key": "pg{页码}_e{元素索引}_r{行}_c{列}", "text": "原文", "translation": "译文"},
@@ -143,7 +170,8 @@ SELF_REVIEW_PROMPT = """\
 1. 是否有整段文字或整个表格被遗漏？
 2. 表格行列数是否与原文一致？
 3. 原文中同一行左右并排的内容，是否被错误合并成了一个段落？
-4. 译文是否存在严重错误（意思完全相反、关键数字错误）？
+4. 原文中的签名、盖章、logo、照片等视觉元素是否被保留？（应有 image_region 或 has_image）
+5. 译文是否存在严重错误（意思完全相反、关键数字错误）？
 
 以下问题请忽略，不算不合格：
 - 专有名词的不同译法（如医院名、人名的不同翻译方式）
@@ -324,6 +352,7 @@ class ScanAgent:
             "ocr_extract_text": OCRTool(context=context),
             "cv_detect_layout": CVTool(context=context),
             "translate_texts": TranslationTool(translate_pipeline=self.translate_pipeline),
+            "crop_image_region": CropImageTool(context=context),
             "generate_word_document": WordWriterTool(
                 format_engine=self.format_engine,
                 page_images=page_images,
@@ -479,6 +508,65 @@ class ScanAgent:
         if embedded_count > 0:
             logger.info(f"翻译嵌入: {embedded_count} 个元素已替换为译文")
 
+        # ── 4b. 嵌入裁剪图片到 page_structures ──
+        # 📘 教学笔记：为什么需要后处理嵌入图片？
+        # Brain 调用 crop_image_region 后，裁剪的图片存在 context["cropped_images"] 中。
+        # Brain 在 JSON 中用 crop_key 引用这些图片，但 writer 需要实际的 bytes。
+        # 后处理：遍历所有 elements，把 crop_key 替换为实际的 cropped_image bytes。
+        cropped_images = context.get("cropped_images", {})
+        image_embedded_count = 0
+        if cropped_images:
+            for page_idx_e, structure in enumerate(all_page_structures):
+                for elem in structure.get("elements", []):
+                    elem_type = elem.get("type", "")
+
+                    if elem_type == "image_region":
+                        # 📘 独立的 image_region 元素
+                        crop_key = elem.get("crop_key", "")
+                        bbox_pct = elem.get("bbox_pct")
+                        if crop_key and crop_key in cropped_images:
+                            elem["cropped_image"] = cropped_images[crop_key]
+                            image_embedded_count += 1
+                        elif bbox_pct and not elem.get("cropped_image"):
+                            # 📘 fallback: Brain 给了 bbox_pct 但没调 crop 工具，自动裁剪
+                            auto_key = f"cropped_{page_idx_e}_{int(bbox_pct[0])}_{int(bbox_pct[1])}_{int(bbox_pct[2])}_{int(bbox_pct[3])}"
+                            if auto_key in cropped_images:
+                                elem["cropped_image"] = cropped_images[auto_key]
+                                image_embedded_count += 1
+                            elif page_idx_e < len(page_images):
+                                # 📘 自动裁剪
+                                try:
+                                    from PIL import Image as PILImage
+                                    pil_img = PILImage.open(io.BytesIO(page_images[page_idx_e]))
+                                    w, h = pil_img.size
+                                    left = max(0, int(w * bbox_pct[0] / 100))
+                                    top = max(0, int(h * bbox_pct[1] / 100))
+                                    right = min(w, int(w * bbox_pct[2] / 100))
+                                    bottom = min(h, int(h * bbox_pct[3] / 100))
+                                    if right - left > 10 and bottom - top > 10:
+                                        cropped = pil_img.crop((left, top, right, bottom))
+                                        buf = io.BytesIO()
+                                        cropped.save(buf, format="JPEG", quality=92)
+                                        elem["cropped_image"] = buf.getvalue()
+                                        image_embedded_count += 1
+                                except Exception as e:
+                                    logger.warning(f"自动裁剪失败: {e}")
+
+                    elif elem_type == "table":
+                        # 📘 表格内的图片（has_image + crop_key）
+                        for row in elem.get("rows", []):
+                            cells = row.get("cells", row) if isinstance(row, dict) else row
+                            if isinstance(cells, dict):
+                                cells = cells.get("cells", [])
+                            for cell in cells:
+                                crop_key = cell.get("crop_key", "")
+                                if cell.get("has_image") and crop_key and crop_key in cropped_images:
+                                    cell["cropped_image"] = cropped_images[crop_key]
+                                    image_embedded_count += 1
+
+            if image_embedded_count > 0:
+                logger.info(f"图片嵌入: {image_embedded_count} 个裁剪图片已嵌入结构")
+
         # ── 5. 生成 Word 文档 ──
         self._emit_event(on_event, "generating", {
             "step": "生成",
@@ -618,6 +706,7 @@ class ScanAgent:
             self.tools["ocr_extract_text"].get_api_format(),
             self.tools["cv_detect_layout"].get_api_format(),
             self.tools["translate_texts"].get_api_format(),
+            self.tools["crop_image_region"].get_api_format(),
         ]
         # 📘 图片生成工具（可选）
         if "generate_translated_image" in self.tools:
@@ -729,6 +818,7 @@ class ScanAgent:
                         "cv_detect_layout": "cv",
                         "translate_texts": "translate",
                         "generate_translated_image": "image_gen",
+                        "crop_image_region": "crop",
                     }.get(tool_name, tool_name)
                     self.stats["tool_calls"][stat_key] = (
                         self.stats["tool_calls"].get(stat_key, 0) + 1

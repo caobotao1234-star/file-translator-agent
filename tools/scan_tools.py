@@ -524,3 +524,133 @@ class ImageGenTool(BaseTool):
                 {"error": f"图片生成失败: {type(e).__name__}: {str(e)}"},
                 ensure_ascii=False,
             )
+
+
+class CropImageTool(BaseTool):
+    """
+    📘 教学笔记：图片区域裁剪工具
+
+    从页面图片中裁剪指定区域，用于保留签名、盖章、logo、照片等
+    不可翻译的视觉元素。Brain 看到这些元素后，用 bbox_pct 标记位置，
+    本工具从原始高分辨率页面图片中裁剪出来。
+
+    📘 为什么需要这个工具？
+    签名、盖章、logo 等是非文字视觉元素：
+    - OCR 完全看不到它们（只能识别文字）
+    - CV 可能检测到图片区域，但不知道是什么
+    - Brain（多模态 LLM）能看到并理解它们
+    排版要求"完全一致"，这些元素必须保留在译文中的原始位置。
+    """
+
+    name = "crop_image_region"
+    description = (
+        "从页面图片中裁剪指定区域。用于保留签名、盖章、logo、照片等不可翻译的视觉元素。"
+        "提供百分比坐标 bbox_pct = [left%, top%, right%, bottom%]，返回裁剪结果。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "page_index": {
+                "type": "integer",
+                "description": "页码索引（从0开始）",
+            },
+            "bbox_pct": {
+                "type": "array",
+                "items": {"type": "number"},
+                "description": "裁剪区域的百分比坐标 [left%, top%, right%, bottom%]，每个值 0-100",
+            },
+            "description": {
+                "type": "string",
+                "description": "区域描述（如'红色公章'、'手写签名'、'公司logo'）",
+            },
+        },
+        "required": ["page_index", "bbox_pct", "description"],
+    }
+
+    def __init__(self, context: Dict[str, Any] = None):
+        self.context = context or {}
+
+    def execute(self, params: dict) -> str:
+        valid, msg = self.validate_params(params)
+        if not valid:
+            return json.dumps({"error": msg}, ensure_ascii=False)
+
+        page_index = params["page_index"]
+        bbox_pct = params["bbox_pct"]
+        description = params.get("description", "图片区域")
+
+        page_images = self.context.get("page_images", [])
+
+        # 📘 page_index 自动修正
+        current_idx = self.context.get("current_page_index")
+        if current_idx is not None and page_index != current_idx:
+            page_index = current_idx
+
+        if page_index < 0 or page_index >= len(page_images):
+            return json.dumps(
+                {"error": f"page_index {page_index} 超出范围"},
+                ensure_ascii=False,
+            )
+
+        if not bbox_pct or len(bbox_pct) != 4:
+            return json.dumps(
+                {"error": "bbox_pct 必须是 [left%, top%, right%, bottom%] 格式"},
+                ensure_ascii=False,
+            )
+
+        try:
+            from PIL import Image as PILImage
+
+            img_bytes = page_images[page_index]
+            pil_img = PILImage.open(io.BytesIO(img_bytes))
+            w, h = pil_img.size
+
+            left = int(w * bbox_pct[0] / 100)
+            top = int(h * bbox_pct[1] / 100)
+            right = int(w * bbox_pct[2] / 100)
+            bottom = int(h * bbox_pct[3] / 100)
+
+            # 📘 边界保护
+            left = max(0, min(left, w - 1))
+            top = max(0, min(top, h - 1))
+            right = max(left + 1, min(right, w))
+            bottom = max(top + 1, min(bottom, h))
+
+            if right - left < 10 or bottom - top < 10:
+                return json.dumps(
+                    {"error": "裁剪区域太小（< 10px）"},
+                    ensure_ascii=False,
+                )
+
+            cropped = pil_img.crop((left, top, right, bottom))
+            buf = io.BytesIO()
+            cropped.save(buf, format="JPEG", quality=92)
+            cropped_bytes = buf.getvalue()
+
+            # 📘 存入 context 供 writer 使用
+            # key: "cropped_{page_index}_{bbox}" → bytes
+            crop_key = f"cropped_{page_index}_{int(bbox_pct[0])}_{int(bbox_pct[1])}_{int(bbox_pct[2])}_{int(bbox_pct[3])}"
+            if "cropped_images" not in self.context:
+                self.context["cropped_images"] = {}
+            self.context["cropped_images"][crop_key] = cropped_bytes
+
+            logger.info(
+                f"裁剪成功: 第 {page_index} 页 [{description}] "
+                f"bbox={bbox_pct} → {cropped.size[0]}x{cropped.size[1]}px, "
+                f"{len(cropped_bytes) / 1024:.1f}KB"
+            )
+
+            return json.dumps({
+                "success": True,
+                "crop_key": crop_key,
+                "size_px": list(cropped.size),
+                "size_kb": round(len(cropped_bytes) / 1024, 1),
+                "description": description,
+            }, ensure_ascii=False)
+
+        except Exception as e:
+            logger.error(f"图片裁剪失败: {e}")
+            return json.dumps(
+                {"error": f"裁剪失败: {type(e).__name__}: {str(e)}"},
+                ensure_ascii=False,
+            )
