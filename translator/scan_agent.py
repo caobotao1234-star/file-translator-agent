@@ -32,6 +32,7 @@
 import json
 import time
 import io
+import os
 import base64
 import fitz  # PyMuPDF
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -39,6 +40,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from core.agent_events import AgentEvent
 from core.logger import get_logger
 from tools.scan_tools import OCRTool, CVTool, TranslationTool, WordWriterTool, ImageGenTool, CropImageTool
+from tools.scan_tools_ext import GlossaryTool, ColorDetectTool, TextDirectionTool, ContextTranslationTool, PageComparisonTool
 from tools.dynamic_tools import DynamicToolRegistry, CreateCustomToolTool
 
 logger = get_logger("scan_agent")
@@ -58,7 +60,12 @@ SCAN_AGENT_SYSTEM_PROMPT = """\
 - ocr_extract_text: OCR 文字识别（返回文字和坐标位置）
 - cv_detect_layout: 表格线和图片区域检测
 - translate_texts: 文本翻译（使用专业翻译模型，便宜且准确）
+- translate_with_context: 带上下文的翻译（附加术语表+前文摘要，确保跨页一致性）
 - crop_image_region: 从页面裁剪图片区域（保留签名、盖章、logo、照片等不可翻译元素）
+- manage_glossary: 术语表管理（add/lookup/list/save，确保专有名词跨页一致）
+- detect_colors: 颜色检测（识别彩色文字、背景色、红色公章等）
+- detect_text_direction: 文字方向检测（横排/竖排/旋转）
+- compare_page_layout: 页面布局对比（原文 vs 译文结构相似度验证）
 - generate_translated_image: 图片生成（可选，仅排版极复杂时使用）
 - create_custom_tool: 创建自定义工具（遇到现有工具解决不了的问题时使用）
 
@@ -70,6 +77,10 @@ OCR 的核心价值是提供文字的坐标位置。OCR 经常识别错字，当
 - 如果 OCR 结果有明显错误，直接用你看到的文字替换
 - 翻译时把你修正后的准确文字传给 translate_texts
 - 每个工具通常只需调用一次
+- 遇到专有名词（人名、公司名、地名）→ 用 manage_glossary 注册，确保跨页一致
+- 需要跨页上下文时 → 用 translate_with_context 代替 translate_texts
+- 看到彩色元素（红章、蓝字）→ 可用 detect_colors 确认颜色值
+- 看到竖排或旋转文字 → 用 detect_text_direction 确认方向
 
 ## ⚠️ 排版还原的核心方法论（必须严格遵守）
 
@@ -134,7 +145,7 @@ OCR 的核心价值是提供文字的坐标位置。OCR 经常识别错字，当
   "page_type": "table_document" | "certificate" | "text_document" | "mixed",
   "elements": [
     {"type": "table", "borders": false, "col_widths": [50, 50], "rows": [
-      {"cells": [{"text": "标签", "bold": true, "align": "left"},
+      {"cells": [{"text": "标签", "bold": true, "align": "left", "font_color": "#FF0000"},
                   {"text": "值", "align": "left"}]}
     ]},
     {"type": "table", "borders": true, "col_widths": [30, 40, 30], "rows": [
@@ -142,7 +153,7 @@ OCR 的核心价值是提供文字的坐标位置。OCR 经常识别错字，当
                   {"text": "表头2", "bold": true, "align": "center"},
                   {"text": "表头3", "bold": true, "align": "center"}]}
     ]},
-    {"type": "paragraph", "text": "独立段落文字", "bold": false, "align": "left", "font_size": "normal"},
+    {"type": "paragraph", "text": "独立段落文字", "bold": false, "align": "left", "font_size": "normal", "font_color": "#FF0000"},
     {"type": "image_region", "bbox_pct": [75, 5, 95, 30], "crop_key": "cropped_0_75_5_95_30", "description": "证件照片"}
   ],
   "items": [
@@ -156,6 +167,7 @@ OCR 的核心价值是提供文字的坐标位置。OCR 经常识别错字，当
 - borders: true = 有可见边框的真实表格
 - 单元格可用 colspan/rowspan 合并
 - col_widths 总和 = 100，按原文中各列的视觉宽度比例设置
+- font_color: 可选，如 "#FF0000" 表示红色文字（仅在检测到彩色文字时使用）
 - elements 中的 text 放原文，items 中放原文+译文对应关系
 - 翻译目标语言：{{target_lang}}
 """
@@ -352,12 +364,28 @@ class ScanAgent:
             "ocr_extract_text": OCRTool(context=context),
             "cv_detect_layout": CVTool(context=context),
             "translate_texts": TranslationTool(translate_pipeline=self.translate_pipeline),
+            "translate_with_context": ContextTranslationTool(
+                translate_pipeline=self.translate_pipeline, context=context,
+            ),
             "crop_image_region": CropImageTool(context=context),
+            "manage_glossary": GlossaryTool(context=context),
+            "detect_colors": ColorDetectTool(context=context),
+            "detect_text_direction": TextDirectionTool(context=context),
+            "compare_page_layout": PageComparisonTool(context=context),
             "generate_word_document": WordWriterTool(
                 format_engine=self.format_engine,
                 page_images=page_images,
             ),
         }
+        # 📘 加载持久化术语表到 context
+        glossary_path = "translator_config/glossary.json"
+        if os.path.exists(glossary_path):
+            try:
+                with open(glossary_path, "r", encoding="utf-8") as f:
+                    context["glossary"] = json.load(f)
+                logger.info(f"已加载术语表: {len(context['glossary'])} 个术语")
+            except Exception:
+                pass
         # 📘 图片生成工具（可选）：Agent Brain 自主决定是否调用
         if self.image_gen_engine:
             self.tools["generate_translated_image"] = ImageGenTool(
@@ -706,7 +734,12 @@ class ScanAgent:
             self.tools["ocr_extract_text"].get_api_format(),
             self.tools["cv_detect_layout"].get_api_format(),
             self.tools["translate_texts"].get_api_format(),
+            self.tools["translate_with_context"].get_api_format(),
             self.tools["crop_image_region"].get_api_format(),
+            self.tools["manage_glossary"].get_api_format(),
+            self.tools["detect_colors"].get_api_format(),
+            self.tools["detect_text_direction"].get_api_format(),
+            self.tools["compare_page_layout"].get_api_format(),
         ]
         # 📘 图片生成工具（可选）
         if "generate_translated_image" in self.tools:
@@ -817,8 +850,13 @@ class ScanAgent:
                         "ocr_extract_text": "ocr",
                         "cv_detect_layout": "cv",
                         "translate_texts": "translate",
+                        "translate_with_context": "translate",
                         "generate_translated_image": "image_gen",
                         "crop_image_region": "crop",
+                        "manage_glossary": "glossary",
+                        "detect_colors": "color_detect",
+                        "detect_text_direction": "text_direction",
+                        "compare_page_layout": "page_compare",
                     }.get(tool_name, tool_name)
                     self.stats["tool_calls"][stat_key] = (
                         self.stats["tool_calls"].get(stat_key, 0) + 1
@@ -1203,6 +1241,8 @@ class ScanAgent:
                     # 📘 修正时提供完整工具集（翻译 + 创建自定义工具 + 已有动态工具）
                     fix_tool_schemas = [
                         self.tools["translate_texts"].get_api_format(),
+                        self.tools["translate_with_context"].get_api_format(),
+                        self.tools["crop_image_region"].get_api_format(),
                     ]
                     if "create_custom_tool" in self.tools:
                         fix_tool_schemas.append(

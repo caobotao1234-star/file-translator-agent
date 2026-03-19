@@ -106,12 +106,24 @@ def _get_font_size(size_str: str) -> float:
     return mapping.get(size_str, 10.5)
 
 
-def _set_run_font(run, bold: bool = False, size_pt: float = 10, font_name: str = "Microsoft YaHei"):
-    """📘 设置 run 的字体属性"""
+def _set_run_font(run, bold: bool = False, size_pt: float = 10, font_name: str = "Microsoft YaHei",
+                  color_hex: str = None):
+    """
+    📘 设置 run 的字体属性
+    color_hex: 可选，如 "#FF0000" 表示红色文字
+    """
     run.font.size = Pt(size_pt)
     run.font.name = font_name
     run.font.bold = bold
     run._element.rPr.rFonts.set(qn("w:eastAsia"), font_name)
+    if color_hex and color_hex.startswith("#") and len(color_hex) == 7:
+        try:
+            r = int(color_hex[1:3], 16)
+            g = int(color_hex[3:5], 16)
+            b = int(color_hex[5:7], 16)
+            run.font.color.rgb = RGBColor(r, g, b)
+        except (ValueError, IndexError):
+            pass
 
 
 def _add_image_to_cell(cell, image_bytes: bytes, align: str = "center", max_width_cm: float = None):
@@ -270,6 +282,9 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
 
             # 📘 写入文字（支持 per-line alignment）
             trans_lines = translated.split("\n")
+            # 📘 v7.3: 单元格文字颜色支持（detect_colors 工具检测到的颜色）
+            font_color = cell_data.get("font_color")
+
             if cell_lines and len(cell_lines) == len(trans_lines):
                 # 📘 per-line alignment：每行用原文的对齐方式
                 for line_idx, (trans_text, orig_line) in enumerate(zip(trans_lines, cell_lines)):
@@ -282,7 +297,7 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
                     para.paragraph_format.space_before = Pt(0)
                     para.paragraph_format.space_after = Pt(1)
                     run = para.add_run(trans_text.strip())
-                    _set_run_font(run, bold=cell_bold, size_pt=10)
+                    _set_run_font(run, bold=cell_bold, size_pt=10, color_hex=font_color)
             else:
                 # 📘 简写模式：所有行用同一个对齐
                 for line_idx, line_text in enumerate(trans_lines):
@@ -294,7 +309,7 @@ def _add_table_to_doc(doc: Document, table_data: dict, translations: Dict[str, s
                     para.paragraph_format.space_before = Pt(0)
                     para.paragraph_format.space_after = Pt(1)
                     run = para.add_run(line_text.strip())
-                    _set_run_font(run, bold=cell_bold, size_pt=10)
+                    _set_run_font(run, bold=cell_bold, size_pt=10, color_hex=font_color)
 
             # 📘 图片在文字后面（默认）
             if has_image and cropped_image and image_position != "before":
@@ -350,6 +365,9 @@ def _add_paragraph_to_doc(doc: Document, elem: dict, translations: Dict[str, str
     size_pt = _get_font_size(elem.get("font_size", "normal"))
     is_bold = elem.get("bold", False)
 
+    # 📘 v7.3: 段落文字颜色支持
+    font_color = elem.get("font_color")
+
     for line_text in lines:
         line_text = line_text.strip()
         if not line_text:
@@ -359,7 +377,7 @@ def _add_paragraph_to_doc(doc: Document, elem: dict, translations: Dict[str, str
         para.paragraph_format.space_before = Pt(1)
         para.paragraph_format.space_after = Pt(1)
         run = para.add_run(line_text)
-        _set_run_font(run, bold=is_bold, size_pt=size_pt)
+        _set_run_font(run, bold=is_bold, size_pt=size_pt, color_hex=font_color)
 
 
 def _add_signature_block_to_doc(doc: Document, elem: dict, translations: Dict[str, str],

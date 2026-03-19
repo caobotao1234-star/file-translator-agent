@@ -363,6 +363,8 @@ class DynamicToolRegistry:
             "render_page_preview", "save_layout_rule", "create_custom_tool",
             "ocr_extract_text", "cv_detect_layout", "translate_texts",
             "generate_word_document", "generate_translated_image",
+            "crop_image_region", "manage_glossary", "detect_colors",
+            "detect_text_direction", "translate_with_context", "compare_page_layout",
         }
         if tool_name in builtin_names:
             raise ValueError(f"工具名 '{tool_name}' 与内置工具冲突，请换一个名字")
