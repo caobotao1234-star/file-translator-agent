@@ -79,11 +79,20 @@ def get_logger(
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # 终端输出（级别由 LOG_LEVEL 环境变量控制）
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(_resolve_level(_CONSOLE_LEVEL))
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+    # 📘 教学笔记：终端输出 vs GUI 模式
+    # GUI 模式下，root logger 已经有 LogInterceptor，
+    # 子 logger 的消息会通过 propagate 冒泡上去。
+    # 如果这里再加 StreamHandler，就会重复输出。
+    # 判断方法：检查 root logger 是否已有 LogInterceptor（GUI 模式标志）。
+    root_has_gui_handler = any(
+        type(h).__name__ == "LogInterceptor"
+        for h in logging.getLogger().handlers
+    )
+    if not root_has_gui_handler:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(_resolve_level(_CONSOLE_LEVEL))
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
 
     # 文件输出（始终 DEBUG，TRACE 模式下降为 TRACE）
     if log_to_file:

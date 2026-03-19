@@ -540,6 +540,40 @@ class ScanAgent:
                 for tc in tool_calls_in_turn:
                     tool_name = tc["name"]
                     tool_call_id = tc["id"]
+
+                    # 📘 教学笔记：Gemini 拼接工具名防御
+                    # Gemini 偶尔会把两个工具名拼在一起返回，
+                    # 如 "cv_detect_layoutocr_extract_text"。
+                    # 检测方法：如果 tool_name 不在已知工具中，
+                    # 尝试从已知工具名列表中拆分出第一个匹配的。
+                    if tool_name not in self.tools:
+                        known_names = sorted(self.tools.keys(), key=len, reverse=True)
+                        split_found = False
+                        for known in known_names:
+                            if tool_name.startswith(known) and len(tool_name) > len(known):
+                                remainder = tool_name[len(known):]
+                                if remainder in self.tools:
+                                    logger.warning(
+                                        f"检测到 Gemini 拼接工具名: '{tool_name}' → "
+                                        f"拆分为 '{known}' + '{remainder}'，使用第一个"
+                                    )
+                                    tool_name = known
+                                    split_found = True
+                                    break
+                        if not split_found:
+                            # 📘 也可能是反过来拼的，检查 endswith
+                            for known in known_names:
+                                if tool_name.endswith(known) and len(tool_name) > len(known):
+                                    prefix = tool_name[:-len(known)]
+                                    if prefix in self.tools:
+                                        logger.warning(
+                                            f"检测到 Gemini 拼接工具名: '{tool_name}' → "
+                                            f"拆分为 '{prefix}' + '{known}'，使用第一个"
+                                        )
+                                        tool_name = prefix
+                                        split_found = True
+                                        break
+
                     tool_call_count += 1
 
                     # 📘 统计工具调用次数

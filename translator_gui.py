@@ -795,6 +795,18 @@ class MainWindow(QMainWindow):
     # 日志重定向
     # ---------------------------------------------------------
     def _setup_log_redirect(self):
+        """
+        📘 教学笔记：GUI 日志重定向（修复重复日志）
+        问题根因：get_logger() 给每个子 logger 加了 StreamHandler，
+        而这里又给 root logger 加了 LogInterceptor。
+        Python logging 的 propagate=True（默认）会让消息从子 logger
+        冒泡到 root logger，导致每条日志打两遍。
+
+        修复方案：给 root logger 加完 LogInterceptor 后，
+        遍历所有已存在的子 logger，移除它们的 StreamHandler（终端输出）。
+        子 logger 的消息会通过 propagate 冒泡到 root 的 LogInterceptor，
+        只走一条路径 → 不再重复。
+        """
         handler = LogInterceptor(self._log_signal)
         handler.setFormatter(logging.Formatter(
             "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -803,6 +815,14 @@ class MainWindow(QMainWindow):
         handler.setLevel(TRACE)
         logging.getLogger().addHandler(handler)
         logging.getLogger().setLevel(TRACE)
+
+        # 📘 移除所有子 logger 的 StreamHandler，防止重复输出
+        # 子 logger 的消息会通过 propagate 冒泡到 root 的 LogInterceptor
+        for name in list(logging.Logger.manager.loggerDict):
+            lgr = logging.getLogger(name)
+            for h in lgr.handlers[:]:  # 📘 用切片拷贝，因为遍历中会删除
+                if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                    lgr.removeHandler(h)
 
         for name in [
             "httpcore", "httpcore.http11", "httpcore.connection",
@@ -1003,6 +1023,11 @@ class MainWindow(QMainWindow):
         self.format_panel.setEnabled(not running)
 
     def _apply_log_level(self, level_name: str):
+        """
+        📘 教学笔记：运行时切换日志级别
+        GUI 下拉框切换时调用。同时清理新创建的子 logger 的 StreamHandler，
+        防止翻译过程中新建的 logger 又加了终端 handler 导致重复。
+        """
         import core.logger as logger_module
 
         level_map = {"TRACE": TRACE, "DEBUG": logging.DEBUG, "INFO": logging.INFO}
@@ -1014,9 +1039,10 @@ class MainWindow(QMainWindow):
         for name in list(logging.Logger.manager.loggerDict):
             lgr = logging.getLogger(name)
             lgr.setLevel(min(lgr.level, level) if lgr.level > 0 else level)
-            for h in lgr.handlers:
+            # 📘 移除子 logger 的 StreamHandler（防止新建的 logger 又加了终端输出）
+            for h in lgr.handlers[:]:
                 if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
-                    h.setLevel(level)
+                    lgr.removeHandler(h)
 
         noisy_loggers = [
             "httpcore", "httpcore.http11", "httpcore.connection",
