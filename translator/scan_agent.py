@@ -49,14 +49,20 @@ SCAN_AGENT_SYSTEM_PROMPT = """\
 你是文档翻译 Agent。分析扫描件图片，提取结构化内容并翻译。
 
 ## 工具
-- ocr_extract_text: OCR 文字识别（返回文字和坐标）
+- ocr_extract_text: OCR 文字识别（返回文字和坐标位置）
 - cv_detect_layout: 表格线和图片区域检测
 - translate_texts: 文本翻译
 - generate_translated_image: 图片生成（可选，仅排版极复杂时使用）
 
+## 重要：你是文字内容的权威
+OCR 工具的核心价值是提供文字的坐标位置信息。
+但 OCR 经常识别错字（如 FAMS→FAN3、M.Med→M.Mad）。
+当 OCR 文字与你从图片中看到的不一致时，以你看到的为准。
+你的视觉理解能力比 OCR 更准确，因为你有上下文理解。
+
 ## 流程
 1. 观察图片，判断类型（表格/证件/纯文本/混合）
-2. 调用工具：有表格先 cv_detect_layout 再 ocr_extract_text，纯文本直接 ocr_extract_text
+2. 参考 OCR 结果的位置信息，但用你自己看到的文字内容
 3. 调用 translate_texts 翻译
 4. 输出 JSON（不要 markdown code block 包裹）
 
@@ -82,18 +88,50 @@ SCAN_AGENT_SYSTEM_PROMPT = """\
 - 翻译目标语言：{{target_lang}}
 """
 
-# 📘 教学笔记：统一审查提示词（v5 — 内容+排版+翻译质量）
-# v5 架构中，审校职责统一由规划者管理。
-# 自我审查同时检查：结构完整性、翻译质量、排版合理性。
+# 📘 教学笔记：审查提示词（v6 — 聚焦关键问题，忽略细枝末节）
+# v6 改进：
+#   1. 明确审查优先级：结构完整性 > 内容遗漏 > 翻译准确性
+#   2. 忽略不影响理解的小问题（专有名词译法、OCR 小错误）
+#   3. 输出必须是严格 JSON，不要 markdown
 SELF_REVIEW_PROMPT = """\
-审查翻译结果，对比原始页面图片：
-1. 文字是否遗漏？2. 译文是否准确？3. 表格结构是否正确？
+对比原始页面图片，审查翻译结果。只关注以下关键问题：
+1. 是否有整段文字或整个表格被遗漏？
+2. 表格行列数是否与原文一致？
+3. 译文是否存在严重错误（意思完全相反、关键数字错误）？
+
+以下问题请忽略，不算不合格：
+- 专有名词的不同译法（如医院名、人名的不同翻译方式）
+- OCR 识别的个别字符错误（如 FAMS→FAN3）
+- 对齐方式的细微差异
+- 翻译风格偏好
 
 当前结果：
 {result_json}
 
-合格回复：{{"passed": true, "reason": ""}}
-不合格回复：{{"passed": false, "reason": "具体问题", "fix_actions": ["修正建议"]}}
+必须输出严格 JSON（不要 markdown code block）：
+合格：{{"passed": true, "reason": ""}}
+不合格：{{"passed": false, "reason": "具体问题", "fix_actions": ["修正建议"]}}
+"""
+
+# 📘 教学笔记：修正提示词（v6 — Brain 带图修正，作为文字内容权威）
+# 核心理念：OCR 提供位置信息，Brain 看图提供准确文字内容。
+# 修正时必须带原始图片，Brain 对照图片修正 OCR 错误和翻译问题。
+FIX_WITH_IMAGE_PROMPT = """\
+你是文档翻译 Agent。以下是第 {page_idx} 页的分析结果，审查发现问题。
+
+## 审查反馈
+{feedback}
+
+## 当前结果
+{current_json}
+
+## 你的任务
+1. 对照原始图片，检查并修正上述问题
+2. 如果 OCR 识别有误，以你从图片中看到的文字为准（你的视觉能力比 OCR 更准确）
+3. 修正后重新翻译有问题的部分
+4. 输出完整的修正后 JSON（与原格式一致，不要 markdown code block 包裹）
+
+翻译目标语言：{target_lang}
 """
 
 
@@ -845,18 +883,19 @@ class ScanAgent:
         on_event: Callable[[AgentEvent], None] = None,
     ) -> Tuple[bool, str, dict, list, Dict[str, str]]:
         """
-        📘 教学笔记：自我审查（Self-Review）
+        📘 教学笔记：自我审查 + 智能修正（v6）
 
-        Agent 大脑检查自己的输出质量：
-        1. 发送页面图片 + 提取结果给 Brain
-        2. Brain 判断是否通过
-        3. 未通过 → 重新处理（最多 max_review_retries 次）
-        4. 2 次重试后仍未通过 → 标记质量问题并继续
+        v6 核心改进：
+        1. 审查聚焦关键问题（遗漏、结构错误），忽略细枝末节
+        2. 审查解析失败时，提取 review_text 中的有用反馈作为修正依据
+        3. 修正时必须带原始图片——Brain 是文字内容的权威，OCR 只提供位置
+        4. Brain 对照图片修正 OCR 错误、补充遗漏、修正翻译
 
-        📘 为什么需要自我审查？
-        LLM 不是完美的——可能遗漏文字、搞错表格结构。
-        让 Agent 自己检查一遍，能发现并修正大部分问题。
-        这比人工检查便宜得多，而且是自动的。
+        📘 为什么 Brain 比 OCR 更准确？
+        OCR（RapidOCR）是纯文字识别，容易把 FAMS→FAN3、M.Med→M.Mad。
+        多模态 LLM 看图片时有上下文理解能力——知道这是医生资质，
+        所以能正确识别 FAMS（Fellow of Academy of Medicine Singapore）。
+        OCR 的核心价值是提供文字的坐标位置，内容以 Brain 为准。
 
         返回: (passed, reason, page_structure, items, translations)
         """
@@ -902,78 +941,142 @@ class ScanAgent:
                         self._notify_token_update()
             except Exception as e:
                 logger.warning(f"第 {page_idx} 页审查调用失败: {e}")
-                # 📘 审查失败不阻塞流程，标记并继续
                 passed = True
                 reason = f"审查调用失败: {str(e)}"
                 break
 
             # 📘 解析审查结果
-            # 📘 教学笔记：审查结果解析策略
-            # 审查模型应该返回 {"passed": true/false, "reason": "..."}，
-            # 但经常返回 markdown 格式或其他非 JSON 内容。
-            # 策略：解析失败 → 视为通过（宁可放过，不浪费 token 重试）。
-            # 因为解析失败说明模型没按格式回复，重试大概率还是一样的结果。
             try:
                 from translator.scan_parser import _parse_structure_json
                 review_result = _parse_structure_json(review_text)
                 if not review_result:
-                    # 📘 尝试直接 json.loads
                     review_result = json.loads(review_text.strip())
             except (json.JSONDecodeError, Exception):
                 review_result = None
 
-            if review_result is None:
-                # 📘 解析失败 → 视为通过，不浪费 token 重试
-                logger.warning(f"第 {page_idx} 页审查结果解析失败，视为通过")
-                passed = True
-                reason = "审查结果解析失败，视为通过"
-                break
+            # 📘 教学笔记：审查结果解析策略（v6）
+            # 解析成功 → 按 passed 字段判断
+            # 解析失败 → review_text 本身就是有价值的反馈！
+            #   模型返回了 markdown 格式的审查意见，虽然不是 JSON，
+            #   但里面包含了具体的问题描述，可以直接作为修正的依据。
+            if review_result is not None:
+                if review_result.get("passed", False):
+                    passed = True
+                    reason = review_result.get("reason", "")
+                    logger.info(f"第 {page_idx} 页审查通过")
+                    break
+                reason = review_result.get("reason", "审查未通过")
+            else:
+                # 📘 解析失败，但 review_text 包含有用反馈
+                # 截取前 500 字符作为修正依据（避免太长）
+                reason = review_text.strip()[:500] if review_text.strip() else "审查未通过"
+                logger.warning(
+                    f"第 {page_idx} 页审查结果非 JSON，提取反馈用于修正: {reason[:100]}..."
+                )
 
-            if review_result.get("passed", False):
-                passed = True
-                reason = review_result.get("reason", "")
-                logger.info(f"第 {page_idx} 页审查通过")
-                break
-
-            # 📘 审查未通过
-            reason = review_result.get("reason", "审查未通过")
-            )
             retries += 1
 
             if retries <= self.max_review_retries:
                 logger.info(
-                    f"第 {page_idx} 页审查未通过 (原因: {reason})，"
+                    f"第 {page_idx} 页审查未通过 (原因: {reason[:200]})，"
                     f"第 {retries} 次重试..."
                 )
                 print(
-                    f"  [🔄 第 {page_idx + 1} 页] 审查未通过，重试中 ({retries}/{self.max_review_retries})...",
+                    f"  [🔄 第 {page_idx + 1} 页] 审查未通过，Brain 带图修正中 ({retries}/{self.max_review_retries})...",
                     flush=True,
                 )
 
-                # 📘 教学笔记：增量修正 vs 完全重来
-                # 之前审查未通过时完全重新处理该页（重发图片 + 重新 OCR + 重新翻译），
-                # 浪费大量 token。优化：把审查反馈发给 Brain，让它基于已有结果修正，
-                # 只需 1 次 Brain 调用（不含图片），而不是完整的 ReAct 循环。
+                # 📘 教学笔记：带图修正（v6 核心改进）
+                # 之前的增量修正不带图片，Brain 只能根据文字描述盲修。
+                # 现在把原始图片 + 审查反馈一起发给 Brain：
+                #   - Brain 对照图片看到真实内容
+                #   - Brain 发现 OCR 错误时，以自己看到的为准
+                #   - Brain 补充遗漏的文字、修正翻译
+                # 这才是 Agent 该做的事——自主发现问题、自主修正。
                 try:
+                    fix_prompt = FIX_WITH_IMAGE_PROMPT.format(
+                        page_idx=page_idx,
+                        feedback=reason,
+                        current_json=json.dumps(page_structure, ensure_ascii=False, indent=2),
+                        target_lang=target_lang,
+                    )
                     fix_messages = [
-                        {"role": "system", "content": SCAN_AGENT_SYSTEM_PROMPT.replace("{{target_lang}}", target_lang)},
                         {
                             "role": "user",
-                            "content": (
-                                f"以下是第 {page_idx} 页的分析结果，审查发现问题：{reason}\n\n"
-                                f"当前结果：\n{json.dumps(page_structure, ensure_ascii=False, indent=2)}\n\n"
-                                f"请修正上述问题，输出完整的修正后 JSON。"
-                            ),
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{page_image_b64}",
+                                    },
+                                },
+                                {"type": "text", "text": fix_prompt},
+                            ],
                         },
                     ]
+
+                    # 📘 修正时也提供翻译工具，Brain 可能需要重新翻译修正后的文字
+                    fix_tool_schemas = [
+                        self.tools["translate_texts"].get_api_format(),
+                    ]
+
                     fix_text = ""
-                    for chunk in self.brain_engine.stream_chat(fix_messages, max_tokens=16384):
+                    fix_tool_calls = []
+                    for chunk in self.brain_engine.stream_chat(
+                        fix_messages, tools=fix_tool_schemas, max_tokens=16384,
+                    ):
                         if chunk["type"] == "text":
                             fix_text += chunk["content"]
+                        elif chunk["type"] == "tool_call":
+                            fix_tool_calls.append(chunk)
                         elif chunk["type"] == "usage":
                             self.stats["planner_tokens"]["prompt"] += chunk.get("prompt_tokens", 0)
                             self.stats["planner_tokens"]["completion"] += chunk.get("completion_tokens", 0)
                             self._notify_token_update()
+
+                    # 📘 如果 Brain 要求调翻译工具，执行一轮
+                    if fix_tool_calls and not fix_text:
+                        assistant_msg = {"role": "assistant", "content": None, "tool_calls": []}
+                        for tc in fix_tool_calls:
+                            tc_entry = {
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                            }
+                            if "extra_content" in tc:
+                                tc_entry["extra_content"] = tc["extra_content"]
+                            assistant_msg["tool_calls"].append(tc_entry)
+                        fix_messages.append(assistant_msg)
+
+                        for tc in fix_tool_calls:
+                            tool_name = tc["name"]
+                            try:
+                                tool_params = json.loads(tc["arguments"])
+                            except json.JSONDecodeError:
+                                tool_params = {}
+                            if tool_name in self.tools:
+                                tool_result = self.tools[tool_name].execute(tool_params)
+                                self.stats["tool_calls"]["translate"] = (
+                                    self.stats["tool_calls"].get("translate", 0) + 1
+                                )
+                            else:
+                                tool_result = json.dumps({"error": f"未知工具: {tool_name}"})
+                            fix_messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": tool_result,
+                            })
+
+                        # 📘 工具执行后再调一次 Brain 拿最终结果
+                        for chunk in self.brain_engine.stream_chat(
+                            fix_messages, max_tokens=16384,
+                        ):
+                            if chunk["type"] == "text":
+                                fix_text += chunk["content"]
+                            elif chunk["type"] == "usage":
+                                self.stats["planner_tokens"]["prompt"] += chunk.get("prompt_tokens", 0)
+                                self.stats["planner_tokens"]["completion"] += chunk.get("completion_tokens", 0)
+                                self._notify_token_update()
 
                     if fix_text:
                         new_structure, new_items, new_translations = self._parse_brain_output(
@@ -983,13 +1086,20 @@ class ScanAgent:
                             page_structure = new_structure
                             items = new_items
                             translations = new_translations
+                            logger.info(
+                                f"第 {page_idx} 页带图修正完成: "
+                                f"{len(new_structure.get('elements', []))} 个元素, "
+                                f"{len(new_translations)} 个翻译"
+                            )
+                        else:
+                            logger.warning(f"第 {page_idx} 页修正结果解析失败，保留原结果")
                 except Exception as e:
-                    logger.error(f"第 {page_idx} 页增量修正失败: {e}")
+                    logger.error(f"第 {page_idx} 页带图修正失败: {e}")
                     reason = f"修正失败: {str(e)}"
                     break
             else:
                 logger.warning(
-                    f"第 {page_idx} 页审查 {self.max_review_retries} 次重试后仍未通过: {reason}"
+                    f"第 {page_idx} 页审查 {self.max_review_retries} 次重试后仍未通过: {reason[:200]}"
                 )
                 print(
                     f"  [⚠️ 第 {page_idx + 1} 页] 审查未通过，标记质量问题并继续",
@@ -1000,7 +1110,7 @@ class ScanAgent:
         self.stats["review_results"].append({
             "page": page_idx,
             "passed": passed,
-            "reason": reason,
+            "reason": reason[:200],
             "retries": retries,
         })
 
