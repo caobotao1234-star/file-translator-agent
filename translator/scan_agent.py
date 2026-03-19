@@ -42,33 +42,38 @@ from tools.dynamic_tools import DynamicToolRegistry, CreateCustomToolTool
 
 logger = get_logger("scan_agent")
 
-# 📘 教学笔记：Agent 大脑的系统提示词
-# 这是 Agent 的"灵魂"——告诉大脑它是谁、能做什么、该怎么做。
-# 好的 system prompt 是 Agent 质量的关键。
+# 📘 教学笔记：Agent 大脑的系统提示词（v6 — Brain 作为项目负责人）
+# Brain 不再是"执行者"，而是整个翻译项目的负责人。
+# 它有三个核心目标，需要灵活运用各种手段来达成。
 SCAN_AGENT_SYSTEM_PROMPT = """\
-你是文档翻译 Agent。分析扫描件图片，提取结构化内容并翻译。
+你是文档翻译项目的负责人（Brain）。你管理整个翻译流程，灵活调度工具来达成目标。
 
-## 工具
+## 你的三大目标（按优先级排序）
+1. 💰 节省 token：不做无用功，每次工具调用都要有明确目的
+2. 📐 排版一致：译文的布局结构必须与原文一致（表格行列、段落顺序、对齐方式）
+3. ✅ 翻译准确：内容翻译准确，不遗漏，不曲解
+
+## 你的工具
 - ocr_extract_text: OCR 文字识别（返回文字和坐标位置）
 - cv_detect_layout: 表格线和图片区域检测
-- translate_texts: 文本翻译
+- translate_texts: 文本翻译（使用专业翻译模型）
 - generate_translated_image: 图片生成（可选，仅排版极复杂时使用）
+- create_custom_tool: 创建自定义工具（遇到现有工具解决不了的问题时使用）
 
-## 重要：你是文字内容的权威
-OCR 工具的核心价值是提供文字的坐标位置信息。
+## 关键原则：你是文字内容的权威
+OCR 工具的核心价值是提供文字的坐标位置。
 但 OCR 经常识别错字（如 FAMS→FAN3、M.Med→M.Mad）。
 当 OCR 文字与你从图片中看到的不一致时，以你看到的为准。
 你的视觉理解能力比 OCR 更准确，因为你有上下文理解。
 
-## 流程
-1. 观察图片，判断类型（表格/证件/纯文本/混合）
-2. 参考 OCR 结果的位置信息，但用你自己看到的文字内容
-3. 调用 translate_texts 翻译
-4. 输出 JSON（不要 markdown code block 包裹）
+## 灵活策略
+- OCR/CV 结果已预执行并提供给你，通常不需要再调用
+- 如果 OCR 结果有明显错误，直接用你看到的文字替换，不要重新调 OCR
+- 如果遇到现有工具解决不了的问题，用 create_custom_tool 创建新工具
+- 翻译时把你修正后的准确文字传给 translate_texts，而不是 OCR 的错误文字
+- 每个工具通常只需调用一次，重复调用浪费 token
 
-⚠️ 重要：每个工具只需调用一次！OCR 和 CV 结果已缓存，重复调用浪费资源。
-
-## 输出 JSON 格式
+## 输出 JSON 格式（不要 markdown code block 包裹）
 {
   "page_type": "table_document" | "certificate" | "text_document" | "mixed",
   "elements": [
@@ -85,6 +90,7 @@ OCR 工具的核心价值是提供文字的坐标位置信息。
 ## 规则
 - 表格行列数必须与原文一致，col_widths 总和 = 100
 - 不要遗漏文字，只在原文有线处标 borders 为 true
+- elements 中的 text 字段放原文，items 中放原文+译文的对应关系
 - 翻译目标语言：{{target_lang}}
 """
 
@@ -113,11 +119,14 @@ SELF_REVIEW_PROMPT = """\
 不合格：{{"passed": false, "reason": "具体问题", "fix_actions": ["修正建议"]}}
 """
 
-# 📘 教学笔记：修正提示词（v6 — Brain 带图修正，作为文字内容权威）
-# 核心理念：OCR 提供位置信息，Brain 看图提供准确文字内容。
-# 修正时必须带原始图片，Brain 对照图片修正 OCR 错误和翻译问题。
+# 📘 教学笔记：修正提示词（v6 — Brain 带图修正，作为项目负责人）
+# Brain 看到原图 + 审查反馈，自主决定修正策略：
+# - OCR 错误 → 直接用自己看到的文字替换
+# - 翻译错误 → 调 translate_texts 重新翻译
+# - 结构错误 → 重新组织 elements
+# - 遇到新问题 → 创建自定义工具解决
 FIX_WITH_IMAGE_PROMPT = """\
-你是文档翻译 Agent。以下是第 {page_idx} 页的分析结果，审查发现问题。
+你是文档翻译项目的负责人。以下是第 {page_idx} 页的分析结果，审查发现了问题。
 
 ## 审查反馈
 {feedback}
@@ -126,27 +135,34 @@ FIX_WITH_IMAGE_PROMPT = """\
 {current_json}
 
 ## 你的任务
-1. 对照原始图片，检查并修正上述问题
-2. 如果 OCR 识别有误，以你从图片中看到的文字为准（你的视觉能力比 OCR 更准确）
-3. 修正后重新翻译有问题的部分
-4. 输出完整的修正后 JSON（与原格式一致，不要 markdown code block 包裹）
+对照原始图片，灵活修正上述问题：
+- OCR 识别错误 → 以你从图片中看到的文字为准，直接修正
+- 翻译不准确 → 调用 translate_texts 重新翻译修正后的文字
+- 结构/排版问题 → 重新组织 elements 结构
+- 遇到新问题 → 可以调用 create_custom_tool 创建工具解决
 
+输出完整的修正后 JSON（与原格式一致，不要 markdown code block 包裹）。
 翻译目标语言：{target_lang}
 """
 
 
 class ScanAgent:
     """
-    📘 教学笔记：扫描件翻译 Agent
+    📘 教学笔记：扫描件翻译 Agent（v6 — Brain 作为项目负责人）
 
-    这是一个真正的 Agent——有大脑（LLM）、有工具（OCR/CV/翻译/Word），
-    能自主决策处理策略，而不是按固定流水线执行。
+    v6 核心理念：Brain 不是执行者，而是项目负责人。
+    它有三大目标：省 token、排版一致、翻译准确。
+    为了达成目标，Brain 可以灵活使用各种手段：
+    - 调用预置工具（OCR、CV、翻译、图片生成）
+    - 创建自定义工具解决新问题（并持久化保存）
+    - 修正 OCR 错误（Brain 的视觉能力 > OCR）
+    - 自我审查 + 带图修正
 
     职责：
     1. 将 PDF 渲染为页面图片
-    2. 逐页调用 Agent Brain 处理（ReAct 循环）
-    3. 自我审查每页结果
-    4. 汇总结果，调用 Word Writer 生成文档
+    2. 逐页调用 Brain 处理（ReAct 循环）
+    3. 自我审查 + 智能修正
+    4. 汇总结果，生成 Word 文档
     5. 通过事件机制报告进度
     """
 
@@ -535,10 +551,11 @@ class ScanAgent:
                         "text": (
                             f"请分析这张文档图片（第 {page_idx} 页），"
                             f"提取结构化内容并翻译为{target_lang}。\n\n"
-                            f"## 已有的 OCR 结果\n{ocr_result}\n\n"
+                            f"## 已有的 OCR 结果（参考位置信息，文字内容以你看到的为准）\n"
+                            f"{ocr_result}\n\n"
                             f"## 已有的 CV 布局检测结果\n{cv_result}\n\n"
-                            f"OCR 和 CV 已执行完毕，请直接使用上述结果。"
-                            f"如需翻译请调用 translate_texts，然后输出最终 JSON。"
+                            f"📘 提示：OCR 和 CV 已预执行。请对照图片核实 OCR 文字，"
+                            f"如有识别错误直接修正。然后调用 translate_texts 翻译，最后输出 JSON。"
                         ),
                     },
                 ],
@@ -546,9 +563,9 @@ class ScanAgent:
         ]
 
         # 📘 构建工具列表（给 Brain 的 tools 参数）
-        # 📘 教学笔记：精简工具列表
-        # OCR 和 CV 已预执行，Brain 通常只需要 translate_texts。
-        # 但保留 OCR/CV 以防 Brain 需要对特定区域重新识别。
+        # 📘 教学笔记：Brain 作为项目负责人，拥有完整工具集
+        # 包括 OCR/CV（通常不需要再调）、翻译、图片生成、创建自定义工具。
+        # Brain 自主决定用什么工具、什么顺序、调几次。
         tool_schemas = [
             self.tools["ocr_extract_text"].get_api_format(),
             self.tools["cv_detect_layout"].get_api_format(),
@@ -559,6 +576,15 @@ class ScanAgent:
             tool_schemas.append(
                 self.tools["generate_translated_image"].get_api_format()
             )
+        # 📘 自定义工具创建（Brain 遇到问题时可以自己写工具）
+        if "create_custom_tool" in self.tools:
+            tool_schemas.append(
+                self.tools["create_custom_tool"].get_api_format()
+            )
+        # 📘 已有的动态工具也提供给 Brain
+        if hasattr(self, 'dynamic_registry'):
+            for schema in self.dynamic_registry.get_tool_schemas():
+                tool_schemas.append(schema)
 
         # 📘 ReAct 循环
         tool_call_count = 0
@@ -987,11 +1013,10 @@ class ScanAgent:
                 )
 
                 # 📘 教学笔记：带图修正（v6 核心改进）
-                # 之前的增量修正不带图片，Brain 只能根据文字描述盲修。
-                # 现在把原始图片 + 审查反馈一起发给 Brain：
-                #   - Brain 对照图片看到真实内容
-                #   - Brain 发现 OCR 错误时，以自己看到的为准
-                #   - Brain 补充遗漏的文字、修正翻译
+                # Brain 作为项目负责人，拥有完整工具集来修正问题：
+                # - 看图修正 OCR 错误（视觉能力 > OCR）
+                # - 调翻译工具重新翻译
+                # - 甚至创建新工具解决特殊问题
                 # 这才是 Agent 该做的事——自主发现问题、自主修正。
                 try:
                     fix_prompt = FIX_WITH_IMAGE_PROMPT.format(
@@ -1015,10 +1040,16 @@ class ScanAgent:
                         },
                     ]
 
-                    # 📘 修正时也提供翻译工具，Brain 可能需要重新翻译修正后的文字
+                    # 📘 修正时提供完整工具集（翻译 + 创建自定义工具 + 已有动态工具）
                     fix_tool_schemas = [
                         self.tools["translate_texts"].get_api_format(),
                     ]
+                    if "create_custom_tool" in self.tools:
+                        fix_tool_schemas.append(
+                            self.tools["create_custom_tool"].get_api_format()
+                        )
+                    if hasattr(self, 'dynamic_registry'):
+                        fix_tool_schemas.extend(self.dynamic_registry.get_tool_schemas())
 
                     fix_text = ""
                     fix_tool_calls = []
@@ -1034,8 +1065,11 @@ class ScanAgent:
                             self.stats["planner_tokens"]["completion"] += chunk.get("completion_tokens", 0)
                             self._notify_token_update()
 
-                    # 📘 如果 Brain 要求调翻译工具，执行一轮
-                    if fix_tool_calls and not fix_text:
+                    # 📘 如果 Brain 要求调工具，执行（可能多轮）
+                    fix_tool_round = 0
+                    max_fix_rounds = 3  # 修正阶段最多 3 轮工具调用
+                    while fix_tool_calls and not fix_text and fix_tool_round < max_fix_rounds:
+                        fix_tool_round += 1
                         assistant_msg = {"role": "assistant", "content": None, "tool_calls": []}
                         for tc in fix_tool_calls:
                             tc_entry = {
@@ -1054,25 +1088,44 @@ class ScanAgent:
                                 tool_params = json.loads(tc["arguments"])
                             except json.JSONDecodeError:
                                 tool_params = {}
+
                             if tool_name in self.tools:
                                 tool_result = self.tools[tool_name].execute(tool_params)
-                                self.stats["tool_calls"]["translate"] = (
-                                    self.stats["tool_calls"].get("translate", 0) + 1
+                                # 📘 统计
+                                stat_key = {
+                                    "translate_texts": "translate",
+                                    "create_custom_tool": "create_tool",
+                                }.get(tool_name, tool_name)
+                                self.stats["tool_calls"][stat_key] = (
+                                    self.stats["tool_calls"].get(stat_key, 0) + 1
                                 )
                             else:
-                                tool_result = json.dumps({"error": f"未知工具: {tool_name}"})
+                                # 📘 检查动态工具
+                                dynamic_tool = (
+                                    self.dynamic_registry.get_tool(tool_name)
+                                    if hasattr(self, 'dynamic_registry') else None
+                                )
+                                if dynamic_tool:
+                                    self.tools[tool_name] = dynamic_tool
+                                    tool_result = dynamic_tool.execute(tool_params)
+                                else:
+                                    tool_result = json.dumps({"error": f"未知工具: {tool_name}"})
+
                             fix_messages.append({
                                 "role": "tool",
                                 "tool_call_id": tc["id"],
                                 "content": tool_result,
                             })
 
-                        # 📘 工具执行后再调一次 Brain 拿最终结果
+                        # 📘 工具执行后再调 Brain 拿结果（可能继续调工具或输出最终 JSON）
+                        fix_tool_calls = []
                         for chunk in self.brain_engine.stream_chat(
-                            fix_messages, max_tokens=16384,
+                            fix_messages, tools=fix_tool_schemas, max_tokens=16384,
                         ):
                             if chunk["type"] == "text":
                                 fix_text += chunk["content"]
+                            elif chunk["type"] == "tool_call":
+                                fix_tool_calls.append(chunk)
                             elif chunk["type"] == "usage":
                                 self.stats["planner_tokens"]["prompt"] += chunk.get("prompt_tokens", 0)
                                 self.stats["planner_tokens"]["completion"] += chunk.get("completion_tokens", 0)
