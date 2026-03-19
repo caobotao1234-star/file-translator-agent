@@ -69,19 +69,25 @@ class TranslateWorker(QThread):
         self.target_lang = target_lang
 
     def _emit_token_usage(self):
-        """📘 从 pipeline 和 scan_agent 汇总 4 维 token 用量"""
+        """
+        📘 教学笔记：汇总 4 维 token 用量
+
+        token 来源：
+        - 翻译: pipeline.total_translate_tokens（所有翻译 Agent 的累计）
+        - 规划: scan_agent.stats["planner_tokens"]（Brain 分析+决策）
+        - 审校: scan_agent.stats["reviewer_tokens"] + layout_agent brain_tokens
+        - 生图: scan_agent.stats["image_gen_tokens"]
+
+        📘 注意：翻译 token 只从 pipeline 读取，不从 scan_stats 重复读取。
+        scan_agent 的翻译走的是同一个 pipeline，pipeline 已经累计了。
+        """
         pipeline = self.agent.pipeline
         translate_t = pipeline.total_translate_tokens
 
-        # 📘 planner/image_gen/reviewer 来自 ScanAgent（如果有的话）
-        # ScanAgent 是在 translate_file 内部临时创建的，
-        # 这里通过 agent 的属性获取（如果存在）
         planner_t = 0
         image_gen_t = 0
         reviewer_t = 0
 
-        # 📘 ScanAgent 的 stats 在 translate_file 返回后可能已经丢失，
-        # 所以我们在 agent 上缓存最新的 scan_stats
         scan_stats = getattr(self.agent, '_last_scan_stats', None)
         if scan_stats:
             planner_t = scan_stats.get("planner_tokens", {}).get("prompt", 0) + \
@@ -90,14 +96,10 @@ class TranslateWorker(QThread):
                            scan_stats.get("image_gen_tokens", {}).get("completion", 0)
             reviewer_t = scan_stats.get("reviewer_tokens", {}).get("prompt", 0) + \
                           scan_stats.get("reviewer_tokens", {}).get("completion", 0)
-            # 📘 scan_stats 中的 translate_tokens 也要加上
-            translate_t += scan_stats.get("translate_tokens", {}).get("prompt", 0) + \
-                           scan_stats.get("translate_tokens", {}).get("completion", 0)
 
         # 📘 LayoutAgent 的 stats（普通 PDF 排版修正）
         layout_stats = getattr(self.agent, '_last_layout_stats', None)
         if layout_stats:
-            # 📘 Layout Agent 的 brain_tokens 计入 reviewer（排版审校角色）
             reviewer_t += layout_stats.get("brain_tokens", {}).get("prompt", 0) + \
                            layout_stats.get("brain_tokens", {}).get("completion", 0)
 
@@ -109,13 +111,23 @@ class TranslateWorker(QThread):
                 break
             try:
                 self.log_signal.emit(f"开始翻译: {os.path.basename(filepath)}", "info")
+
+                # 📘 教学笔记：实时 token 更新
+                # ScanAgent 每次 token 变化时通过回调链更新 _last_scan_stats，
+                # 我们在 agent 上挂一个 GUI 回调，每次 stats 更新时自动 emit。
+                worker_ref = self
+                self.agent._gui_token_callback = lambda: worker_ref._emit_token_usage()
+
                 output = self.agent.translate_file(
                     filepath,
                     target_lang=self.target_lang,
                 )
+                self.agent._gui_token_callback = None
                 self._emit_token_usage()
                 self.finished_signal.emit(output)
             except Exception as e:
+                if hasattr(self.agent, '_gui_token_callback'):
+                    self.agent._gui_token_callback = None
                 self._emit_token_usage()
                 self.error_signal.emit(f"{os.path.basename(filepath)}: {e}")
 
@@ -979,8 +991,11 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(completed)
 
     def _on_token_update(self, planner_t: int, translate_t: int, image_gen_t: int, reviewer_t: int):
-        """📘 v5: 4 维 Token 用量显示"""
+        """📘 v5: 4 维 Token 用量显示（实时更新）"""
         total = planner_t + translate_t + image_gen_t + reviewer_t
+        if total == 0:
+            self.token_label.setText("Token 用量: —")
+            return
         parts = []
         if translate_t:
             parts.append(f"翻译 {translate_t:,}")
@@ -990,8 +1005,18 @@ class MainWindow(QMainWindow):
             parts.append(f"审校 {reviewer_t:,}")
         if image_gen_t:
             parts.append(f"生图 {image_gen_t:,}")
-        detail = " + ".join(parts) if parts else "—"
-        self.token_label.setText(f"Token: {total:,}  ({detail})")
+        detail = " | ".join(parts)
+        self.token_label.setText(f"🔢 Token: {total:,}  ({detail})")
+        # 📘 tooltip 显示详细分项
+        self.token_label.setToolTip(
+            f"Token 用量明细:\n"
+            f"  翻译模型: {translate_t:,}\n"
+            f"  规划者:   {planner_t:,}\n"
+            f"  审校:     {reviewer_t:,}\n"
+            f"  图片生成: {image_gen_t:,}\n"
+            f"  ─────────────\n"
+            f"  总计:     {total:,}"
+        )
 
     def _on_all_done(self):
         self._set_running(False)

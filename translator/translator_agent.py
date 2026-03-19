@@ -168,6 +168,16 @@ class TranslatorAgent:
                     print(f"[🤖 Agent 模式] 使用 Agent Brain 处理扫描件...", flush=True)
                     try:
                         from translator.scan_agent import ScanAgent
+
+                        # 📘 token 更新回调：ScanAgent 每次 token 变化时
+                        # 实时更新 _last_scan_stats，供 GUI worker 读取
+                        def _on_scan_token_update(agent):
+                            self._last_scan_stats = agent.stats
+                            # 📘 通知 GUI 刷新 token 显示
+                            cb = getattr(self, '_gui_token_callback', None)
+                            if cb:
+                                cb()
+
                         scan_agent = ScanAgent(
                             brain_engine=self.router.get("agent_brain"),
                             translate_pipeline=self.pipeline,
@@ -177,13 +187,14 @@ class TranslatorAgent:
                                 if "image_gen" in self.router.engines
                                 else None
                             ),
+                            on_token_update=_on_scan_token_update,
                         )
                         result = scan_agent.process_scan_pdf(
                             filepath=input_path,
                             output_path=output_path,
                             target_lang=target_lang,
                         )
-                        # 📘 缓存 ScanAgent 的 stats 供 GUI token 统计使用
+                        # 📘 最终缓存 ScanAgent 的 stats
                         self._last_scan_stats = scan_agent.stats
                         return result["output_path"]
                     except Exception as e:

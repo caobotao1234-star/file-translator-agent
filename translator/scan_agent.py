@@ -179,6 +179,7 @@ class ScanAgent:
         image_gen_engine=None,
         max_tool_calls: int = 10,
         max_review_retries: int = 3,
+        on_token_update: Callable[["ScanAgent"], None] = None,
     ):
         """
         📘 参数说明：
@@ -188,6 +189,7 @@ class ScanAgent:
         - image_gen_engine: 图片生成模型引擎（可选，如 gemini-3-pro-image-preview）
         - max_tool_calls: 单页最大工具调用次数（防止无限循环）
         - max_review_retries: 自我审查最大重试次数
+        - on_token_update: 每次 token 用量变化时的回调（供 GUI 实时更新）
         """
         self.brain_engine = brain_engine
         self.translate_pipeline = translate_pipeline
@@ -195,6 +197,7 @@ class ScanAgent:
         self.image_gen_engine = image_gen_engine
         self.max_tool_calls = max_tool_calls
         self.max_review_retries = max_review_retries
+        self.on_token_update = on_token_update
 
         # 📘 统计信息（v5: 4 个维度 — planner/translate/image_gen/reviewer）
         # planner = Agent Brain 的 token（分析+决策+审查）
@@ -391,11 +394,7 @@ class ScanAgent:
 
         # ── 5. 统计 ──
         self.stats["total_time_seconds"] = round(time.time() - start_time, 1)
-
-        # 📘 从 TranslatePipeline 收集翻译模型的 token 用量
-        if self.translate_pipeline:
-            self.stats["translate_tokens"]["prompt"] += self.translate_pipeline.total_translate_tokens
-            # 📘 pipeline 只暴露 total，无法拆分 prompt/completion，全计入 prompt
+        self._notify_token_update()
 
         self._emit_event(on_event, "complete", {
             "progress_pct": 100,
@@ -428,6 +427,14 @@ class ScanAgent:
                 on_event(AgentEvent(type=event_type, data=data))
             except Exception as e:
                 logger.debug(f"事件发射失败: {e}")
+
+    def _notify_token_update(self):
+        """📘 通知 GUI 更新 token 用量（实时刷新）"""
+        if self.on_token_update:
+            try:
+                self.on_token_update(self)
+            except Exception:
+                pass
 
     def _process_single_page(
         self,
@@ -516,6 +523,7 @@ class ScanAgent:
                     elif chunk["type"] == "usage":
                         self.stats["planner_tokens"]["prompt"] += chunk.get("prompt_tokens", 0)
                         self.stats["planner_tokens"]["completion"] += chunk.get("completion_tokens", 0)
+                        self._notify_token_update()
             except Exception as e:
                 logger.error(f"Agent Brain 调用失败: {e}")
                 logger.error(f"已收集的文本: {text_in_turn[:200] if text_in_turn else '(空)'}")
@@ -638,6 +646,10 @@ class ScanAgent:
                         "call_count": tool_call_count,
                     })
 
+                    # 📘 翻译工具执行后通知 token 更新（pipeline tokens 变化了）
+                    if tool_name == "translate_texts":
+                        self._notify_token_update()
+
                 continue  # 继续 ReAct 循环
 
             # 📘 情况2：Brain 返回了纯文本（最终结果）→ 解析并结束
@@ -662,6 +674,7 @@ class ScanAgent:
                 elif chunk["type"] == "usage":
                     self.stats["planner_tokens"]["prompt"] += chunk.get("prompt_tokens", 0)
                     self.stats["planner_tokens"]["completion"] += chunk.get("completion_tokens", 0)
+                    self._notify_token_update()
 
         # 📘 解析 Brain 输出的 JSON
         logger.info(f"第 {page_idx} 页: Brain 输出 {len(final_text)} 字符")
@@ -867,6 +880,7 @@ class ScanAgent:
                     elif chunk["type"] == "usage":
                         self.stats["reviewer_tokens"]["prompt"] += chunk.get("prompt_tokens", 0)
                         self.stats["reviewer_tokens"]["completion"] += chunk.get("completion_tokens", 0)
+                        self._notify_token_update()
             except Exception as e:
                 logger.warning(f"第 {page_idx} 页审查调用失败: {e}")
                 # 📘 审查失败不阻塞流程，标记并继续
