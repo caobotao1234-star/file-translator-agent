@@ -46,69 +46,27 @@ logger = get_logger("scan_agent")
 # 这是 Agent 的"灵魂"——告诉大脑它是谁、能做什么、该怎么做。
 # 好的 system prompt 是 Agent 质量的关键。
 SCAN_AGENT_SYSTEM_PROMPT = """\
-你是一个专业的文档分析和翻译 Agent。你的任务是分析扫描件文档图片，提取结构化内容，并完成翻译。
+你是文档翻译 Agent。分析扫描件图片，提取结构化内容并翻译。
 
-## 你的能力
-你可以调用以下工具：
-- ocr_extract_text: OCR 文字识别（返回文字内容和位置坐标）
-- cv_detect_layout: 表格线和图片区域检测（返回水平线、垂直线、图片区域）
-- translate_texts: 文本翻译（使用 doubao 模型翻译为目标语言）
-- generate_translated_image: 图片生成（可选，将页面区域重新绘制为目标语言版本）
+## 工具
+- ocr_extract_text: OCR 文字识别（返回文字和坐标）
+- cv_detect_layout: 表格线和图片区域检测
+- translate_texts: 文本翻译
+- generate_translated_image: 图片生成（可选，仅排版极复杂时使用）
 
-## 图片生成能力（如果可用）
-当你判断某些内容用图片生成方式能更好地保持原文的布局和视觉效果时，
-可以调用 generate_translated_image 工具。典型场景：
-- 排版极其复杂的证件、名片、海报
-- 包含大量装饰性文字和图形元素的页面
-- 文字与背景图片紧密融合的区域
+## 流程
+1. 观察图片，判断类型（表格/证件/纯文本/混合）
+2. 调用工具：有表格先 cv_detect_layout 再 ocr_extract_text，纯文本直接 ocr_extract_text
+3. 调用 translate_texts 翻译
+4. 输出 JSON（不要 markdown code block 包裹）
 
-调用流程（两步走）：
-1. 你先自己翻译出准确的译文（translated_text）
-2. 你再写一段详细的图片生成提示词（image_prompt），描述：
-   - 原文的布局结构（位置、大小、排列）
-   - 字体风格（大小、粗细、颜色）
-   - 需要保持的设计元素（边框、背景、logo）
-   - 将译文放在对应位置的具体指令
-3. 调用 generate_translated_image，传入译文和提示词
+⚠️ 重要：每个工具只需调用一次！OCR 和 CV 结果已缓存，重复调用浪费资源。
 
-注意：图片生成成本较高，只在你认为确实需要时才使用。
-大多数文档（表格、纯文本）用 OCR + 翻译 + Word 生成即可。
-
-## 工作流程
-1. 观察页面图片，判断文档类型（表格文档/证件/纯文本/混合等）
-2. 根据文档类型决定调用哪些工具：
-   - 有表格 → 先调 cv_detect_layout 检测表格线，再调 ocr_extract_text 识别文字
-   - 纯文本/证件 → 直接调 ocr_extract_text
-   - 有图片 → cv_detect_layout 会检测图片区域
-   - 排版极复杂 → 考虑用 generate_translated_image
-3. 综合工具结果和你的视觉理解，生成结构化数据
-4. 调用 translate_texts 翻译所有文本
-5. 输出最终的 JSON 结构化数据
-
-## 输出格式
-当你完成分析和翻译后，输出严格的 JSON（不要包裹在 markdown code block 中）：
+## 输出 JSON 格式
 {
   "page_type": "table_document" | "certificate" | "text_document" | "mixed",
   "elements": [
-    {
-      "type": "table",
-      "col_widths": [30, 40, 30],
-      "rows": [
-        {
-          "cells": [
-            {
-              "text": "原文内容",
-              "colspan": 1,
-              "rowspan": 1,
-              "bold": false,
-              "align": "center",
-              "borders": {"top": true, "bottom": true, "left": true, "right": false},
-              "vertical": false
-            }
-          ]
-        }
-      ]
-    },
+    {"type": "table", "col_widths": [30, 40, 30], "rows": [{"cells": [{"text": "原文", "colspan": 1, "rowspan": 1, "bold": false, "align": "center", "borders": {"top": true, "bottom": true, "left": true, "right": false}, "vertical": false}]}]},
     {"type": "paragraph", "text": "段落文字", "bold": false, "align": "left", "font_size": "normal"},
     {"type": "image_region", "image_index": 0, "description": "图片描述"}
   ],
@@ -118,41 +76,24 @@ SCAN_AGENT_SYSTEM_PROMPT = """\
   ]
 }
 
-## 重要规则
-- 表格的行列数必须与原文完全一致
-- 不要遗漏任何文字内容
-- col_widths 总和必须等于 100
-- 只在原文画了线的地方标 borders 为 true
-- key 命名规则：pg{页码}_e{元素索引}_r{行}_c{列}（表格）或 pg{页码}_e{元素索引}_para（段落）
-- 图片区域标记位置即可，不需要识别图片内容
+## 规则
+- 表格行列数必须与原文一致，col_widths 总和 = 100
+- 不要遗漏文字，只在原文有线处标 borders 为 true
 - 翻译目标语言：{{target_lang}}
-
-## 创建自定义工具
-如果你发现现有工具无法解决某个问题，可以调用 create_custom_tool 创建新工具。
-- 代码必须定义 run(params, context) 函数，返回 JSON 字符串
-- context 包含 page_images 等共享数据
-- 只能使用安全模块: json, re, math, string, collections, itertools 等
-- 创建后的工具立即可用，并会持久化保存供未来复用
 """
 
 # 📘 教学笔记：统一审查提示词（v5 — 内容+排版+翻译质量）
 # v5 架构中，审校职责统一由规划者管理。
 # 自我审查同时检查：结构完整性、翻译质量、排版合理性。
 SELF_REVIEW_PROMPT = """\
-请审查以下文档分析和翻译结果的质量。对比原始页面图片，检查：
-
-1. **文字提取完整性**：是否有遗漏的文字？OCR 结果是否完整？
-2. **翻译质量**：译文是否准确？是否有漏译、误译、语法错误？术语是否统一？
-3. **翻译覆盖率**：所有文字都翻译了吗？是否有原文残留？
-4. **结构正确性**：表格行列数对吗？合并单元格对吗？
-5. **边框准确性**：只在原文有线的地方标了 true 吗？
-6. **排版合理性**：译文长度是否合理？标题是否简洁？正文是否通顺？
+审查翻译结果，对比原始页面图片：
+1. 文字是否遗漏？2. 译文是否准确？3. 表格结构是否正确？
 
 当前结果：
 {result_json}
 
-如果结果质量合格，回复 JSON：{{"passed": true, "reason": ""}}
-如果有问题需要修正，回复 JSON：{{"passed": false, "reason": "具体问题描述", "fix_actions": ["需要重新OCR第X区域", "需要补充翻译", "需要修正译文"]}}
+合格回复：{{"passed": true, "reason": ""}}
+不合格回复：{{"passed": false, "reason": "具体问题", "fix_actions": ["修正建议"]}}
 """
 
 
@@ -177,8 +118,8 @@ class ScanAgent:
         translate_pipeline,
         format_engine,
         image_gen_engine=None,
-        max_tool_calls: int = 10,
-        max_review_retries: int = 3,
+        max_tool_calls: int = 5,
+        max_review_retries: int = 2,
         on_token_update: Callable[["ScanAgent"], None] = None,
     ):
         """
@@ -258,12 +199,24 @@ class ScanAgent:
 
         for i in range(num_pages):
             page = doc[i]
-            zoom = 200 / 72.0  # 200 DPI
-            mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat)
-            jpeg_bytes = pix.tobytes("jpeg", jpg_quality=88)
-            page_images.append(jpeg_bytes)
-            page_images_b64.append(base64.b64encode(jpeg_bytes).decode("utf-8"))
+            # 📘 教学笔记：双分辨率策略
+            # OCR 需要高分辨率（200 DPI）才能准确识别小字，
+            # 但 LLM 视觉分析只需要看清布局（150 DPI 足够）。
+            # 用高分辨率给 OCR/CV 工具，低分辨率给 Brain 看，节省 image tokens。
+
+            # 📘 高分辨率：给 OCR/CV 工具用
+            zoom_hi = 200 / 72.0
+            mat_hi = fitz.Matrix(zoom_hi, zoom_hi)
+            pix_hi = page.get_pixmap(matrix=mat_hi)
+            jpeg_hi = pix_hi.tobytes("jpeg", jpg_quality=88)
+            page_images.append(jpeg_hi)
+
+            # 📘 低分辨率：给 Brain 看（节省 ~40% image tokens）
+            zoom_lo = 150 / 72.0
+            mat_lo = fitz.Matrix(zoom_lo, zoom_lo)
+            pix_lo = page.get_pixmap(matrix=mat_lo)
+            jpeg_lo = pix_lo.tobytes("jpeg", jpg_quality=75)
+            page_images_b64.append(base64.b64encode(jpeg_lo).decode("utf-8"))
 
         doc.close()
         logger.info(f"PDF 渲染完成: {num_pages} 页")
@@ -463,6 +416,17 @@ class ScanAgent:
         # 📘 构建初始消息：system prompt + 页面图片
         system_prompt = SCAN_AGENT_SYSTEM_PROMPT.replace("{{target_lang}}", target_lang)
 
+        # 📘 教学笔记：预执行 OCR + CV，减少 ReAct 循环次数
+        # 之前 Brain 每页要调 2-4 次工具（OCR、CV），每次都要重发图片 + 对话历史，
+        # 导致 prompt tokens 爆炸。优化：先跑 OCR 和 CV，把结果直接塞进初始消息，
+        # Brain 只需要看结果 → 翻译 → 输出 JSON，最少只需 1-2 轮 ReAct。
+        ocr_result = self.tools["ocr_extract_text"].execute({"page_index": page_idx})
+        cv_result = self.tools["cv_detect_layout"].execute({"page_index": page_idx})
+
+        # 📘 统计预执行的工具调用
+        self.stats["tool_calls"]["ocr"] = self.stats["tool_calls"].get("ocr", 0) + 1
+        self.stats["tool_calls"]["cv"] = self.stats["tool_calls"].get("cv", 0) + 1
+
         messages = [
             {"role": "system", "content": system_prompt},
             {
@@ -478,7 +442,11 @@ class ScanAgent:
                         "type": "text",
                         "text": (
                             f"请分析这张文档图片（第 {page_idx} 页），"
-                            f"提取结构化内容并翻译为{target_lang}。"
+                            f"提取结构化内容并翻译为{target_lang}。\n\n"
+                            f"## 已有的 OCR 结果\n{ocr_result}\n\n"
+                            f"## 已有的 CV 布局检测结果\n{cv_result}\n\n"
+                            f"OCR 和 CV 已执行完毕，请直接使用上述结果。"
+                            f"如需翻译请调用 translate_texts，然后输出最终 JSON。"
                         ),
                     },
                 ],
@@ -486,22 +454,19 @@ class ScanAgent:
         ]
 
         # 📘 构建工具列表（给 Brain 的 tools 参数）
-        # WordWriterTool 不暴露给 Brain——Word 生成由 ScanAgent 统一调用
+        # 📘 教学笔记：精简工具列表
+        # OCR 和 CV 已预执行，Brain 通常只需要 translate_texts。
+        # 但保留 OCR/CV 以防 Brain 需要对特定区域重新识别。
         tool_schemas = [
             self.tools["ocr_extract_text"].get_api_format(),
             self.tools["cv_detect_layout"].get_api_format(),
             self.tools["translate_texts"].get_api_format(),
         ]
-        # 📘 图片生成工具（可选）：让 Brain 自主决定是否调用
+        # 📘 图片生成工具（可选）
         if "generate_translated_image" in self.tools:
             tool_schemas.append(
                 self.tools["generate_translated_image"].get_api_format()
             )
-        # 📘 动态工具：create_custom_tool + 已加载的动态工具
-        if "create_custom_tool" in self.tools:
-            tool_schemas.append(self.tools["create_custom_tool"].get_api_format())
-        if hasattr(self, 'dynamic_registry'):
-            tool_schemas.extend(self.dynamic_registry.get_tool_schemas())
 
         # 📘 ReAct 循环
         tool_call_count = 0
@@ -922,17 +887,42 @@ class ScanAgent:
                     flush=True,
                 )
 
-                # 📘 重新处理该页
+                # 📘 教学笔记：增量修正 vs 完全重来
+                # 之前审查未通过时完全重新处理该页（重发图片 + 重新 OCR + 重新翻译），
+                # 浪费大量 token。优化：把审查反馈发给 Brain，让它基于已有结果修正，
+                # 只需 1 次 Brain 调用（不含图片），而不是完整的 ReAct 循环。
                 try:
-                    page_structure, items, translations = self._process_single_page(
-                        page_idx=page_idx,
-                        page_image_b64=page_image_b64,
-                        target_lang=target_lang,
-                        on_event=on_event,
-                    )
+                    fix_messages = [
+                        {"role": "system", "content": SCAN_AGENT_SYSTEM_PROMPT.replace("{{target_lang}}", target_lang)},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"以下是第 {page_idx} 页的分析结果，审查发现问题：{reason}\n\n"
+                                f"当前结果：\n{json.dumps(page_structure, ensure_ascii=False, indent=2)}\n\n"
+                                f"请修正上述问题，输出完整的修正后 JSON。"
+                            ),
+                        },
+                    ]
+                    fix_text = ""
+                    for chunk in self.brain_engine.stream_chat(fix_messages, max_tokens=16384):
+                        if chunk["type"] == "text":
+                            fix_text += chunk["content"]
+                        elif chunk["type"] == "usage":
+                            self.stats["planner_tokens"]["prompt"] += chunk.get("prompt_tokens", 0)
+                            self.stats["planner_tokens"]["completion"] += chunk.get("completion_tokens", 0)
+                            self._notify_token_update()
+
+                    if fix_text:
+                        new_structure, new_items, new_translations = self._parse_brain_output(
+                            fix_text, page_idx
+                        )
+                        if new_structure.get("page_type") != "error":
+                            page_structure = new_structure
+                            items = new_items
+                            translations = new_translations
                 except Exception as e:
-                    logger.error(f"第 {page_idx} 页重试失败: {e}")
-                    reason = f"重试失败: {str(e)}"
+                    logger.error(f"第 {page_idx} 页增量修正失败: {e}")
+                    reason = f"修正失败: {str(e)}"
                     break
             else:
                 logger.warning(
