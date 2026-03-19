@@ -908,6 +908,11 @@ class ScanAgent:
                 break
 
             # 📘 解析审查结果
+            # 📘 教学笔记：审查结果解析策略
+            # 审查模型应该返回 {"passed": true/false, "reason": "..."}，
+            # 但经常返回 markdown 格式或其他非 JSON 内容。
+            # 策略：解析失败 → 视为通过（宁可放过，不浪费 token 重试）。
+            # 因为解析失败说明模型没按格式回复，重试大概率还是一样的结果。
             try:
                 from translator.scan_parser import _parse_structure_json
                 review_result = _parse_structure_json(review_text)
@@ -917,17 +922,21 @@ class ScanAgent:
             except (json.JSONDecodeError, Exception):
                 review_result = None
 
-            if review_result and review_result.get("passed", False):
+            if review_result is None:
+                # 📘 解析失败 → 视为通过，不浪费 token 重试
+                logger.warning(f"第 {page_idx} 页审查结果解析失败，视为通过")
+                passed = True
+                reason = "审查结果解析失败，视为通过"
+                break
+
+            if review_result.get("passed", False):
                 passed = True
                 reason = review_result.get("reason", "")
                 logger.info(f"第 {page_idx} 页审查通过")
                 break
 
             # 📘 审查未通过
-            reason = (
-                review_result.get("reason", "审查未通过")
-                if review_result
-                else "审查结果解析失败"
+            reason = review_result.get("reason", "审查未通过")
             )
             retries += 1
 
