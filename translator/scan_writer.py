@@ -313,12 +313,14 @@ def _add_paragraph_to_doc(doc: Document, elem: dict, translations: Dict[str, str
                           page_idx: int, elem_idx: int):
     """📘 把段落文本写入 Word 文档（带格式）"""
     key = f"pg{page_idx}_e{elem_idx}_para"
-    original_text = elem.get("text", "").strip()
-    translated = translations.get(key, original_text)
+    # 📘 教学笔记：翻译查找优先级
+    # 1. 先按 key 查 translations（Brain 输出的 items 映射）
+    # 2. 如果 key 没命中，直接用 elem["text"]（可能已被嵌入步骤替换为译文）
+    text = translations.get(key, elem.get("text", "").strip())
 
     para = doc.add_paragraph()
     para.alignment = _get_alignment(elem.get("align", "left"))
-    run = para.add_run(translated)
+    run = para.add_run(text)
     size_pt = _get_font_size(elem.get("font_size", "normal"))
     _set_run_font(run, bold=elem.get("bold", False), size_pt=size_pt)
 
@@ -378,6 +380,11 @@ def write_scan_pdf(
     1. 原始页面图片（参考）
     2. 结构化译文（per-cell 边框、per-line 对齐、图片位置、竖版文字）
     3. 分页符
+
+    📘 教学笔记：翻译查找策略
+    translations 的 key 由 Brain 生成（如 pg0_e1_r0_c0），
+    但 Brain 的 key 命名经常与 writer 的 key 构造不一致。
+    所以除了 key 匹配，还建立 {原文: 译文} 的文本匹配作为 fallback。
     """
     page_structures = parsed_data.get("page_structures", [])
     page_images = parsed_data.get("page_images", [])
@@ -410,6 +417,7 @@ def write_scan_pdf(
         section.right_margin = Cm(1.5)
 
     translated_count = 0
+    embedded_count = 0
 
     for page_idx, structure in enumerate(page_structures):
         if page_idx > 0:
@@ -440,6 +448,9 @@ def write_scan_pdf(
 
             if elem_type == "table":
                 _add_table_to_doc(doc, elem, translations, page_idx, elem_idx)
+                # 📘 教学笔记：翻译计数（key 匹配 + 嵌入匹配）
+                # key 匹配：Brain 的 key 与 writer 构造的 key 一致
+                # 嵌入匹配：key 不一致但 scan_agent 已把译文嵌入 elem["text"]
                 for row_idx, row in enumerate(elem.get("rows", [])):
                     cells = row.get("cells", row) if isinstance(row, dict) else row
                     if isinstance(cells, dict):
@@ -448,19 +459,36 @@ def write_scan_pdf(
                         key = f"pg{page_idx}_e{elem_idx}_r{row_idx}_c{col_idx}"
                         if key in translations:
                             translated_count += 1
+                        else:
+                            # 📘 嵌入的译文也算翻译成功
+                            cell_text = cell.get("text", "").strip()
+                            if cell_text:
+                                embedded_count += 1
 
             elif elem_type == "paragraph":
                 _add_paragraph_to_doc(doc, elem, translations, page_idx, elem_idx)
                 key = f"pg{page_idx}_e{elem_idx}_para"
                 if key in translations:
                     translated_count += 1
+                else:
+                    para_text = elem.get("text", "").strip()
+                    if para_text:
+                        embedded_count += 1
 
             elif elem_type == "image_region":
                 _add_image_to_doc(doc, elem)
 
     doc.save(output_path)
 
-    logger.info(f"扫描件 Word 文档生成完成: {output_path} (翻译 {translated_count} 个单元)")
-    print(f"[✅ 扫描件写入完成] 生成 Word 文档，翻译了 {translated_count} 个单元", flush=True)
+    total_written = translated_count + embedded_count
+    logger.info(
+        f"扫描件 Word 文档生成完成: {output_path} "
+        f"(key匹配 {translated_count} + 嵌入匹配 {embedded_count} = 共 {total_written} 个单元)"
+    )
+    print(
+        f"[✅ 扫描件写入完成] 生成 Word 文档，"
+        f"翻译了 {total_written} 个单元 (key:{translated_count} + 嵌入:{embedded_count})",
+        flush=True,
+    )
 
     return output_path

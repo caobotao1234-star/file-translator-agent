@@ -323,7 +323,61 @@ class ScanAgent:
                     "retries": 0,
                 })
 
-        # ── 4. 生成 Word 文档 ──
+        # ── 4. 嵌入翻译到 page_structures ──
+        # 📘 教学笔记：为什么要嵌入？
+        # Brain 生成的 key（如 pg0_e1_r0_c0）经常与 writer 构造的 key 不一致，
+        # 导致 writer 查不到翻译，输出原文。
+        # 解决方案：建立 {原文: 译文} 反向查找表，直接把译文写进 elements 里。
+        # 这样 writer 不需要做 key 匹配，直接读 element 里的文字就是译文。
+        text_to_translation = {}
+        for item in all_items:
+            key = item.get("key", "")
+            original = item.get("full_text", "").strip()
+            trans = all_translations.get(key, "")
+            if original and trans and original != trans:
+                text_to_translation[original] = trans
+
+        embedded_count = 0
+        for page_idx, structure in enumerate(all_page_structures):
+            for elem in structure.get("elements", []):
+                elem_type = elem.get("type", "")
+                if elem_type == "paragraph":
+                    orig = elem.get("text", "").strip()
+                    trans = text_to_translation.get(orig)
+                    if trans:
+                        elem["text"] = trans
+                        embedded_count += 1
+                elif elem_type == "table":
+                    for row in elem.get("rows", []):
+                        cells = row.get("cells", row) if isinstance(row, dict) else row
+                        if isinstance(cells, dict):
+                            cells = cells.get("cells", [])
+                        for cell in cells:
+                            # 📘 教学笔记：处理两种格式
+                            # Brain 可能用 "text" 字段或 "lines" 数组来存储单元格内容。
+                            # 两种都要检查并嵌入译文。
+                            cell_lines = cell.get("lines")
+                            if cell_lines and isinstance(cell_lines, list):
+                                orig = "\n".join(
+                                    l.get("text", "") for l in cell_lines
+                                ).strip()
+                                trans = text_to_translation.get(orig)
+                                if trans:
+                                    # 📘 替换 lines 为单个 text 字段
+                                    cell.pop("lines", None)
+                                    cell["text"] = trans
+                                    embedded_count += 1
+                            else:
+                                orig = cell.get("text", "").strip()
+                                trans = text_to_translation.get(orig)
+                                if trans:
+                                    cell["text"] = trans
+                                    embedded_count += 1
+
+        if embedded_count > 0:
+            logger.info(f"翻译嵌入: {embedded_count} 个元素已替换为译文")
+
+        # ── 5. 生成 Word 文档 ──
         self._emit_event(on_event, "generating", {
             "step": "生成",
             "progress_pct": 85,
@@ -345,7 +399,7 @@ class ScanAgent:
             logger.error(f"Word 生成异常: {e}")
             final_output_path = output_path
 
-        # ── 5. 统计 ──
+        # ── 6. 统计 ──
         self.stats["total_time_seconds"] = round(time.time() - start_time, 1)
         self._notify_token_update()
 
