@@ -73,6 +73,17 @@ class OCRTool(BaseTool):
         page_index = params["page_index"]
         page_images = self.context.get("page_images", [])
 
+        # 📘 教学笔记：page_index 自动修正
+        # Brain 经常传错 page_index（比如总是传 0），因为它不知道当前页码。
+        # context["current_page_index"] 由 ScanAgent 在每页处理前设置，
+        # 如果 Brain 传的值超出范围或与当前页不一致，自动修正。
+        current_idx = self.context.get("current_page_index")
+        if current_idx is not None and page_index != current_idx:
+            logger.debug(
+                f"OCR page_index 修正: Brain 传 {page_index} → 实际 {current_idx}"
+            )
+            page_index = current_idx
+
         if page_index < 0 or page_index >= len(page_images):
             return json.dumps(
                 {"error": f"page_index {page_index} 超出范围 [0, {len(page_images) - 1}]"},
@@ -139,6 +150,14 @@ class CVTool(BaseTool):
 
         page_index = params["page_index"]
         page_images = self.context.get("page_images", [])
+
+        # 📘 page_index 自动修正（同 OCRTool）
+        current_idx = self.context.get("current_page_index")
+        if current_idx is not None and page_index != current_idx:
+            logger.debug(
+                f"CV page_index 修正: Brain 传 {page_index} → 实际 {current_idx}"
+            )
+            page_index = current_idx
 
         if page_index < 0 or page_index >= len(page_images):
             return json.dumps(

@@ -436,6 +436,64 @@ def _parse_structure_json(response: str) -> Optional[dict]:
         logger.warning(f"JSON 解析失败（已尝试修复）: {e}")
         logger.debug(f"JSON 原文前 800 字符: {text[:800]}")
 
+    # 📘 策略5：截断 JSON 修复
+    # LLM 输出可能因 max_tokens 限制被截断，导致 JSON 不完整。
+    # 修复方法：从末尾向前找到最后一个完整的 value 结束位置，
+    # 然后补齐缺失的 ] 和 }。
+    truncated = _try_fix_truncated_json(fixed)
+    if truncated:
+        try:
+            result = json.loads(truncated)
+            if isinstance(result, dict):
+                logger.info("JSON 通过截断修复后解析成功")
+                return result
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def _try_fix_truncated_json(text: str) -> Optional[str]:
+    """
+    📘 教学笔记：截断 JSON 修复
+
+    LLM 输出被截断时，JSON 可能在任意位置断开：
+    - 字符串中间: {"text": "hello wor  → 找到最后完整的 key-value
+    - 对象中间: {"a": 1, "b":  → 删掉不完整的 key-value
+    - 数组中间: [1, 2, 3,  → 删掉尾部逗号
+
+    策略：从末尾逐字符回退，找到最后一个有效的 JSON 结束字符（} 或 ]），
+    然后计算缺失的括号数量并补齐。
+    """
+    if not text or not text.strip().startswith("{"):
+        return None
+
+    # 📘 从末尾向前找到最后一个 }, ], 或 " 后面跟着有效结构的位置
+    # 先尝试逐步截断末尾，直到找到一个可以通过补括号修复的位置
+    for cut in range(len(text) - 1, max(len(text) - 500, 0), -1):
+        candidate = text[:cut].rstrip().rstrip(",")
+        # 计算未闭合的括号
+        open_braces = candidate.count("{") - candidate.count("}")
+        open_brackets = candidate.count("[") - candidate.count("]")
+        # 检查是否在字符串内部（简单启发式：奇数个未转义引号）
+        if open_braces < 0 or open_brackets < 0:
+            continue
+        if open_braces == 0 and open_brackets == 0:
+            # 已经平衡了，直接尝试
+            try:
+                json.loads(candidate)
+                return candidate
+            except json.JSONDecodeError:
+                continue
+        # 补齐括号
+        suffix = "]" * open_brackets + "}" * open_braces
+        patched = candidate + suffix
+        try:
+            json.loads(patched)
+            return patched
+        except json.JSONDecodeError:
+            continue
+
     return None
 
 

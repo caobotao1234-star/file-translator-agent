@@ -266,7 +266,11 @@ class ScanAgent:
         logger.info(f"PDF 渲染完成: {num_pages} 页")
 
         # 📘 初始化工具（需要 page_images 作为上下文）
-        context = {"page_images": page_images}
+        # 📘 教学笔记：current_page_index 机制
+        # Brain 经常传错 page_index（比如总是传 0），因为它不知道当前处理的是第几页。
+        # 解决方案：context 中维护 current_page_index，工具优先使用它。
+        # 这样即使 Brain 传了错误的 page_index，工具也能用正确的页码。
+        context = {"page_images": page_images, "current_page_index": 0}
         self.tools = {
             "ocr_extract_text": OCRTool(context=context),
             "cv_detect_layout": CVTool(context=context),
@@ -306,6 +310,8 @@ class ScanAgent:
                 "total_pages": num_pages,
                 "progress_pct": progress_pct,
             })
+            # 📘 更新 context 中的当前页码，工具会优先使用这个值
+            context["current_page_index"] = page_idx
             print(
                 f"  [🤖 第 {page_idx + 1}/{num_pages} 页] Agent Brain 分析中...",
                 flush=True,
@@ -500,7 +506,9 @@ class ScanAgent:
             text_in_turn = ""
 
             try:
-                for chunk in self.brain_engine.stream_chat(messages, tools=tool_schemas):
+                for chunk in self.brain_engine.stream_chat(
+                    messages, tools=tool_schemas, max_tokens=16384,
+                ):
                     if chunk["type"] == "text":
                         text_in_turn += chunk["content"]
                     elif chunk["type"] == "tool_call":
@@ -648,7 +656,7 @@ class ScanAgent:
                 "role": "user",
                 "content": "工具调用次数已达上限。请立即根据已有信息输出最终的 JSON 结构化数据。",
             })
-            for chunk in self.brain_engine.stream_chat(messages):
+            for chunk in self.brain_engine.stream_chat(messages, max_tokens=16384):
                 if chunk["type"] == "text":
                     final_text += chunk["content"]
                 elif chunk["type"] == "usage":
@@ -853,7 +861,7 @@ class ScanAgent:
             # 📘 调用 Brain 审查
             review_text = ""
             try:
-                for chunk in self.brain_engine.stream_chat(messages):
+                for chunk in self.brain_engine.stream_chat(messages, max_tokens=4096):
                     if chunk["type"] == "text":
                         review_text += chunk["content"]
                     elif chunk["type"] == "usage":

@@ -185,7 +185,8 @@ class ExternalLLMEngine:
         return False
 
     def stream_chat(
-        self, messages: List[Dict], tools: List[Dict] = None
+        self, messages: List[Dict], tools: List[Dict] = None,
+        max_tokens: int = None,
     ) -> Generator[Dict, None, None]:
         """
         📘 带重试机制的流式对话（与 ArkLLMEngine.stream_chat 完全相同的接口）
@@ -206,7 +207,7 @@ class ExternalLLMEngine:
                         "content": f"\n[⏳ 第{attempt}次重试，等待{delay:.1f}秒...]\n",
                     }
                     time.sleep(delay)
-                yield from self._do_stream_chat(messages, tools)
+                yield from self._do_stream_chat(messages, tools, max_tokens=max_tokens)
                 return
             except LLMRetryError:
                 raise
@@ -222,7 +223,8 @@ class ExternalLLMEngine:
         )
 
     def _do_stream_chat(
-        self, messages: List[Dict], tools: List[Dict] = None
+        self, messages: List[Dict], tools: List[Dict] = None,
+        max_tokens: int = None,
     ) -> Generator[Dict, None, None]:
         """
         📘 实际执行一次流式 API 调用
@@ -243,6 +245,12 @@ class ExternalLLMEngine:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        # 📘 教学笔记：max_tokens 控制输出长度
+        # Brain 处理复杂表格页时可能输出 10000+ 字符的 JSON，
+        # 如果不设 max_tokens，某些模型会用默认值（如 4096）截断输出。
+        # ScanAgent 传 max_tokens=16384 确保大页面不被截断。
+        if max_tokens:
+            kwargs["max_tokens"] = max_tokens
         if tools:
             kwargs["tools"] = tools
             self.logger.trace(
