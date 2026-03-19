@@ -236,6 +236,41 @@ class TranslatorAgent:
             write_pdf(parsed_data, translations, output_path, self.format_engine,
                       source_path=input_path)
 
+            # 📘 Step 3.5: PDF 排版修正 Agent（翻译后自动检测溢出并修正）
+            # 只对普通 PDF（非扫描件）生效，扫描件由 ScanAgent 统一处理
+            if not self.pipeline.is_stopped:
+                try:
+                    from translator.layout_agent import PDFLayoutAgent
+
+                    brain_engine = (
+                        self.router.get("agent_brain")
+                        if "agent_brain" in self.router.engines
+                        else None
+                    )
+                    layout_agent = PDFLayoutAgent(
+                        brain_engine=brain_engine,
+                        translate_pipeline=self.pipeline,
+                        format_engine=self.format_engine,
+                    )
+                    updated_translations, layout_overrides = layout_agent.review_and_fix(
+                        source_path=input_path,
+                        parsed_data=parsed_data,
+                        translations=translations,
+                        target_lang=target_lang,
+                    )
+                    # 📘 如果有修正，重新写入 PDF
+                    if layout_overrides:
+                        logger.info(f"排版修正：{len(layout_overrides)} 个覆盖，重新写入 PDF")
+                        write_pdf(
+                            parsed_data, updated_translations, output_path,
+                            self.format_engine, source_path=input_path,
+                            layout_overrides=layout_overrides,
+                        )
+                    # 📘 缓存 layout agent stats 供 GUI token 统计
+                    self._last_layout_stats = layout_agent.stats
+                except Exception as e:
+                    logger.warning(f"PDF 排版修正失败（不影响翻译结果）: {e}")
+
         # 4. COM 增强：处理图表/文本框/SmartArt（仅 Word）
         if ext == ".docx" and self.com_enabled and not was_stopped:
             self._com_enhance(input_path, output_path, target_lang)

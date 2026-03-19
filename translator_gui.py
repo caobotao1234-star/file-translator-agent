@@ -94,6 +94,13 @@ class TranslateWorker(QThread):
             translate_t += scan_stats.get("translate_tokens", {}).get("prompt", 0) + \
                            scan_stats.get("translate_tokens", {}).get("completion", 0)
 
+        # 📘 LayoutAgent 的 stats（普通 PDF 排版修正）
+        layout_stats = getattr(self.agent, '_last_layout_stats', None)
+        if layout_stats:
+            # 📘 Layout Agent 的 brain_tokens 计入 reviewer（排版审校角色）
+            reviewer_t += layout_stats.get("brain_tokens", {}).get("prompt", 0) + \
+                           layout_stats.get("brain_tokens", {}).get("completion", 0)
+
         self.token_signal.emit(planner_t, translate_t, image_gen_t, reviewer_t)
 
     def run(self):
