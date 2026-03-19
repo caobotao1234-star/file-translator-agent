@@ -818,30 +818,28 @@ class ScanAgent:
                     if tool_name not in self.tools:
                         known_names = sorted(self.tools.keys(), key=len, reverse=True)
                         split_found = False
+                        # 📘 v7.3: N-way 拼接防御
+                        # Gemini 有时把 N 个工具名拼在一起（如 5 个工具名连成一串）。
+                        # 贪心匹配：从头开始找第一个匹配的已知工具名。
                         for known in known_names:
                             if tool_name.startswith(known) and len(tool_name) > len(known):
-                                remainder = tool_name[len(known):]
-                                if remainder in self.tools:
+                                logger.warning(
+                                    f"检测到 Gemini 拼接工具名: '{tool_name}' → "
+                                    f"提取第一个匹配: '{known}'"
+                                )
+                                tool_name = known
+                                split_found = True
+                                break
+                        if not split_found:
+                            for known in known_names:
+                                if tool_name.endswith(known) and len(tool_name) > len(known):
                                     logger.warning(
                                         f"检测到 Gemini 拼接工具名: '{tool_name}' → "
-                                        f"拆分为 '{known}' + '{remainder}'，使用第一个"
+                                        f"提取尾部匹配: '{known}'"
                                     )
                                     tool_name = known
                                     split_found = True
                                     break
-                        if not split_found:
-                            # 📘 也可能是反过来拼的，检查 endswith
-                            for known in known_names:
-                                if tool_name.endswith(known) and len(tool_name) > len(known):
-                                    prefix = tool_name[:-len(known)]
-                                    if prefix in self.tools:
-                                        logger.warning(
-                                            f"检测到 Gemini 拼接工具名: '{tool_name}' → "
-                                            f"拆分为 '{prefix}' + '{known}'，使用第一个"
-                                        )
-                                        tool_name = prefix
-                                        split_found = True
-                                        break
 
                     tool_call_count += 1
 
