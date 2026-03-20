@@ -63,12 +63,13 @@ class TranslateWorker(QThread):
     error_signal = pyqtSignal(str)          # 错误信息
 
     def __init__(self, agent: TranslatorAgent, files: list, target_lang: str,
-                 user_prompt: str = ""):
+                 user_prompt: str = "", preserve_background: bool = False):
         super().__init__()
         self.agent = agent
         self.files = files
         self.target_lang = target_lang
         self.user_prompt = user_prompt
+        self.preserve_background = preserve_background
 
     def _emit_token_usage(self):
         """
@@ -146,6 +147,7 @@ class TranslateWorker(QThread):
                     filepath,
                     target_lang=self.target_lang,
                     user_instruction=file_instruction,
+                    preserve_background=self.preserve_background,
                 )
                 self.agent._gui_token_callback = None
                 self._emit_token_usage()
@@ -766,6 +768,18 @@ class MainWindow(QMainWindow):
         log_row.addWidget(self.log_combo, 1)
         sg_layout.addLayout(log_row)
 
+        # 📘 PDF 保留背景选项
+        self.preserve_bg_check = QCheckBox("PDF 保留背景（在原图上覆盖译文，输出 PDF）")
+        self.preserve_bg_check.setToolTip(
+            "勾选后，扫描件 PDF 翻译时保留原文档的背景和视觉效果。\n"
+            "Brain 会在原始页面图片上直接擦除原文并写入译文，\n"
+            "最终输出 PDF 而非 Word。\n\n"
+            "适用场景：背景有花纹、水印、彩色底图的文档。\n"
+            "不勾选（默认）：提取结构化内容，生成干净的 Word 文档。"
+        )
+        self.preserve_bg_check.setChecked(False)
+        sg_layout.addWidget(self.preserve_bg_check)
+
         # 📘 代理设置
         proxy_row = QHBoxLayout()
         self.proxy_check = QCheckBox("代理")
@@ -1011,6 +1025,8 @@ class MainWindow(QMainWindow):
             self._append_log(f"规划者: {brain_model}", "info")
         if image_model:
             self._append_log(f"图片生成: {image_model}", "info")
+        if self.preserve_bg_check.isChecked():
+            self._append_log("PDF 保留背景: 开启（在原图上覆盖译文）", "info")
         self._append_log(f"文件数: {len(files)}", "info")
         user_prompt = self.user_prompt.toPlainText().strip()
         if user_prompt:
@@ -1041,7 +1057,8 @@ class MainWindow(QMainWindow):
             return
 
         self.worker = TranslateWorker(self.agent, files, target_lang,
-                                       user_prompt=self.user_prompt.toPlainText().strip())
+                                       user_prompt=self.user_prompt.toPlainText().strip(),
+                                       preserve_background=self.preserve_bg_check.isChecked())
 
         original_translate_document = self.agent.pipeline.translate_document
         worker_ref = self.worker

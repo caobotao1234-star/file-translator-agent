@@ -654,3 +654,313 @@ class CropImageTool(BaseTool):
                 {"error": f"裁剪失败: {type(e).__name__}: {str(e)}"},
                 ensure_ascii=False,
             )
+
+
+class OverlayTextTool(BaseTool):
+    """
+    📘 教学笔记：文字覆盖工具（保留背景模式）
+
+    在原始页面图片上：
+    1. 用背景色矩形覆盖原文字区域（擦除原文）
+    2. 在同位置绘制译文（匹配字号、颜色、对齐）
+
+    📘 为什么需要这个工具？
+    客户选择"保留背景"时，不能重建 Word 文档（会丢失背景）。
+    必须在原图上直接操作：擦掉原文 → 写上译文 → 合成 PDF。
+    Brain 决定每个文字区域的 bbox、译文、字号、颜色、对齐方式。
+
+    📘 技术方案：
+    - Pillow 的 ImageDraw 绘制矩形（擦除）和文字（写入）
+    - 支持中英文混排（需要合适的字体文件）
+    - 自动缩小字号以适应区域宽度
+    """
+
+    name = "overlay_translated_text"
+    description = (
+        "在原始页面图片上覆盖译文。先用背景色擦除原文区域，再在同位置绘制译文。"
+        "用于「保留背景」模式，直接在原图上翻译。"
+        "可一次处理多个文字区域（regions 数组）。"
+        "处理完成后，修改后的图片自动存入 context，供最终 PDF 合成使用。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "page_index": {
+                "type": "integer",
+                "description": "页码索引（从0开始）",
+            },
+            "regions": {
+                "type": "array",
+                "description": "要覆盖的文字区域列表",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "bbox_pct": {
+                            "type": "array",
+                            "items": {"type": "number"},
+                            "description": "区域百分比坐标 [left%, top%, right%, bottom%]",
+                        },
+                        "translated_text": {
+                            "type": "string",
+                            "description": "要写入的译文",
+                        },
+                        "font_size": {
+                            "type": "number",
+                            "description": "字号（pt），不填则自动计算",
+                        },
+                        "font_color": {
+                            "type": "string",
+                            "description": "字体颜色，如 '#000000'、'#FF0000'，默认黑色",
+                        },
+                        "bg_color": {
+                            "type": "string",
+                            "description": "背景覆盖色，如 '#FFFFFF'，默认白色。设为 'auto' 则自动检测区域周边颜色",
+                        },
+                        "align": {
+                            "type": "string",
+                            "enum": ["left", "center", "right"],
+                            "description": "对齐方式，默认 left",
+                        },
+                        "bold": {
+                            "type": "boolean",
+                            "description": "是否加粗，默认 false",
+                        },
+                    },
+                    "required": ["bbox_pct", "translated_text"],
+                },
+            },
+        },
+        "required": ["page_index", "regions"],
+    }
+
+    def __init__(self, context: Dict[str, Any] = None):
+        self.context = context or {}
+
+    def _detect_bg_color(self, pil_img, left, top, right, bottom):
+        """📘 自动检测区域周边的背景色（取边缘像素的中位数）"""
+        import numpy as np
+        w, h = pil_img.size
+        # 📘 采样区域边缘外扩 2px 的像素
+        margin = 3
+        pixels = []
+        for x in range(max(0, left - margin), min(w, right + margin)):
+            for y_off in [max(0, top - margin), min(h - 1, bottom + margin)]:
+                pixels.append(pil_img.getpixel((x, y_off))[:3])
+        for y in range(max(0, top - margin), min(h, bottom + margin)):
+            for x_off in [max(0, left - margin), min(w - 1, right + margin)]:
+                pixels.append(pil_img.getpixel((x_off, y))[:3])
+        if not pixels:
+            return (255, 255, 255)
+        arr = np.array(pixels)
+        median = tuple(int(v) for v in np.median(arr, axis=0))
+        return median
+
+    def _find_font(self, bold=False):
+        """📘 查找可用的中文字体文件"""
+        import platform
+        candidates = []
+        if platform.system() == "Windows":
+            font_dir = "C:/Windows/Fonts"
+            if bold:
+                candidates = [
+                    f"{font_dir}/msyhbd.ttc",  # 微软雅黑粗体
+                    f"{font_dir}/simhei.ttf",  # 黑体
+                    f"{font_dir}/msyh.ttc",    # 微软雅黑
+                ]
+            else:
+                candidates = [
+                    f"{font_dir}/msyh.ttc",    # 微软雅黑
+                    f"{font_dir}/simsun.ttc",  # 宋体
+                    f"{font_dir}/simhei.ttf",  # 黑体
+                ]
+        else:
+            candidates = [
+                "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return None
+
+    def execute(self, params: dict) -> str:
+        valid, msg = self.validate_params(params)
+        if not valid:
+            return json.dumps({"error": msg}, ensure_ascii=False)
+
+        page_index = params["page_index"]
+        regions = params.get("regions", [])
+
+        page_images = self.context.get("page_images", [])
+        current_idx = self.context.get("current_page_index")
+        if current_idx is not None and page_index != current_idx:
+            page_index = current_idx
+
+        if page_index < 0 or page_index >= len(page_images):
+            return json.dumps(
+                {"error": f"page_index {page_index} 超出范围"},
+                ensure_ascii=False,
+            )
+
+        if not regions:
+            return json.dumps({"error": "regions 不能为空"}, ensure_ascii=False)
+
+        try:
+            from PIL import Image as PILImage, ImageDraw, ImageFont
+
+            img_bytes = page_images[page_index]
+            pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+            draw = ImageDraw.Draw(pil_img)
+            w, h = pil_img.size
+
+            # 📘 预加载字体
+            font_path_normal = self._find_font(bold=False)
+            font_path_bold = self._find_font(bold=True)
+
+            success_count = 0
+            errors = []
+
+            for i, region in enumerate(regions):
+                try:
+                    bbox_pct = region["bbox_pct"]
+                    text = region["translated_text"]
+                    if not text or not bbox_pct or len(bbox_pct) != 4:
+                        continue
+
+                    # 📘 百分比 → 像素坐标
+                    left = int(w * bbox_pct[0] / 100)
+                    top = int(h * bbox_pct[1] / 100)
+                    right = int(w * bbox_pct[2] / 100)
+                    bottom = int(h * bbox_pct[3] / 100)
+
+                    left = max(0, min(left, w - 1))
+                    top = max(0, min(top, h - 1))
+                    right = max(left + 1, min(right, w))
+                    bottom = max(top + 1, min(bottom, h))
+
+                    region_w = right - left
+                    region_h = bottom - top
+                    if region_w < 5 or region_h < 5:
+                        continue
+
+                    # 📘 背景色
+                    bg_color_str = region.get("bg_color", "#FFFFFF")
+                    if bg_color_str == "auto":
+                        bg_color = self._detect_bg_color(pil_img, left, top, right, bottom)
+                    else:
+                        bg_color = tuple(int(bg_color_str.lstrip("#")[j:j+2], 16) for j in (0, 2, 4))
+
+                    # 📘 字体颜色
+                    font_color_str = region.get("font_color", "#000000")
+                    font_color = tuple(int(font_color_str.lstrip("#")[j:j+2], 16) for j in (0, 2, 4))
+
+                    # 📘 字号：指定 or 自动计算
+                    is_bold = region.get("bold", False)
+                    font_path = font_path_bold if is_bold else font_path_normal
+                    target_size = region.get("font_size")
+
+                    if target_size:
+                        # 📘 pt → px（按 200 DPI 换算）
+                        px_size = int(target_size * 200 / 72)
+                    else:
+                        # 📘 自动：根据区域高度和文字行数估算
+                        line_count = text.count("\n") + 1
+                        px_size = max(12, int(region_h / line_count * 0.85))
+
+                    # 📘 加载字体，自动缩小以适应区域宽度
+                    font = None
+                    if font_path:
+                        for attempt_size in range(px_size, 8, -2):
+                            try:
+                                font = ImageFont.truetype(font_path, attempt_size)
+                            except Exception:
+                                font = ImageFont.load_default()
+                                break
+                            # 📘 检查最长行是否超出区域宽度
+                            max_line_w = 0
+                            for line in text.split("\n"):
+                                bbox = font.getbbox(line)
+                                line_w = bbox[2] - bbox[0] if bbox else 0
+                                max_line_w = max(max_line_w, line_w)
+                            if max_line_w <= region_w - 4:
+                                break
+                        else:
+                            try:
+                                font = ImageFont.truetype(font_path, 10)
+                            except Exception:
+                                font = ImageFont.load_default()
+                    else:
+                        font = ImageFont.load_default()
+
+                    # 📘 Step 1: 用背景色覆盖原文区域
+                    draw.rectangle([left, top, right, bottom], fill=bg_color)
+
+                    # 📘 Step 2: 绘制译文
+                    align = region.get("align", "left")
+                    lines = text.split("\n")
+                    # 📘 计算总文字高度
+                    line_heights = []
+                    for line in lines:
+                        bbox = font.getbbox(line) if line else font.getbbox("A")
+                        lh = (bbox[3] - bbox[1]) if bbox else px_size
+                        line_heights.append(lh)
+                    total_text_h = sum(line_heights) + max(0, (len(lines) - 1) * 2)
+
+                    # 📘 垂直居中
+                    y_start = top + max(0, (region_h - total_text_h) // 2)
+                    y_cursor = y_start
+
+                    for line_idx, line in enumerate(lines):
+                        if not line.strip():
+                            y_cursor += line_heights[line_idx] + 2
+                            continue
+                        bbox = font.getbbox(line)
+                        line_w = (bbox[2] - bbox[0]) if bbox else 0
+
+                        if align == "center":
+                            x = left + (region_w - line_w) // 2
+                        elif align == "right":
+                            x = right - line_w - 2
+                        else:
+                            x = left + 2
+
+                        draw.text((x, y_cursor), line, fill=font_color, font=font)
+                        y_cursor += line_heights[line_idx] + 2
+
+                    success_count += 1
+
+                except Exception as e:
+                    errors.append(f"区域 {i}: {str(e)}")
+
+            # 📘 保存修改后的图片到 context
+            buf = io.BytesIO()
+            pil_img.save(buf, format="JPEG", quality=92)
+            overlay_bytes = buf.getvalue()
+
+            if "overlay_images" not in self.context:
+                self.context["overlay_images"] = {}
+            self.context["overlay_images"][page_index] = overlay_bytes
+
+            logger.info(
+                f"文字覆盖完成: 第 {page_index} 页, "
+                f"{success_count}/{len(regions)} 个区域成功"
+            )
+
+            result = {
+                "success": True,
+                "page_index": page_index,
+                "regions_processed": success_count,
+                "regions_total": len(regions),
+                "image_size_kb": round(len(overlay_bytes) / 1024, 1),
+            }
+            if errors:
+                result["errors"] = errors
+
+            return json.dumps(result, ensure_ascii=False)
+
+        except Exception as e:
+            logger.error(f"文字覆盖失败: {e}")
+            return json.dumps(
+                {"error": f"覆盖失败: {type(e).__name__}: {str(e)}"},
+                ensure_ascii=False,
+            )

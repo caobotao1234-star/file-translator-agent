@@ -204,6 +204,7 @@ class TranslatorAgent:
         output_path: str = None,
         target_lang: str = "英文",
         user_instruction: str = "",
+        preserve_background: bool = False,
     ) -> str:
         """
         翻译文档（支持 .docx、.pptx、.pdf）。
@@ -211,6 +212,9 @@ class TranslatorAgent:
         📘 v5 简化：去掉了独立审校和排版审校步骤。
         审校由规划者（Agent Brain）在扫描件处理中统一管理。
         普通文档（Word/PPT/PDF）直接翻译输出。
+
+        📘 preserve_background: 保留背景模式（仅扫描件 PDF 生效）
+        在原图上直接覆盖译文，输出 PDF 而非 Word。
         """
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"文件不存在: {input_path}")
@@ -240,11 +244,17 @@ class TranslatorAgent:
             is_scan = detect_scan_pdf(input_path)
             if is_scan:
                 base, _ = os.path.splitext(output_path)
-                output_path = base + ".docx"
+                # 📘 保留背景模式输出 PDF，否则输出 Word
+                if preserve_background:
+                    output_path = base + ".pdf"
+                else:
+                    output_path = base + ".docx"
 
                 # 📘 Agent Brain 模式：端到端处理扫描件
                 if "agent_brain" in self.router.engines:
                     print(f"[🤖 Agent 模式] 使用 Agent Brain 处理扫描件...", flush=True)
+                    if preserve_background:
+                        print(f"[📐 保留背景] 将在原图上覆盖译文，输出 PDF", flush=True)
                     try:
                         from translator.scan_agent import ScanAgent
 
@@ -267,6 +277,7 @@ class TranslatorAgent:
                                 else None
                             ),
                             on_token_update=_on_scan_token_update,
+                            preserve_background=preserve_background,
                         )
                         result = scan_agent.process_scan_pdf(
                             filepath=input_path,

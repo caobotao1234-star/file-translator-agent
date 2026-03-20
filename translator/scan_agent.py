@@ -39,7 +39,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.agent_events import AgentEvent
 from core.logger import get_logger
-from tools.scan_tools import OCRTool, CVTool, TranslationTool, WordWriterTool, ImageGenTool, CropImageTool
+from tools.scan_tools import OCRTool, CVTool, TranslationTool, WordWriterTool, ImageGenTool, CropImageTool, OverlayTextTool
 from tools.scan_tools_ext import GlossaryTool, ColorDetectTool, TextDirectionTool, ContextTranslationTool, PageComparisonTool
 from tools.dynamic_tools import DynamicToolRegistry, CreateCustomToolTool
 
@@ -254,6 +254,7 @@ class ScanAgent:
         max_tool_calls: int = 10,
         max_review_retries: int = 2,
         on_token_update: Callable[["ScanAgent"], None] = None,
+        preserve_background: bool = False,
     ):
         """
         📘 参数说明：
@@ -264,6 +265,7 @@ class ScanAgent:
         - max_tool_calls: 单页最大工具调用次数（防止无限循环）
         - max_review_retries: 自我审查最大重试次数
         - on_token_update: 每次 token 用量变化时的回调（供 GUI 实时更新）
+        - preserve_background: 保留背景模式（在原图上覆盖译文，输出 PDF）
         """
         self.brain_engine = brain_engine
         self.translate_pipeline = translate_pipeline
@@ -272,6 +274,7 @@ class ScanAgent:
         self.max_tool_calls = max_tool_calls
         self.max_review_retries = max_review_retries
         self.on_token_update = on_token_update
+        self.preserve_background = preserve_background
 
         # 📘 统计信息（v5: 4 个维度 — planner/translate/image_gen/reviewer）
         # planner = Agent Brain 的 token（分析+决策+审查）
@@ -397,6 +400,11 @@ class ScanAgent:
                 context=context,
             )
             logger.info("图片生成工具已注册，Agent Brain 可自主调用")
+
+        # 📘 保留背景模式：注册文字覆盖工具
+        if self.preserve_background:
+            self.tools["overlay_translated_text"] = OverlayTextTool(context=context)
+            logger.info("保留背景模式：文字覆盖工具已注册")
 
         # 📘 动态工具系统：加载已有 + 注册创建工具
         self.dynamic_registry = DynamicToolRegistry()
@@ -600,27 +608,44 @@ class ScanAgent:
             if image_embedded_count > 0:
                 logger.info(f"图片嵌入: {image_embedded_count} 个裁剪图片已嵌入结构")
 
-        # ── 5. 生成 Word 文档 ──
+        # ── 5. 生成文档 ──
         self._emit_event(on_event, "generating", {
             "step": "生成",
             "progress_pct": 85,
         })
-        print(f"[🤖 生成文档] 调用 Word Writer...", flush=True)
 
-        try:
-            writer_result = self.tools["generate_word_document"].execute({
-                "page_structures": all_page_structures,
-                "translations": all_translations,
-                "output_path": output_path,
-            })
-            writer_data = json.loads(writer_result)
-            if "error" in writer_data:
-                logger.error(f"Word 生成失败: {writer_data['error']}")
-                raise RuntimeError(writer_data["error"])
-            final_output_path = writer_data.get("output_path", output_path)
-        except Exception as e:
-            logger.error(f"Word 生成异常: {e}")
-            final_output_path = output_path
+        # 📘 保留背景模式：用 overlay 图片合成 PDF
+        if self.preserve_background:
+            print(f"[🤖 生成文档] 合成保留背景 PDF...", flush=True)
+            try:
+                from translator.scan_writer import write_overlay_pdf
+                overlay_images = context.get("overlay_images", {})
+                final_output_path = write_overlay_pdf(
+                    overlay_images=overlay_images,
+                    page_images=page_images,
+                    output_path=output_path,
+                    num_pages=num_pages,
+                )
+            except Exception as e:
+                logger.error(f"保留背景 PDF 生成异常: {e}")
+                final_output_path = output_path
+        else:
+            print(f"[🤖 生成文档] 调用 Word Writer...", flush=True)
+
+            try:
+                writer_result = self.tools["generate_word_document"].execute({
+                    "page_structures": all_page_structures,
+                    "translations": all_translations,
+                    "output_path": output_path,
+                })
+                writer_data = json.loads(writer_result)
+                if "error" in writer_data:
+                    logger.error(f"Word 生成失败: {writer_data['error']}")
+                    raise RuntimeError(writer_data["error"])
+                final_output_path = writer_data.get("output_path", output_path)
+            except Exception as e:
+                logger.error(f"Word 生成异常: {e}")
+                final_output_path = output_path
 
         # ── 6. 统计 ──
         self.stats["total_time_seconds"] = round(time.time() - start_time, 1)
@@ -704,6 +729,32 @@ class ScanAgent:
                 f"{user_instruction}\n"
             )
 
+        # 📘 保留背景模式：追加特殊指令
+        if self.preserve_background:
+            system_prompt += (
+                "\n\n## ⚠️ 保留背景模式（当前生效）\n"
+                "本次翻译要求保留原文档的背景和视觉效果。你必须使用 overlay_translated_text 工具，"
+                "在原始页面图片上直接覆盖译文，而不是输出 JSON 结构。\n\n"
+                "### 工作流程\n"
+                "1. 分析页面，识别所有文字区域的精确位置（bbox_pct）\n"
+                "2. 调用 translate_texts 翻译所有文字\n"
+                "3. 调用 overlay_translated_text，传入所有文字区域的 bbox_pct + 译文\n"
+                "   - bg_color 设为 'auto'（自动检测背景色）或指定颜色\n"
+                "   - font_color 匹配原文颜色\n"
+                "   - font_size 匹配原文大小（可不填，工具会自动计算）\n"
+                "   - align 匹配原文对齐方式\n"
+                "4. 非文字视觉元素（签名、盖章、logo）不要覆盖，保持原样\n\n"
+                "### 输出 JSON 格式（保留背景模式）\n"
+                "overlay 工具调用完成后，输出简化的 JSON：\n"
+                '{"page_type": "overlay", "overlay_completed": true, '
+                '"regions_count": N, "items": [...]}\n\n'
+                "### 关键注意事项\n"
+                "- 精确定位文字区域的 bbox_pct 是最关键的，宁可稍大不要太小\n"
+                "- 背景色检测用 'auto'，工具会自动采样边缘像素\n"
+                "- 如果原文有彩色文字，用 detect_colors 确认颜色后传给 overlay\n"
+                "- 不要覆盖非文字区域（签名、盖章、logo、照片等）\n"
+            )
+
         # 📘 教学笔记：预执行 OCR + CV，减少 ReAct 循环次数
         # 之前 Brain 每页要调 2-4 次工具（OCR、CV），每次都要重发图片 + 对话历史，
         # 导致 prompt tokens 爆炸。优化：先跑 OCR 和 CV，把结果直接塞进初始消息，
@@ -761,6 +812,11 @@ class ScanAgent:
         if "generate_translated_image" in self.tools:
             tool_schemas.append(
                 self.tools["generate_translated_image"].get_api_format()
+            )
+        # 📘 保留背景模式：文字覆盖工具
+        if "overlay_translated_text" in self.tools:
+            tool_schemas.append(
+                self.tools["overlay_translated_text"].get_api_format()
             )
         # 📘 自定义工具创建（Brain 遇到问题时可以自己写工具）
         if "create_custom_tool" in self.tools:
@@ -871,6 +927,7 @@ class ScanAgent:
                         "detect_colors": "color_detect",
                         "detect_text_direction": "text_direction",
                         "compare_page_layout": "page_compare",
+                        "overlay_translated_text": "overlay",
                     }.get(tool_name, tool_name)
                     self.stats["tool_calls"][stat_key] = (
                         self.stats["tool_calls"].get(stat_key, 0) + 1

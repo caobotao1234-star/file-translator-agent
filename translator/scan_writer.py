@@ -620,3 +620,63 @@ def write_scan_pdf(
     )
 
     return output_path
+
+
+def write_overlay_pdf(
+    overlay_images: Dict[int, bytes],
+    page_images: list,
+    output_path: str,
+    num_pages: int,
+):
+    """
+    📘 教学笔记：保留背景模式 — 图片合成 PDF
+
+    把处理后的页面图片（已覆盖译文）合成为 PDF 文件。
+    如果某页没有被 overlay 处理，使用原始页面图片。
+
+    📘 技术方案：
+    - 用 Pillow 把每页 JPEG 转为 PDF 页面
+    - 第一页用 save()，后续页用 append_images
+    - 输出路径强制 .pdf（保留背景 = 保留原始视觉效果）
+    """
+    from PIL import Image as PILImage
+
+    base, ext = os.path.splitext(output_path)
+    output_path = base + ".pdf"
+
+    logger.info(f"开始生成保留背景 PDF: {output_path}")
+    print(f"[📝 保留背景] 合成 PDF（{num_pages} 页）...", flush=True)
+
+    pdf_pages = []
+    for page_idx in range(num_pages):
+        # 📘 优先使用 overlay 处理后的图片，否则用原图
+        if page_idx in overlay_images:
+            img_bytes = overlay_images[page_idx]
+        elif page_idx < len(page_images) and page_images[page_idx]:
+            img_bytes = page_images[page_idx]
+        else:
+            logger.warning(f"第 {page_idx} 页无图片数据，跳过")
+            continue
+
+        pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+        pdf_pages.append(pil_img)
+
+    if not pdf_pages:
+        raise ValueError("没有可用的页面图片")
+
+    # 📘 Pillow save as PDF：第一页 save，其余 append
+    pdf_pages[0].save(
+        output_path,
+        "PDF",
+        resolution=200.0,
+        save_all=True,
+        append_images=pdf_pages[1:] if len(pdf_pages) > 1 else [],
+    )
+
+    logger.info(f"保留背景 PDF 生成完成: {output_path} ({len(pdf_pages)} 页)")
+    print(
+        f"[✅ 保留背景完成] 生成 PDF，{len(pdf_pages)} 页",
+        flush=True,
+    )
+
+    return output_path

@@ -365,6 +365,7 @@ class DynamicToolRegistry:
             "generate_word_document", "generate_translated_image",
             "crop_image_region", "manage_glossary", "detect_colors",
             "detect_text_direction", "translate_with_context", "compare_page_layout",
+            "overlay_translated_text",
         }
         if tool_name in builtin_names:
             raise ValueError(f"工具名 '{tool_name}' 与内置工具冲突，请换一个名字")
