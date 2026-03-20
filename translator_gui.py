@@ -624,7 +624,9 @@ class MainWindow(QMainWindow):
         left_scroll.setWidgetResizable(True)
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         left_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        left_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         left_inner = QWidget()
+        left_inner.setStyleSheet("background: transparent;")
         left_layout = QVBoxLayout(left_inner)
         left_layout.setContentsMargins(0, 0, 4, 0)
         left_layout.setSpacing(6)
@@ -797,6 +799,9 @@ class MainWindow(QMainWindow):
         pal.setColor(QPalette.ColorRole.PlaceholderText, QColor("#7f849c"))
         self.user_prompt.setPalette(pal)
         self.user_prompt.setPlaceholderText(
+            '例如: 人名 gaoshen 翻译成「高申」; 第三个文件公章用红字标注'
+        )
+        self.user_prompt.setToolTip(
             '输入针对文件的特殊翻译需求，例如：\n'
             '• 第一个文件的人名 gaoshen 翻译成「高申」\n'
             '• 第三个文件的公章不需要裁剪，用红字标注即可\n'
