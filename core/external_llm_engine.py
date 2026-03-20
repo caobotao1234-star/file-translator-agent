@@ -315,7 +315,14 @@ class ExternalLLMEngine:
 
         # 📘 代理配置：读取环境变量（与 __init__ 中的逻辑一致）
         proxy_url = os.getenv("HTTPS_PROXY", "") or os.getenv("HTTP_PROXY", "")
-        timeout_seconds = float(os.getenv("EXTERNAL_API_TIMEOUT", "180"))
+        # 📘 教学笔记：图片生成需要更长超时
+        # 普通文本 API 180 秒够用，但图片生成要：
+        # 1. 上传大尺寸原图 base64（几百 KB ~ 几 MB）
+        # 2. 等模型生成图片（比文本慢很多）
+        # 3. 下载生成的图片 base64
+        # 通过代理时更慢。默认 300 秒（5分钟），可通过环境变量覆盖。
+        timeout_seconds = float(os.getenv("IMAGE_GEN_TIMEOUT",
+                                          os.getenv("EXTERNAL_API_TIMEOUT", "300")))
 
         # ── 📘 Step 4: 发送请求（带重试） ──
         last_error = None
