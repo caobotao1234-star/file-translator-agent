@@ -519,19 +519,43 @@ class ImageGenTool(BaseTool):
             if images:
                 if "overlay_images" not in self.context:
                     self.context["overlay_images"] = {}
-                self.context["overlay_images"][page_index] = images[0]
+
+                # 📘 教学笔记：强制 resize 到原图尺寸
+                # 图片生成 LLM（如 Gemini）返回的图片尺寸可能与原图不同，
+                # 导致最终 PDF 页面忽大忽小。必须 resize 到原图的精确尺寸。
+                from PIL import Image as PILImage
+                original_img = PILImage.open(io.BytesIO(page_images[page_index]))
+                orig_w, orig_h = original_img.size
+
+                gen_img = PILImage.open(io.BytesIO(images[0]))
+                gen_w, gen_h = gen_img.size
+
+                if (gen_w, gen_h) != (orig_w, orig_h):
+                    logger.info(
+                        f"图片生成尺寸不匹配: 生成 {gen_w}x{gen_h} vs 原图 {orig_w}x{orig_h}，"
+                        f"resize 到原图尺寸"
+                    )
+                    gen_img = gen_img.resize((orig_w, orig_h), PILImage.LANCZOS)
+                    buf = io.BytesIO()
+                    gen_img.save(buf, format="JPEG", quality=92)
+                    final_bytes = buf.getvalue()
+                else:
+                    final_bytes = images[0]
+
+                self.context["overlay_images"][page_index] = final_bytes
 
                 logger.info(
                     f"图片生成成功: 第 {page_index} 页, "
-                    f"图片大小 {len(images[0]) / 1024:.1f}KB"
+                    f"图片大小 {len(final_bytes) / 1024:.1f}KB"
                 )
 
                 return json.dumps({
                     "success": True,
                     "page_index": page_index,
                     "image_generated": True,
-                    "image_size_kb": round(len(images[0]) / 1024, 1),
+                    "image_size_kb": round(len(final_bytes) / 1024, 1),
                     "image_count": len(images),
+                    "resized": (gen_w, gen_h) != (orig_w, orig_h),
                     "text_response": gen_result.get("text", "")[:200],
                 }, ensure_ascii=False)
             else:

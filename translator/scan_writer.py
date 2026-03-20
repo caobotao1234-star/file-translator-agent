@@ -659,6 +659,21 @@ def write_overlay_pdf(
             continue
 
         pil_img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+
+        # 📘 教学笔记：强制统一页面尺寸
+        # 图片生成 LLM 返回的图片尺寸可能与原图不同，
+        # 导致 PDF 页面忽大忽小。如果 overlay 图片尺寸与原图不一致，
+        # 强制 resize 到原图尺寸，确保所有页面大小统一。
+        if page_idx in overlay_images and page_idx < len(page_images) and page_images[page_idx]:
+            orig_img = PILImage.open(io.BytesIO(page_images[page_idx]))
+            orig_w, orig_h = orig_img.size
+            cur_w, cur_h = pil_img.size
+            if (cur_w, cur_h) != (orig_w, orig_h):
+                logger.info(
+                    f"第 {page_idx} 页 overlay 尺寸 {cur_w}x{cur_h} != 原图 {orig_w}x{orig_h}，resize"
+                )
+                pil_img = pil_img.resize((orig_w, orig_h), PILImage.LANCZOS)
+
         pdf_pages.append(pil_img)
 
     if not pdf_pages:
