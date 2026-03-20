@@ -900,37 +900,72 @@ class OverlayTextTool(BaseTool):
                         line_count = text.count("\n") + 1
                         px_size = max(12, int(region_h / line_count * 0.85))
 
-                    # 📘 加载字体，自动缩小以适应区域宽度
+                    # ── 📘 自动换行（Word Wrap）──
+                    # 📘 教学笔记：为什么需要自动换行？
+                    # Brain 传来的译文可能是一整段没有 \n 的长文本。
+                    # 如果不换行，字号会被缩到极小以适应区域宽度，导致文字几乎看不见。
+                    # 解决方案：先加载字体，然后按区域宽度自动折行，
+                    # 再根据折行后的行数调整字号使文字填满区域。
+                    def _wrap_text(text_to_wrap, font_obj, max_width):
+                        """按像素宽度自动折行，支持中英文混排"""
+                        wrapped_lines = []
+                        for paragraph in text_to_wrap.split("\n"):
+                            if not paragraph.strip():
+                                wrapped_lines.append("")
+                                continue
+                            current_line = ""
+                            for char in paragraph:
+                                test_line = current_line + char
+                                bbox = font_obj.getbbox(test_line)
+                                line_w = (bbox[2] - bbox[0]) if bbox else 0
+                                if line_w > max_width - 4 and current_line:
+                                    wrapped_lines.append(current_line)
+                                    current_line = char
+                                else:
+                                    current_line = test_line
+                            if current_line:
+                                wrapped_lines.append(current_line)
+                        return wrapped_lines
+
+                    # 📘 加载字体 → 自动换行 → 如果行数太多则缩小字号重试
                     font = None
+                    wrapped_lines = []
+                    usable_w = region_w - 4  # 📘 左右各留 2px 边距
+
                     if font_path:
+                        # 📘 从估算字号开始，逐步缩小直到文字能装进区域
                         for attempt_size in range(px_size, 8, -2):
                             try:
                                 font = ImageFont.truetype(font_path, attempt_size)
                             except Exception:
                                 font = ImageFont.load_default()
                                 break
-                            # 📘 检查最长行是否超出区域宽度
-                            max_line_w = 0
-                            for line in text.split("\n"):
-                                bbox = font.getbbox(line)
-                                line_w = bbox[2] - bbox[0] if bbox else 0
-                                max_line_w = max(max_line_w, line_w)
-                            if max_line_w <= region_w - 4:
+                            wrapped_lines = _wrap_text(text, font, usable_w)
+                            # 📘 计算折行后的总高度
+                            total_h = 0
+                            for wl in wrapped_lines:
+                                bbox = font.getbbox(wl) if wl else font.getbbox("A")
+                                total_h += (bbox[3] - bbox[1]) if bbox else attempt_size
+                            total_h += max(0, (len(wrapped_lines) - 1) * 2)
+                            if total_h <= region_h - 4:
                                 break
                         else:
                             try:
                                 font = ImageFont.truetype(font_path, 10)
+                                wrapped_lines = _wrap_text(text, font, usable_w)
                             except Exception:
                                 font = ImageFont.load_default()
+                                wrapped_lines = text.split("\n")
                     else:
                         font = ImageFont.load_default()
+                        wrapped_lines = text.split("\n")
 
                     # 📘 Step 1: 用背景色覆盖原文区域
                     draw.rectangle([left, top, right, bottom], fill=bg_color)
 
-                    # 📘 Step 2: 绘制译文
+                    # 📘 Step 2: 绘制译文（使用自动换行后的 wrapped_lines）
                     align = region.get("align", "left")
-                    lines = text.split("\n")
+                    lines = wrapped_lines
                     # 📘 计算总文字高度
                     line_heights = []
                     for line in lines:
