@@ -305,6 +305,7 @@ class ScanAgent:
         output_path: str,
         target_lang: str = "英文",
         user_instruction: str = "",
+        page_range: set = None,
         on_event: Callable[[AgentEvent], None] = None,
     ) -> Dict[str, Any]:
         """
@@ -316,6 +317,9 @@ class ScanAgent:
         3. 每页完成后自我审查（_self_review）
         4. 汇总所有页面结果
         5. 调用 WordWriterTool 生成 .docx
+
+        📘 page_range: 要翻译的页码集合（0-based），None/空 = 全部翻译。
+        不在范围内的页面保留原图（保留背景模式）或输出空白页（Word 模式）。
 
         📘 与 v7.1 parse_scan_pdf 的区别：
         v7.1 返回 parsed_data，需要外部再调翻译和写入。
@@ -330,6 +334,10 @@ class ScanAgent:
         if user_instruction:
             logger.info(f"客户特殊需求: {user_instruction[:200]}")
             print(f"[💬 客户需求] {user_instruction[:100]}{'...' if len(user_instruction) > 100 else ''}", flush=True)
+        if page_range:
+            display_pages = sorted(p + 1 for p in page_range)
+            logger.info(f"页码范围: {display_pages}")
+            print(f"[📄 页码范围] 仅翻译第 {display_pages} 页", flush=True)
 
         doc = fitz.open(filepath)
         num_pages = len(doc)
@@ -431,6 +439,24 @@ class ScanAgent:
             })
             # 📘 更新 context 中的当前页码，工具会优先使用这个值
             context["current_page_index"] = page_idx
+
+            # 📘 页码过滤：不在范围内的页面跳过翻译
+            if page_range and page_idx not in page_range:
+                print(
+                    f"  [⏭️ 第 {page_idx + 1}/{num_pages} 页] 不在翻译范围内，跳过",
+                    flush=True,
+                )
+                # 📘 保留背景模式下，跳过的页面保留原图（不处理）
+                # Word 模式下，跳过的页面输出原始图片作为参考
+                all_page_structures.append({"page_type": "skipped", "elements": []})
+                self.stats["review_results"].append({
+                    "page": page_idx,
+                    "passed": True,
+                    "reason": "跳过（不在翻译范围内）",
+                    "retries": 0,
+                })
+                continue
+
             print(
                 f"  [🤖 第 {page_idx + 1}/{num_pages} 页] Agent Brain 分析中...",
                 flush=True,

@@ -37,6 +37,44 @@ logger = get_logger("translator_agent")
 OUTPUT_DIR = "output"
 
 
+def parse_page_range(text: str) -> set:
+    """
+    📘 教学笔记：解析页码范围字符串
+
+    支持格式（跟打印机一样直觉）：
+    - "1,3,5"     → {0, 2, 4}  （用户输入从1开始，内部从0开始）
+    - "1-3,7"     → {0, 1, 2, 6}
+    - "2-5,8-10"  → {1, 2, 3, 4, 7, 8, 9}
+    - ""          → set()  （空 = 全部翻译）
+
+    📘 用户输入的是"第几页"（从1开始），内部转为 page_index（从0开始）。
+    """
+    if not text or not text.strip():
+        return set()
+
+    pages = set()
+    for part in text.replace(" ", "").replace("，", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                start, end = part.split("-", 1)
+                for p in range(int(start), int(end) + 1):
+                    if p >= 1:
+                        pages.add(p - 1)  # 📘 用户第1页 → index 0
+            except ValueError:
+                continue
+        else:
+            try:
+                p = int(part)
+                if p >= 1:
+                    pages.add(p - 1)
+            except ValueError:
+                continue
+    return pages
+
+
 class TranslatorAgent:
     """
     翻译 Agent v5：翻译模型 + 规划者 + 图片生成。
@@ -205,6 +243,7 @@ class TranslatorAgent:
         target_lang: str = "英文",
         user_instruction: str = "",
         preserve_background: bool = False,
+        page_range: set = None,
     ) -> str:
         """
         翻译文档（支持 .docx、.pptx、.pdf）。
@@ -214,7 +253,7 @@ class TranslatorAgent:
         普通文档（Word/PPT/PDF）直接翻译输出。
 
         📘 preserve_background: 保留背景模式（仅扫描件 PDF 生效）
-        在原图上直接覆盖译文，输出 PDF 而非 Word。
+        📘 page_range: 要翻译的页码集合（0-based index），None/空 = 全部翻译
         """
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"文件不存在: {input_path}")
@@ -284,6 +323,7 @@ class TranslatorAgent:
                             output_path=output_path,
                             target_lang=target_lang,
                             user_instruction=user_instruction,
+                            page_range=page_range,
                         )
                         # 📘 最终缓存 ScanAgent 的 stats
                         self._last_scan_stats = scan_agent.stats
@@ -305,6 +345,26 @@ class TranslatorAgent:
                          if i["type"] == "table_cell")
         total_count = para_count + cell_count
         print(f"[📄 解析完成] {para_count} 个文本段落 + {cell_count} 个表格单元格 = {total_count} 个翻译单元")
+
+        # 📘 页码过滤（普通 PDF / PPT）
+        # 扫描件 PDF 的页码过滤在 ScanAgent 内部处理，这里只处理非扫描件。
+        # items 的 key 格式为 pg{page_idx}_b{block_idx}，从 key 中提取 page_idx。
+        if page_range and ext == ".pdf" and not is_scan:
+            import re
+            original_count = len(parsed_data["items"])
+            filtered_items = []
+            for item in parsed_data["items"]:
+                key = item.get("key", "")
+                m = re.match(r"pg(\d+)_", key)
+                if m:
+                    pg = int(m.group(1))
+                    if pg in page_range:
+                        filtered_items.append(item)
+                else:
+                    filtered_items.append(item)  # 📘 无法判断页码的 item 保留
+            parsed_data["items"] = filtered_items
+            display_pages = sorted(p + 1 for p in page_range)
+            print(f"[📄 页码过滤] 仅翻译第 {display_pages} 页，{original_count} → {len(filtered_items)} 个翻译单元")
 
         # 2. 翻译
         def on_progress(completed, total):

@@ -33,7 +33,7 @@ from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent, QColor, QIcon, QPale
 from translator.format_engine import FormatEngine
 
 from config.settings import Config
-from translator.translator_agent import TranslatorAgent
+from translator.translator_agent import TranslatorAgent, parse_page_range
 from core.logger import TRACE
 
 
@@ -63,13 +63,15 @@ class TranslateWorker(QThread):
     error_signal = pyqtSignal(str)          # 错误信息
 
     def __init__(self, agent: TranslatorAgent, files: list, target_lang: str,
-                 user_prompt: str = "", preserve_background: bool = False):
+                 user_prompt: str = "", preserve_background: bool = False,
+                 page_range_text: str = ""):
         super().__init__()
         self.agent = agent
         self.files = files
         self.target_lang = target_lang
         self.user_prompt = user_prompt
         self.preserve_background = preserve_background
+        self.page_range_text = page_range_text
 
     def _emit_token_usage(self):
         """
@@ -143,11 +145,17 @@ class TranslateWorker(QThread):
                     os.path.basename(filepath), ""
                 )
 
+                # 📘 解析页码范围（仅 PDF 文件生效）
+                file_page_range = None
+                if self.page_range_text and filepath.lower().endswith(".pdf"):
+                    file_page_range = parse_page_range(self.page_range_text)
+
                 output = self.agent.translate_file(
                     filepath,
                     target_lang=self.target_lang,
                     user_instruction=file_instruction,
                     preserve_background=self.preserve_background,
+                    page_range=file_page_range,
                 )
                 self.agent._gui_token_callback = None
                 self._emit_token_usage()
@@ -780,6 +788,24 @@ class MainWindow(QMainWindow):
         self.preserve_bg_check.setChecked(False)
         sg_layout.addWidget(self.preserve_bg_check)
 
+        # 📘 PDF 页码范围
+        page_row = QHBoxLayout()
+        page_row.addWidget(QLabel("PDF 页码"))
+        self.page_range_input = QLineEdit()
+        self.page_range_input.setPlaceholderText("留空=全部，如 1,3,5-8")
+        self.page_range_input.setToolTip(
+            "指定 PDF 要翻译的页码范围（仅对 PDF 文件生效）。\n"
+            "格式跟打印机一样：\n"
+            "  1,3,5    → 翻译第1、3、5页\n"
+            "  2-5,8    → 翻译第2到5页和第8页\n"
+            "  1-3      → 翻译前3页\n"
+            "留空 = 翻译全部页面\n\n"
+            "也可以在「客户特殊需求」里用自然语言描述，\n"
+            "如「只翻译第2页和第5页」，Brain 会自动解析。"
+        )
+        page_row.addWidget(self.page_range_input, 1)
+        sg_layout.addLayout(page_row)
+
         # 📘 代理设置
         proxy_row = QHBoxLayout()
         self.proxy_check = QCheckBox("代理")
@@ -1027,6 +1053,9 @@ class MainWindow(QMainWindow):
             self._append_log(f"图片生成: {image_model}", "info")
         if self.preserve_bg_check.isChecked():
             self._append_log("PDF 保留背景: 开启（在原图上覆盖译文）", "info")
+        page_range_text = self.page_range_input.text().strip()
+        if page_range_text:
+            self._append_log(f"PDF 页码范围: {page_range_text}", "info")
         self._append_log(f"文件数: {len(files)}", "info")
         user_prompt = self.user_prompt.toPlainText().strip()
         if user_prompt:
@@ -1058,7 +1087,8 @@ class MainWindow(QMainWindow):
 
         self.worker = TranslateWorker(self.agent, files, target_lang,
                                        user_prompt=self.user_prompt.toPlainText().strip(),
-                                       preserve_background=self.preserve_bg_check.isChecked())
+                                       preserve_background=self.preserve_bg_check.isChecked(),
+                                       page_range_text=self.page_range_input.text().strip())
 
         original_translate_document = self.agent.pipeline.translate_document
         worker_ref = self.worker
