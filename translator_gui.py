@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QFormLayout, QCheckBox, QScrollArea,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMimeData
-from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent, QColor, QIcon
+from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent, QColor, QIcon, QPalette
 
 from translator.format_engine import FormatEngine
 
@@ -199,7 +199,7 @@ QWidget {
     font-size: 13px;
 }
 QGroupBox {
-    border: 1px solid #45475a;
+    border: 1px solid #585b70;
     border-radius: 8px;
     margin-top: 12px;
     padding: 12px 8px 8px 8px;
@@ -210,6 +210,16 @@ QGroupBox::title {
     subcontrol-origin: margin;
     left: 12px;
     padding: 0 6px;
+    color: #89b4fa;
+}
+QLabel {
+    color: #bac2de;
+    font-size: 13px;
+}
+QCheckBox {
+    color: #bac2de;
+    font-size: 13px;
+    spacing: 6px;
 }
 QPushButton {
     background-color: #89b4fa;
@@ -278,6 +288,13 @@ QTextEdit {
     padding: 8px;
     font-family: "Cascadia Code", "Consolas", monospace;
     font-size: 12px;
+    color: #cdd6f4;
+}
+QTextEdit[placeholderText] {
+    color: #cdd6f4;
+}
+QLineEdit {
+    color: #cdd6f4;
 }
 QProgressBar {
     background-color: #313244;
@@ -773,6 +790,12 @@ class MainWindow(QMainWindow):
         prompt_group = QGroupBox("💬 客户特殊需求（可选）")
         prompt_gl = QVBoxLayout(prompt_group)
         self.user_prompt = QTextEdit()
+        # 📘 教学笔记：暗色主题下 placeholder 颜色修复
+        # Qt 默认 placeholder 颜色太暗，在 #11111b 背景上几乎看不见。
+        # 通过 QPalette 显式设置 PlaceholderText 颜色为可见的灰色。
+        pal = self.user_prompt.palette()
+        pal.setColor(QPalette.ColorRole.PlaceholderText, QColor("#7f849c"))
+        self.user_prompt.setPalette(pal)
         self.user_prompt.setPlaceholderText(
             '输入针对文件的特殊翻译需求，例如：\n'
             '• 第一个文件的人名 gaoshen 翻译成「高申」\n'
@@ -780,8 +803,12 @@ class MainWindow(QMainWindow):
             '• 所有文件中 ABC Corp 统一翻译为「爱必思公司」\n\n'
             'Brain 会自动将需求分发到对应文件。'
         )
-        self.user_prompt.setMinimumHeight(60)
-        self.user_prompt.setMaximumHeight(80)
+        self.user_prompt.setMinimumHeight(80)
+        self.user_prompt.setMaximumHeight(120)
+        # 📘 用非等宽字体，中文更易读
+        self.user_prompt.setStyleSheet(
+            'font-family: "Microsoft YaHei", sans-serif; font-size: 12px;'
+        )
         prompt_gl.addWidget(self.user_prompt)
         left_layout.addWidget(prompt_group)
 
