@@ -377,25 +377,26 @@ class ImageGenTool(BaseTool):
     """
     📘 教学笔记：图片生成工具（Image Generation Tool）
 
-    Agent Brain 决定某些内容（如扫描件中的图表、证件、排版复杂的区域）
-    用图片生成方式处理时，调用此工具。
+    Agent Brain 调用此工具，让图片生成 LLM 在原始页面图片上直接重绘译文。
+    这是「保留背景」模式的核心工具——图片生成 LLM 能理解背景纹理、
+    匹配字体风格、处理渐变和阴影，远比 Pillow 画矩形+写字效果好。
 
-    📘 工作流程（两步走）：
-    1. Agent Brain 先自己输出：
-       - translated_text: 准确的译文
-       - image_prompt: 给生图模型的详细提示词（描述原文的布局、位置、结构）
-    2. 本工具调用生图模型（如 gemini-3-pro-image-preview），
-       将原始页面图片 + 提示词一起发送，生成翻译后的图片。
+    📘 工作流程：
+    1. Brain 分析页面，提取所有文字区域和译文
+    2. Brain 构造详细的 image_prompt，描述每个文字区域的位置和译文
+    3. 本工具把原始页面图片 + prompt 发给图片生成 LLM
+    4. 图片生成 LLM 返回重绘后的图片（背景完全保留，文字替换为译文）
+    5. 图片存入 context["overlay_images"]，供最终 PDF 合成
 
-    📘 目标：让译文和原文内容位置结构一致，且翻译准确。
-    Agent Brain 负责"想"（翻译+提示词），生图模型负责"画"。
+    📘 也可用于非保留背景模式：Brain 认为某些复杂排版用图片生成更好时自主调用。
     """
 
     name = "generate_translated_image"
     description = (
-        "用图片生成模型将页面中的指定区域重新绘制为目标语言版本。"
-        "需要提供原始页面图片、准确的译文、以及详细的图片生成提示词。"
-        "生图模型会根据提示词生成与原文布局结构一致的翻译图片。"
+        "用图片生成模型将页面中的文字替换为目标语言译文，保留原始背景和视觉效果。"
+        "图片生成 LLM 会在原图上直接重绘——保留所有背景纹理、花纹、水印、颜色，"
+        "只把文字内容替换为译文。生成的图片自动保存，供最终 PDF 合成。\n"
+        "适用场景：有花纹背景、水印、彩色底图的文档，或排版极复杂的页面。"
     )
     parameters = {
         "type": "object",
@@ -406,33 +407,28 @@ class ImageGenTool(BaseTool):
             },
             "translated_text": {
                 "type": "string",
-                "description": "准确的译文内容（Agent Brain 翻译后的文本）",
+                "description": "准确的译文内容（所有文字区域的译文，按位置标注）",
             },
             "image_prompt": {
                 "type": "string",
                 "description": (
-                    "给生图模型的详细提示词，描述：\n"
-                    "1. 原文的布局结构（表格/证件/图表等）\n"
-                    "2. 文字在图片中的位置和排列方式\n"
+                    "给图片生成模型的详细指令，必须包含：\n"
+                    "1. 每个文字区域在图片中的大致位置描述\n"
+                    "2. 对应的译文内容\n"
                     "3. 字体大小、粗细、颜色等视觉要求\n"
-                    "4. 需要保持的设计元素（边框、背景色、logo 等）\n"
-                    "5. 将 translated_text 放在对应位置的指令"
+                    "4. 明确指出哪些区域不要修改（签名、盖章、logo 等）\n"
+                    "5. 强调：保留所有背景元素，只替换文字"
                 ),
             },
             "target_lang": {
                 "type": "string",
-                "description": "目标语言，如'英文'、'日文'",
+                "description": "目标语言，如'中文'、'英文'、'日文'",
             },
         },
         "required": ["page_index", "translated_text", "image_prompt", "target_lang"],
     }
 
     def __init__(self, image_gen_engine=None, context: Dict[str, Any] = None):
-        """
-        📘 参数：
-        - image_gen_engine: 图片生成模型引擎（ExternalLLMEngine 实例）
-        - context: 包含 page_images（每页 JPEG bytes）
-        """
         self.image_gen_engine = image_gen_engine
         self.context = context or {}
 
@@ -453,6 +449,11 @@ class ImageGenTool(BaseTool):
         target_lang = params["target_lang"]
 
         page_images = self.context.get("page_images", [])
+        # 📘 page_index 自动修正
+        current_idx = self.context.get("current_page_index")
+        if current_idx is not None and page_index != current_idx:
+            page_index = current_idx
+
         if page_index < 0 or page_index >= len(page_images):
             return json.dumps(
                 {"error": f"page_index {page_index} 超出范围 [0, {len(page_images) - 1}]"},
@@ -462,22 +463,22 @@ class ImageGenTool(BaseTool):
         try:
             import base64
 
-            # 📘 构建生图请求：原始页面图片 + 详细提示词
+            # 📘 构建图片生成请求
             img_b64 = base64.b64encode(page_images[page_index]).decode("utf-8")
 
-            # 📘 教学笔记：组合提示词
-            # Agent Brain 已经输出了准确的译文和布局描述，
-            # 这里把它们组合成一个完整的生图指令。
             full_prompt = (
-                f"请根据以下要求，将这张文档图片中的文字替换为{target_lang}译文，"
-                f"保持原文的布局、位置、结构、字体风格完全一致。\n\n"
-                f"## 译文内容\n{translated_text}\n\n"
-                f"## 布局和样式要求\n{image_prompt}\n\n"
-                f"## 关键规则\n"
-                f"- 译文必须放在与原文完全相同的位置\n"
-                f"- 保持原文的字体大小比例、粗细、颜色\n"
-                f"- 保持所有非文字元素（边框、背景、logo、图片）不变\n"
-                f"- 如果空间不够，适当缩小字号但保持可读性"
+                f"You are a professional document translator. Your task is to modify this document image "
+                f"by replacing ALL text with the {target_lang} translation below, while keeping EVERYTHING "
+                f"else EXACTLY the same - background, colors, textures, watermarks, borders, logos, "
+                f"stamps, signatures, photos, and all visual elements must be perfectly preserved.\n\n"
+                f"## Translated text to place on the image\n{translated_text}\n\n"
+                f"## Layout and style instructions\n{image_prompt}\n\n"
+                f"## Critical rules\n"
+                f"- The background must be IDENTICAL to the original - no white patches, no color changes\n"
+                f"- Text position, size ratio, weight, and color must match the original\n"
+                f"- Do NOT modify any non-text elements (signatures, stamps, logos, photos, barcodes)\n"
+                f"- If space is tight, slightly reduce font size but keep readability\n"
+                f"- Output a complete document image with the same dimensions as the input"
             )
 
             messages = [
@@ -495,28 +496,57 @@ class ImageGenTool(BaseTool):
                 },
             ]
 
-            # 📘 调用生图模型
-            response_text = ""
-            for chunk in self.image_gen_engine.stream_chat(messages):
-                if chunk["type"] == "text":
-                    response_text += chunk["content"]
+            # 📘 使用非流式调用（图片数据不适合流式传输）
+            if hasattr(self.image_gen_engine, 'generate_image'):
+                gen_result = self.image_gen_engine.generate_image(messages)
+            else:
+                # 📘 fallback: 用流式接口（可能丢失图片数据）
+                response_text = ""
+                for chunk in self.image_gen_engine.stream_chat(messages):
+                    if chunk["type"] == "text":
+                        response_text += chunk["content"]
+                gen_result = {"text": response_text, "images": [], "usage": None}
 
-            # 📘 检查响应中是否包含生成的图片（base64）
-            # Gemini image generation 返回的图片通常在 inline_data 中
-            # 通过 OpenAI 兼容接口可能以 base64 文本形式返回
-            result = {
-                "success": True,
-                "page_index": page_index,
-                "translated_text": translated_text,
-                "response": response_text[:500] if response_text else "（无文本响应）",
-            }
+            # 📘 统计 token
+            if gen_result.get("usage"):
+                usage = gen_result["usage"]
+                # 📘 token 统计由 scan_agent 在外层处理
+                self.context.setdefault("_last_image_gen_usage", {})
+                self.context["_last_image_gen_usage"] = usage
 
-            logger.info(
-                f"图片生成完成: 第 {page_index} 页, "
-                f"译文长度={len(translated_text)}, "
-                f"提示词长度={len(image_prompt)}"
-            )
-            return json.dumps(result, ensure_ascii=False)
+            # 📘 保存生成的图片到 context
+            images = gen_result.get("images", [])
+            if images:
+                if "overlay_images" not in self.context:
+                    self.context["overlay_images"] = {}
+                self.context["overlay_images"][page_index] = images[0]
+
+                logger.info(
+                    f"图片生成成功: 第 {page_index} 页, "
+                    f"图片大小 {len(images[0]) / 1024:.1f}KB"
+                )
+
+                return json.dumps({
+                    "success": True,
+                    "page_index": page_index,
+                    "image_generated": True,
+                    "image_size_kb": round(len(images[0]) / 1024, 1),
+                    "image_count": len(images),
+                    "text_response": gen_result.get("text", "")[:200],
+                }, ensure_ascii=False)
+            else:
+                # 📘 图片生成 LLM 没有返回图片（可能只返回了文本）
+                logger.warning(
+                    f"图片生成未返回图片: 第 {page_index} 页, "
+                    f"文本响应: {gen_result.get('text', '')[:200]}"
+                )
+                return json.dumps({
+                    "success": False,
+                    "page_index": page_index,
+                    "image_generated": False,
+                    "text_response": gen_result.get("text", "")[:500],
+                    "hint": "图片生成模型未返回图片。可尝试调整 prompt 或使用 overlay_translated_text 工具作为备选。",
+                }, ensure_ascii=False)
 
         except Exception as e:
             logger.error(f"图片生成工具执行失败: {e}")
@@ -524,6 +554,7 @@ class ImageGenTool(BaseTool):
                 {"error": f"图片生成失败: {type(e).__name__}: {str(e)}"},
                 ensure_ascii=False,
             )
+
 
 
 class CropImageTool(BaseTool):
@@ -677,8 +708,10 @@ class OverlayTextTool(BaseTool):
 
     name = "overlay_translated_text"
     description = (
-        "在原始页面图片上覆盖译文。先用背景色擦除原文区域，再在同位置绘制译文。"
-        "用于「保留背景」模式，直接在原图上翻译。"
+        "在原始页面图片上覆盖译文（Pillow 绘制）。先用背景色擦除原文区域，再在同位置绘制译文。"
+        "⚠️ 仅适用于纯白色或纯色背景的简单文档。"
+        "有花纹、水印、渐变、彩色底图的文档不要用这个工具（会留下明显的色块补丁），"
+        "请改用 generate_translated_image（图片生成 LLM）。"
         "可一次处理多个文字区域（regions 数组）。"
         "处理完成后，修改后的图片自动存入 context，供最终 PDF 合成使用。"
     )

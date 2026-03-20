@@ -184,6 +184,128 @@ class ExternalLLMEngine:
             return True
         return False
 
+    def generate_image(
+        self, messages: List[Dict], max_tokens: int = 8192,
+    ) -> Dict:
+        """
+        📘 教学笔记：非流式图片生成调用
+
+        Gemini 图片生成模型（如 gemini-3-pro-image-preview）通过 OpenAI 兼容接口
+        返回图片时，图片数据在 response.choices[0].message 中。
+
+        📘 为什么不用流式？
+        图片生成返回的是完整的 base64 图片数据（几百 KB ~ 几 MB），
+        流式传输会把 base64 字符串切成碎片，拼接容易出错。
+        非流式一次性拿到完整响应更可靠。
+
+        📘 返回格式：
+        {
+            "text": "文本响应（如果有）",
+            "images": [bytes, ...],  # 解码后的图片 bytes 列表
+            "usage": {"prompt_tokens": N, "completion_tokens": N, "total_tokens": N},
+        }
+        """
+        import json as _json
+
+        self.logger.trace(
+            f"图片生成请求 [model={self.model_id}]\n"
+            f"messages={_json.dumps(_sanitize_for_log(messages), ensure_ascii=False, indent=2)}"
+        )
+
+        last_error = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                if attempt > 0:
+                    delay = self.retry_base_delay * (2 ** (attempt - 1))
+                    self.logger.info(f"图片生成第 {attempt} 次重试，等待 {delay:.1f}s...")
+                    time.sleep(delay)
+
+                response = self.client.chat.completions.create(
+                    model=self.model_id,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    stream=False,
+                )
+
+                result = {"text": "", "images": [], "usage": None}
+
+                # 📘 提取 usage
+                if response.usage:
+                    result["usage"] = {
+                        "prompt_tokens": response.usage.prompt_tokens,
+                        "completion_tokens": response.usage.completion_tokens,
+                        "total_tokens": response.usage.total_tokens,
+                    }
+                    self.logger.debug(
+                        f"图片生成 usage: prompt={response.usage.prompt_tokens}, "
+                        f"completion={response.usage.completion_tokens}"
+                    )
+
+                if not response.choices:
+                    return result
+
+                msg = response.choices[0].message
+
+                # 📘 提取文本内容
+                if msg.content:
+                    content = msg.content
+                    # 📘 Gemini 可能在 content 中混合文本和 base64 图片
+                    # 图片通常以 data:image/ 开头的 data URL 形式出现
+                    import re
+                    # 📘 提取所有 data URL 格式的图片
+                    data_url_pattern = re.compile(
+                        r'data:image/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=\s]+)'
+                    )
+                    matches = list(data_url_pattern.finditer(content))
+                    if matches:
+                        import base64 as b64
+                        for m in matches:
+                            try:
+                                img_bytes = b64.b64decode(m.group(2).replace('\n', '').replace(' ', ''))
+                                result["images"].append(img_bytes)
+                            except Exception as e:
+                                self.logger.warning(f"base64 图片解码失败: {e}")
+                        # 📘 去掉 data URL 后的纯文本
+                        text_only = data_url_pattern.sub('', content).strip()
+                        result["text"] = text_only
+                    else:
+                        result["text"] = content
+
+                # 📘 检查 message.images 字段（LiteLLM / 某些代理的格式）
+                images_field = getattr(msg, 'images', None) or getattr(msg, 'model_extra', {}).get('images', [])
+                if images_field:
+                    import base64 as b64
+                    for img_item in images_field:
+                        url = None
+                        if isinstance(img_item, dict):
+                            url = img_item.get('image_url', {}).get('url', '') or img_item.get('url', '')
+                        elif isinstance(img_item, str):
+                            url = img_item
+                        if url and url.startswith('data:image/'):
+                            try:
+                                b64_data = url.split(',', 1)[1]
+                                img_bytes = b64.b64decode(b64_data)
+                                result["images"].append(img_bytes)
+                            except Exception as e:
+                                self.logger.warning(f"images 字段图片解码失败: {e}")
+
+                self.logger.info(
+                    f"图片生成完成: {len(result['images'])} 张图片, "
+                    f"文本 {len(result['text'])} 字符"
+                )
+                return result
+
+            except Exception as e:
+                last_error = e
+                if not self._is_retryable(e):
+                    raise
+                self.logger.warning(f"图片生成失败 (attempt {attempt + 1}): {e}")
+
+        raise LLMRetryError(
+            f"图片生成在 {self.max_retries} 次重试后仍然失败: {last_error}",
+            last_error=last_error,
+        )
+
     def stream_chat(
         self, messages: List[Dict], tools: List[Dict] = None,
         max_tokens: int = None,
@@ -221,6 +343,128 @@ class ExternalLLMEngine:
             f"外部模型调用在 {self.max_retries} 次重试后仍然失败: {last_error}",
             last_error=last_error,
         )
+    def generate_image(
+        self, messages: List[Dict], max_tokens: int = 8192,
+    ) -> Dict:
+        """
+        📘 教学笔记：非流式图片生成调用
+
+        Gemini 图片生成模型（如 gemini-3-pro-image-preview）通过 OpenAI 兼容接口
+        返回图片时，图片数据在 response.choices[0].message 中。
+
+        📘 为什么不用流式？
+        图片生成返回的是完整的 base64 图片数据（几百 KB ~ 几 MB），
+        流式传输会把 base64 字符串切成碎片，拼接容易出错。
+        非流式一次性拿到完整响应更可靠。
+
+        📘 返回格式：
+        {
+            "text": "文本响应（如果有）",
+            "images": [bytes, ...],  # 解码后的图片 bytes 列表
+            "usage": {"prompt_tokens": N, "completion_tokens": N, "total_tokens": N},
+        }
+        """
+        import json as _json
+
+        self.logger.trace(
+            f"图片生成请求 [model={self.model_id}]\n"
+            f"messages={_json.dumps(_sanitize_for_log(messages), ensure_ascii=False, indent=2)}"
+        )
+
+        last_error = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                if attempt > 0:
+                    delay = self.retry_base_delay * (2 ** (attempt - 1))
+                    self.logger.info(f"图片生成第 {attempt} 次重试，等待 {delay:.1f}s...")
+                    time.sleep(delay)
+
+                response = self.client.chat.completions.create(
+                    model=self.model_id,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    stream=False,
+                )
+
+                result = {"text": "", "images": [], "usage": None}
+
+                # 📘 提取 usage
+                if response.usage:
+                    result["usage"] = {
+                        "prompt_tokens": response.usage.prompt_tokens,
+                        "completion_tokens": response.usage.completion_tokens,
+                        "total_tokens": response.usage.total_tokens,
+                    }
+                    self.logger.debug(
+                        f"图片生成 usage: prompt={response.usage.prompt_tokens}, "
+                        f"completion={response.usage.completion_tokens}"
+                    )
+
+                if not response.choices:
+                    return result
+
+                msg = response.choices[0].message
+
+                # 📘 提取文本内容
+                if msg.content:
+                    content = msg.content
+                    # 📘 Gemini 可能在 content 中混合文本和 base64 图片
+                    # 图片通常以 data:image/ 开头的 data URL 形式出现
+                    import re
+                    # 📘 提取所有 data URL 格式的图片
+                    data_url_pattern = re.compile(
+                        r'data:image/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=\s]+)'
+                    )
+                    matches = list(data_url_pattern.finditer(content))
+                    if matches:
+                        import base64 as b64
+                        for m in matches:
+                            try:
+                                img_bytes = b64.b64decode(m.group(2).replace('\n', '').replace(' ', ''))
+                                result["images"].append(img_bytes)
+                            except Exception as e:
+                                self.logger.warning(f"base64 图片解码失败: {e}")
+                        # 📘 去掉 data URL 后的纯文本
+                        text_only = data_url_pattern.sub('', content).strip()
+                        result["text"] = text_only
+                    else:
+                        result["text"] = content
+
+                # 📘 检查 message.images 字段（LiteLLM / 某些代理的格式）
+                images_field = getattr(msg, 'images', None) or getattr(msg, 'model_extra', {}).get('images', [])
+                if images_field:
+                    import base64 as b64
+                    for img_item in images_field:
+                        url = None
+                        if isinstance(img_item, dict):
+                            url = img_item.get('image_url', {}).get('url', '') or img_item.get('url', '')
+                        elif isinstance(img_item, str):
+                            url = img_item
+                        if url and url.startswith('data:image/'):
+                            try:
+                                b64_data = url.split(',', 1)[1]
+                                img_bytes = b64.b64decode(b64_data)
+                                result["images"].append(img_bytes)
+                            except Exception as e:
+                                self.logger.warning(f"images 字段图片解码失败: {e}")
+
+                self.logger.info(
+                    f"图片生成完成: {len(result['images'])} 张图片, "
+                    f"文本 {len(result['text'])} 字符"
+                )
+                return result
+
+            except Exception as e:
+                last_error = e
+                if not self._is_retryable(e):
+                    raise
+                self.logger.warning(f"图片生成失败 (attempt {attempt + 1}): {e}")
+
+        raise LLMRetryError(
+            f"图片生成在 {self.max_retries} 次重试后仍然失败: {last_error}",
+            last_error=last_error,
+        )
+
 
     def _do_stream_chat(
         self, messages: List[Dict], tools: List[Dict] = None,

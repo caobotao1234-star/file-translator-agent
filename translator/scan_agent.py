@@ -367,6 +367,7 @@ class ScanAgent:
         # 解决方案：context 中维护 current_page_index，工具优先使用它。
         # 这样即使 Brain 传了错误的 page_index，工具也能用正确的页码。
         context = {"page_images": page_images, "current_page_index": 0}
+        self._context = context  # 📘 保存引用，供 _process_single_page 访问
         self.tools = {
             "ocr_extract_text": OCRTool(context=context),
             "cv_detect_layout": CVTool(context=context),
@@ -619,7 +620,7 @@ class ScanAgent:
             print(f"[🤖 生成文档] 合成保留背景 PDF...", flush=True)
             try:
                 from translator.scan_writer import write_overlay_pdf
-                overlay_images = context.get("overlay_images", {})
+                overlay_images = self._context.get("overlay_images", {})
                 final_output_path = write_overlay_pdf(
                     overlay_images=overlay_images,
                     page_images=page_images,
@@ -733,26 +734,37 @@ class ScanAgent:
         if self.preserve_background:
             system_prompt += (
                 "\n\n## ⚠️ 保留背景模式（当前生效）\n"
-                "本次翻译要求保留原文档的背景和视觉效果。你必须使用 overlay_translated_text 工具，"
-                "在原始页面图片上直接覆盖译文，而不是输出 JSON 结构。\n\n"
+                "本次翻译要求保留原文档的背景和视觉效果。最终输出是 PDF（不是 Word）。\n"
+                "你的目标：原图一模一样，只是文字从原文变成了译文。\n\n"
+                "### 你有两个工具可以实现这个目标\n\n"
+                "**首选：generate_translated_image（图片生成 LLM）**\n"
+                "- 把原始页面图片 + 译文 + 详细布局指令发给图片生成 LLM\n"
+                "- 图片生成 LLM 直接在原图上重绘——保留所有背景纹理、花纹、水印\n"
+                "- 适用于：有花纹背景、水印、彩色底图、复杂排版的文档\n"
+                "- 这是效果最好的方案，优先使用\n\n"
+                "**备选：overlay_translated_text（Pillow 文字覆盖）**\n"
+                "- 用背景色矩形覆盖原文区域，再绘制译文\n"
+                "- 适用于：纯白色/纯色背景的简单文档\n"
+                "- 有花纹/渐变/水印的背景不要用这个，会留下明显的色块补丁\n\n"
                 "### 工作流程\n"
-                "1. 分析页面，识别所有文字区域的精确位置（bbox_pct）\n"
+                "1. 分析页面，识别所有文字区域和非文字视觉元素\n"
                 "2. 调用 translate_texts 翻译所有文字\n"
-                "3. 调用 overlay_translated_text，传入所有文字区域的 bbox_pct + 译文\n"
-                "   - bg_color 设为 'auto'（自动检测背景色）或指定颜色\n"
-                "   - font_color 匹配原文颜色\n"
-                "   - font_size 匹配原文大小（可不填，工具会自动计算）\n"
-                "   - align 匹配原文对齐方式\n"
-                "4. 非文字视觉元素（签名、盖章、logo）不要覆盖，保持原样\n\n"
+                "3. 判断背景类型：\n"
+                "   - 有花纹/水印/渐变/彩色底图 → 用 generate_translated_image\n"
+                "   - 纯白色/纯色背景 → 可以用 overlay_translated_text\n"
+                "   - 不确定 → 用 generate_translated_image（更安全）\n"
+                "4. 构造详细的 prompt/参数，调用对应工具\n"
+                "5. 非文字视觉元素（签名、盖章、logo）不要修改\n\n"
+                "### generate_translated_image 的 prompt 编写要点\n"
+                "- 用英文写 prompt（图片生成 LLM 对英文指令理解更好）\n"
+                "- 逐个描述每个文字区域的位置（如 top-left, center, bottom-right）\n"
+                "- 明确写出每个位置对应的译文\n"
+                "- 强调 KEEP the background EXACTLY the same\n"
+                "- 列出不要修改的区域（signatures, stamps, logos）\n\n"
                 "### 输出 JSON 格式（保留背景模式）\n"
-                "overlay 工具调用完成后，输出简化的 JSON：\n"
-                '{"page_type": "overlay", "overlay_completed": true, '
-                '"regions_count": N, "items": [...]}\n\n'
-                "### 关键注意事项\n"
-                "- 精确定位文字区域的 bbox_pct 是最关键的，宁可稍大不要太小\n"
-                "- 背景色检测用 'auto'，工具会自动采样边缘像素\n"
-                "- 如果原文有彩色文字，用 detect_colors 确认颜色后传给 overlay\n"
-                "- 不要覆盖非文字区域（签名、盖章、logo、照片等）\n"
+                "工具调用完成后，输出简化的 JSON：\n"
+                '{"page_type": "overlay", "method": "image_gen" 或 "overlay_text", '
+                '"regions_count": N, "items": [...]}\n'
             )
 
         # 📘 教学笔记：预执行 OCR + CV，减少 ReAct 循环次数
@@ -979,6 +991,15 @@ class ScanAgent:
                     # 📘 翻译工具执行后通知 token 更新（pipeline tokens 变化了）
                     if tool_name == "translate_texts":
                         self._notify_token_update()
+
+                    # 📘 图片生成工具执行后，从 context 提取 token 统计
+                    if tool_name == "generate_translated_image":
+                        img_usage = self._context.get("_last_image_gen_usage")
+                        if img_usage:
+                            self.stats["image_gen_tokens"]["prompt"] += img_usage.get("prompt_tokens", 0)
+                            self.stats["image_gen_tokens"]["completion"] += img_usage.get("completion_tokens", 0)
+                            self._context["_last_image_gen_usage"] = {}
+                            self._notify_token_update()
 
                 continue  # 继续 ReAct 循环
 
