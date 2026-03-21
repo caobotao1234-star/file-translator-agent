@@ -23,10 +23,10 @@
 #
 # 📘 五个处理阶段：
 #   1. PDF 渲染（PyMuPDF）→ 每页 JPEG bytes
-#   2. Agent Brain 分析+策略（外部模型 + OCR/CV 工具）
-#   3. 翻译（doubao via TranslationTool）
+#   2. Agent Brain 分析+翻译（外部模型 + OCR/CV 工具，Brain 直接翻译）
+#   3. 跨页上下文注入（前文翻译对照表 → 确保一致性）
 #   4. 自我审查（外部模型）
-#   5. Word 生成（python-docx via WordWriterTool）
+#   5. Word/PDF 生成
 # =============================================================
 
 import json
@@ -56,11 +56,25 @@ SCAN_AGENT_SYSTEM_PROMPT = """\
 2. ✅ 翻译内容准确，符合场景和上下文
 3. 💰 不浪费 token，高效完成
 
+## ⚠️ 核心原则：你直接翻译（不要调翻译工具）
+你能看到完整的页面图片，理解布局、上下文、行业术语。
+你的翻译质量远超盲翻模型（它看不到图片，不知道上下文）。
+
+**所以：你直接在 items 中输出 translation，不要调用 translate_texts 或 translate_with_context。**
+
+翻译要求：
+- 以你从图片中看到的文字为准（OCR 仅供参考坐标）
+- 翻译必须地道自然，不要 Chinglish（中式英语）
+- 长定语链要重组句式，符合目标语言习惯
+- 行业缩写保留（如 XLPE、PVC、ISO）
+- 专有名词（公司名、人名、地名）跨页保持一致
+- 营销文案要读起来像目标语言母语者写的
+
 ## 你的工具
 - ocr_extract_text: OCR 文字识别（返回文字和坐标位置）
 - cv_detect_layout: 表格线和图片区域检测
-- translate_texts: 文本翻译（使用专业翻译模型，便宜且准确）
-- translate_with_context: 带上下文的翻译（附加术语表+前文摘要，确保跨页一致性）
+- translate_texts: 文本翻译（备用，仅当你无法判断某些专业术语时才调用）
+- translate_with_context: 带上下文的翻译（备用）
 - crop_image_region: 从页面裁剪图片区域（保留签名、盖章、logo、照片等不可翻译元素）
 - manage_glossary: 术语表管理（add/lookup/list/save，确保专有名词跨页一致）
 - detect_colors: 颜色检测（识别彩色文字、背景色、红色公章等）
@@ -75,10 +89,9 @@ OCR 的核心价值是提供文字的坐标位置。OCR 经常识别错字，当
 ## 灵活策略
 - OCR/CV 结果已预执行并提供给你，通常不需要再调用
 - 如果 OCR 结果有明显错误，直接用你看到的文字替换
-- 翻译时把你修正后的准确文字传给 translate_texts
+- **你直接翻译，不需要调翻译工具**（省 token + 翻译更准确）
 - 每个工具通常只需调用一次
 - 遇到专有名词（人名、公司名、地名）→ 用 manage_glossary 注册，确保跨页一致
-- 需要跨页上下文时 → 用 translate_with_context 代替 translate_texts
 - 看到彩色元素（红章、蓝字）→ 可用 detect_colors 确认颜色值
 - 看到竖排或旋转文字 → 用 detect_text_direction 确认方向
 
@@ -217,7 +230,7 @@ FIX_WITH_IMAGE_PROMPT = """\
 ## 你的任务
 对照原始图片，灵活修正上述问题：
 - OCR 识别错误 → 以你从图片中看到的文字为准，直接修正
-- 翻译不准确 → 调用 translate_texts 重新翻译修正后的文字
+- 翻译不准确 → 你直接重新翻译（你能看到图片，翻译更准确）
 - 结构/排版问题 → 重新组织 elements 结构
 - 遇到新问题 → 可以调用 create_custom_tool 创建工具解决
 
@@ -431,6 +444,12 @@ class ScanAgent:
         all_page_structures = []
         all_translations = {}
 
+        # 📘 教学笔记：跨页翻译上下文
+        # Brain 直接翻译时，需要知道前面页面的翻译结果，
+        # 确保同一术语/页眉/公司名在全文档中翻译一致。
+        # 每页处理完后，从 items 中提取 {原文: 译文} 存入此 dict。
+        self._cross_page_context = {}
+
         for page_idx in range(num_pages):
             progress_pct = int((page_idx / num_pages) * 80)  # 0-80% 给页面处理
             self._emit_event(on_event, "page_start", {
@@ -494,6 +513,16 @@ class ScanAgent:
                 all_page_structures.append(page_structure)
                 all_items.extend(page_items)
                 all_translations.update(page_translations)
+
+                # 📘 教学笔记：收集跨页翻译上下文
+                # 从 Brain 输出的 items 中提取 {原文: 译文}，
+                # 注入到下一页的 prompt 中，确保翻译一致性。
+                for item in page_items:
+                    orig = item.get("full_text", "").strip()
+                    key = item.get("key", "")
+                    trans = page_translations.get(key, "")
+                    if orig and trans and orig != trans:
+                        self._cross_page_context[orig] = trans
 
                 elem_count = len(page_structure.get("elements", []))
                 logger.info(
@@ -732,15 +761,20 @@ class ScanAgent:
 
         这是 Agent 架构的核心——ReAct（Reasoning + Acting）循环：
 
-        1. 发送页面图片 + system prompt 给 Agent Brain
-        2. Brain 返回 tool_call → 执行工具 → 将结果反馈给 Brain
-        3. Brain 返回 text（最终 JSON）→ 解析结构化数据 → 结束
-        4. 工具调用次数上限 max_tool_calls，达到上限强制结束
+        1. 发送页面图片 + system prompt + 跨页上下文给 Agent Brain
+        2. Brain 直接翻译所有文字（不调翻译工具，省 token + 更准确）
+        3. Brain 返回 tool_call → 执行工具 → 将结果反馈给 Brain
+        4. Brain 返回 text（最终 JSON，含原文+译文）→ 解析结构化数据 → 结束
+        5. 工具调用次数上限 max_tool_calls，达到上限强制结束
 
-        📘 为什么叫 ReAct？
-        Reasoning（推理）：Brain 看到图片/工具结果后思考下一步
-        Acting（行动）：Brain 决定调用哪个工具
-        这个循环让 Agent 能自适应不同文档类型。
+        📘 为什么 Brain 直接翻译更好？
+        Brain 能看到完整页面图片，理解布局、上下文、行业术语。
+        而独立翻译模型只能看到一个个孤立的文本片段，没有视觉上下文。
+        同样的 PDF 截图发给 Gemini 网页版，翻译质量远超盲翻模型。
+
+        📘 跨页一致性：
+        通过 _cross_page_context 注入前文翻译对照表，
+        Brain 知道前面页面的翻译结果，确保同一术语全文档一致。
 
         返回: (page_structure, items, translations)
         """
@@ -785,7 +819,7 @@ class ScanAgent:
                 "不确定 → 用 generate_translated_image（更安全）\n\n"
                 "### 工作流程\n"
                 "1. 分析页面，识别所有文字区域和非文字视觉元素\n"
-                "2. 调用 translate_texts 翻译所有文字\n"
+                "2. 你直接翻译所有文字（你能看到图片，翻译更准确，不要调翻译工具）\n"
                 "3. 按上述规则选择工具\n"
                 "4. 构造详细的 prompt/参数，调用对应工具\n"
                 "5. 非文字视觉元素（签名、盖章、logo）不要修改\n\n"
@@ -804,13 +838,27 @@ class ScanAgent:
         # 📘 教学笔记：预执行 OCR + CV，减少 ReAct 循环次数
         # 之前 Brain 每页要调 2-4 次工具（OCR、CV），每次都要重发图片 + 对话历史，
         # 导致 prompt tokens 爆炸。优化：先跑 OCR 和 CV，把结果直接塞进初始消息，
-        # Brain 只需要看结果 → 翻译 → 输出 JSON，最少只需 1-2 轮 ReAct。
+        # Brain 只需要看结果 → 直接翻译 → 输出 JSON，最少只需 1 轮。
         ocr_result = self.tools["ocr_extract_text"].execute({"page_index": page_idx})
         cv_result = self.tools["cv_detect_layout"].execute({"page_index": page_idx})
 
         # 📘 统计预执行的工具调用
         self.stats["tool_calls"]["ocr"] = self.stats["tool_calls"].get("ocr", 0) + 1
         self.stats["tool_calls"]["cv"] = self.stats["tool_calls"].get("cv", 0) + 1
+
+        # 📘 教学笔记：跨页上下文注入
+        # Brain 直接翻译时，需要知道前面页面的翻译结果，
+        # 确保同一术语/页眉/公司名在全文档中翻译一致。
+        # _cross_page_context 由 process_scan_pdf 在每页处理后更新。
+        cross_page_hint = ""
+        if hasattr(self, '_cross_page_context') and self._cross_page_context:
+            # 📘 只取最近的翻译对照（避免 prompt 太长）
+            recent_pairs = list(self._cross_page_context.items())[-30:]
+            pairs_str = "\n".join(f"  「{src}」→「{tgt}」" for src, tgt in recent_pairs)
+            cross_page_hint = (
+                f"\n\n## 前文翻译参考（确保跨页一致性）\n"
+                f"以下是前面页面已确定的翻译，相同文字必须使用相同译法：\n{pairs_str}\n"
+            )
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -832,7 +880,9 @@ class ScanAgent:
                             f"{ocr_result}\n\n"
                             f"## 已有的 CV 布局检测结果\n{cv_result}\n\n"
                             f"📘 提示：OCR 和 CV 已预执行。请对照图片核实 OCR 文字，"
-                            f"如有识别错误直接修正。然后调用 translate_texts 翻译，最后输出 JSON。"
+                            f"如有识别错误直接修正。你直接翻译所有文字（不需要调翻译工具），"
+                            f"在 items 中同时输出原文和译文。"
+                            f"{cross_page_hint}"
                         ),
                     },
                 ],
