@@ -249,8 +249,12 @@ class TranslationTool(BaseTool):
     def __init__(self, translate_pipeline=None):
         """
         📘 translate_pipeline: TranslatePipeline 实例（由 ScanAgent 注入）
+        📘 _cache: 跨页翻译缓存 {原文: 译文}
+           同一段文字（如页眉"精益求精·铸造品质"）只翻译一次，
+           后续页面直接复用，确保全文档翻译一致性。
         """
         self.translate_pipeline = translate_pipeline
+        self._cache: Dict[str, str] = {}
 
     def execute(self, params: dict) -> str:
         valid, msg = self.validate_params(params)
@@ -270,15 +274,50 @@ class TranslationTool(BaseTool):
             )
 
         try:
-            # 📘 调用 TranslatePipeline.translate_batch（初翻 + 审校）
-            translated_list = self.translate_pipeline.translate_batch(
-                texts, target_lang=target_lang
-            )
+            # 📘 教学笔记：跨页翻译缓存
+            # 页眉、页脚、公司名等重复文字在每页都出现，
+            # 如果每次都重新翻译，LLM 的随机性会导致每次译法不同。
+            # 缓存命中的直接复用，只翻译没见过的新文本。
+            cached_results = {}
+            texts_to_translate = []
+            indices_to_translate = []
 
-            # 📘 构建 {原文: 译文} 映射
+            for i, text in enumerate(texts):
+                stripped = text.strip()
+                if stripped in self._cache:
+                    cached_results[i] = self._cache[stripped]
+                else:
+                    texts_to_translate.append(text)
+                    indices_to_translate.append(i)
+
+            if cached_results:
+                logger.info(
+                    f"翻译缓存命中: {len(cached_results)} 个, "
+                    f"需翻译: {len(texts_to_translate)} 个"
+                )
+
+            # 📘 只翻译缓存未命中的文本
+            if texts_to_translate:
+                translated_list = self.translate_pipeline.translate_batch(
+                    texts_to_translate, target_lang=target_lang
+                )
+            else:
+                translated_list = []
+
+            # 📘 合并缓存结果和新翻译结果
             translations = {}
-            for orig, trans in zip(texts, translated_list):
-                translations[orig] = trans
+            new_translate_idx = 0
+            for i, text in enumerate(texts):
+                if i in cached_results:
+                    translations[text] = cached_results[i]
+                elif new_translate_idx < len(translated_list):
+                    trans = translated_list[new_translate_idx]
+                    translations[text] = trans
+                    # 📘 写入缓存供后续页面复用
+                    self._cache[text.strip()] = trans
+                    new_translate_idx += 1
+                else:
+                    translations[text] = text  # 兜底
 
             logger.info(f"翻译完成: {len(translations)} 个文本 → {target_lang}")
             return json.dumps({"translations": translations}, ensure_ascii=False)

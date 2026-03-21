@@ -475,6 +475,7 @@ class ContextTranslationTool(BaseTool):
     def __init__(self, translate_pipeline=None, context: Dict[str, Any] = None):
         self.translate_pipeline = translate_pipeline
         self.context = context or {}
+        self._cache: Dict[str, str] = {}
 
     def execute(self, params: dict) -> str:
         valid, msg = self.validate_params(params)
@@ -499,30 +500,60 @@ class ContextTranslationTool(BaseTool):
             all_terms.append({"source": src, "target": info["target"]})
 
         try:
-            # 📘 构建带上下文的翻译输入
-            # 在每个文本前加上上下文提示
-            enriched_texts = []
-            for text in texts:
-                prefix_parts = []
-                if context_summary:
-                    prefix_parts.append(f"[上下文: {context_summary}]")
-                if all_terms:
-                    terms_str = "; ".join(f"{t['source']}={t['target']}" for t in all_terms[:20])
-                    prefix_parts.append(f"[术语: {terms_str}]")
-                if prefix_parts:
-                    enriched = " ".join(prefix_parts) + " " + text
+            # 📘 跨页翻译缓存（与 TranslationTool 同理）
+            cached_results = {}
+            texts_to_translate = []
+            indices_to_translate = []
+
+            for i, text in enumerate(texts):
+                stripped = text.strip()
+                if stripped in self._cache:
+                    cached_results[i] = self._cache[stripped]
                 else:
-                    enriched = text
-                enriched_texts.append(enriched)
+                    texts_to_translate.append(text)
+                    indices_to_translate.append(i)
 
-            # 📘 调用翻译流水线
-            translated_list = self.translate_pipeline.translate_batch(
-                enriched_texts, target_lang=target_lang
-            )
+            if cached_results:
+                logger.info(
+                    f"上下文翻译缓存命中: {len(cached_results)} 个, "
+                    f"需翻译: {len(texts_to_translate)} 个"
+                )
 
+            # 📘 只翻译缓存未命中的文本（带上下文）
+            if texts_to_translate:
+                enriched_texts = []
+                for text in texts_to_translate:
+                    prefix_parts = []
+                    if context_summary:
+                        prefix_parts.append(f"[上下文: {context_summary}]")
+                    if all_terms:
+                        terms_str = "; ".join(f"{t['source']}={t['target']}" for t in all_terms[:20])
+                        prefix_parts.append(f"[术语: {terms_str}]")
+                    if prefix_parts:
+                        enriched = " ".join(prefix_parts) + " " + text
+                    else:
+                        enriched = text
+                    enriched_texts.append(enriched)
+
+                translated_list = self.translate_pipeline.translate_batch(
+                    enriched_texts, target_lang=target_lang
+                )
+            else:
+                translated_list = []
+
+            # 📘 合并缓存结果和新翻译结果
             translations = {}
-            for orig, trans in zip(texts, translated_list):
-                translations[orig] = trans
+            new_translate_idx = 0
+            for i, text in enumerate(texts):
+                if i in cached_results:
+                    translations[text] = cached_results[i]
+                elif new_translate_idx < len(translated_list):
+                    trans = translated_list[new_translate_idx]
+                    translations[text] = trans
+                    self._cache[text.strip()] = trans
+                    new_translate_idx += 1
+                else:
+                    translations[text] = text
 
             logger.info(
                 f"上下文翻译完成: {len(translations)} 个文本, "
