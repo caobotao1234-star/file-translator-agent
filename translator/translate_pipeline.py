@@ -9,24 +9,21 @@ from core.agent_config import AgentConfig
 from core.logger import get_logger
 
 # =============================================================
-# 📘 教学笔记：翻译流水线（Translation Pipeline v6 — 跨页上下文感知）
+# 📘 教学笔记：翻译流水线（Translation Pipeline v7 — 整页翻译 + 跨页上下文）
 # =============================================================
-# v6 核心改进：页间串行 + 页内并行 + 跨页翻译缓存
+# v7 核心理念：一页一次调用，LLM 注意力机制自然覆盖页内上下文。
 #
-# 📘 v5 的问题：
-#   所有 batch 全部并行发出，速度快但没有上下文：
-#   - 第 1 页翻译完的术语，第 5 页完全不知道
-#   - 页眉/公司名每页可能翻译不同（LLM 随机性）
-#   - 同一页内的段落之间也没有语义关联
+# 📘 v5/v6 的问题：
+#   v5: 所有 batch 全并行，页内页间都没有上下文
+#   v6: 页间串行但页内并行，页内上下文仍然丢失
 #
-# 📘 v6 的解决方案：
-#   1. 按页分组：从 item key 中提取页码前缀（pg0, s0, p0）
-#   2. 页间串行：第 1 页翻完 → 收集翻译缓存 → 注入到第 2 页 prompt
-#   3. 页内并行：同一页的多个 batch 仍然多线程并行（保持速度）
-#   4. 翻译缓存：相同原文只翻译一次，后续页面直接复用
-#
-# 📘 代价：总时间从 O(1) 变成 O(页数)，但每页内部仍然并行。
-#   对于大多数文档（<50页），增加的时间可以接受，换来的是翻译一致性。
+# 📘 v7 的解决方案：
+#   1. 整页翻译：一页所有段落一次性发给 LLM，一次性收回
+#      - LLM 注意力机制自然关联标题、正文、表格
+#      - 减少 API 调用次数，更快
+#   2. 跨页上下文：前一页翻完 → 收集术语缓存 → 注入下一页 prompt
+#   3. 翻译缓存：相同原文只翻译一次，后续页面直接复用
+#   4. 极端情况兜底：单页段落数超过 batch_size 时串行分批
 # =============================================================
 
 logger = get_logger("translate_pipeline")
@@ -263,13 +260,12 @@ def _enrich_text_for_prompt(text: str, item: dict) -> str:
 
 class TranslatePipeline:
     """
-    📘 翻译流水线 v6：页间串行带上下文，页内 batch 并行。
-    跨页翻译缓存确保术语一致性。
+    📘 翻译流水线 v7：整页一次性翻译 + 跨页上下文。
+    LLM 注意力机制自然覆盖页内上下文，跨页缓存确保术语一致性。
 
-    📘 教学笔记：max_workers 控制页内并行度
-    - max_workers=1: 串行（兼容模式，适合调试）
-    - max_workers=3~5: 推荐值，同一页内多batch并行，速度提升明显
-    - max_workers>5: 可能触发API限流，视服务端配额而定
+    📘 教学笔记：max_workers 控制并行度（用于极端情况的页内分批）
+    - 正常情况下每页一次调用，不需要并行
+    - 仅当单页段落数超过 batch_size 时才分批串行
     """
 
     def __init__(
@@ -530,20 +526,16 @@ class TranslatePipeline:
         user_instruction: str = "",
     ) -> Dict[str, str]:
         """
-        翻译整个文档（v6 — 页间串行带上下文，页内 batch 并行）。
+        翻译整个文档（v7 — 整页一次性翻译 + 跨页上下文）。
 
-        📘 教学笔记：跨页上下文感知翻译
-        v5 把所有 batch 全部并行发出，速度快但没有上下文：
-        - 第 1 页翻译完的术语，第 5 页完全不知道
-        - 页眉/公司名每页可能翻译不同
+        📘 教学笔记：整页翻译 + 跨页上下文
+        v6 按 batch 切分，同一页内的段落被拆到不同 batch，互相看不到。
+        v7 直接把一整页所有段落一次性发给 LLM：
+        - LLM 的注意力机制自然覆盖页内所有段落（标题、正文、表格互相关联）
+        - 一次发、一次收，减少 API 调用次数，更快
+        - 页间串行：前一页翻完 → 收集术语缓存 → 注入下一页 prompt
 
-        v6 改为按页分组：
-        - 页间串行：第 1 页翻完 → 收集翻译缓存 → 注入到第 2 页的 prompt
-        - 页内并行：同一页的多个 batch 仍然多线程并行（保持速度）
-        - 翻译缓存：相同原文只翻译一次，后续页面直接复用
-
-        📘 代价：总时间从 O(1) 变成 O(页数)，但每页内部仍然并行。
-        对于大多数文档（<50页），增加的时间可以接受，换来的是翻译一致性。
+        📘 如果单页段落数超过 batch_size（极端情况），才拆分为多次调用。
         """
         # 📘 教学笔记：上下文感知预处理
         for item in parsed_data["items"]:
@@ -574,8 +566,7 @@ class TranslatePipeline:
                 item_map[item["key"]] = item
 
         total = len(to_translate)
-        workers = self.max_workers
-        logger.info(f"开始翻译文档: {total} 个翻译单元, batch_size={self.batch_size}, workers={workers}")
+        logger.info(f"开始翻译文档: {total} 个翻译单元, batch_size={self.batch_size}")
 
         # 📘 教学笔记：客户特殊需求暂存（供 _translate_batch 使用）
         self._current_user_instruction = user_instruction
@@ -595,7 +586,6 @@ class TranslatePipeline:
         from collections import OrderedDict
         page_groups: OrderedDict[str, List[Tuple[str, str]]] = OrderedDict()
         for key, text in to_translate:
-            # 📘 提取页码前缀：pg0, s0, p0 等
             page_prefix = key.split("_")[0] if "_" in key else "default"
             if page_prefix not in page_groups:
                 page_groups[page_prefix] = []
@@ -606,14 +596,11 @@ class TranslatePipeline:
         stopped_early = False
 
         # 📘 教学笔记：跨页翻译缓存 + 上下文
-        # translation_cache: {原文: 译文} — 相同原文只翻译一次
-        # cross_page_pairs: 最近的翻译对照（注入到 prompt 中）
         translation_cache: Dict[str, str] = {}
         cross_page_pairs: List[Tuple[str, str]] = []
 
         print(
-            f"  [🚀 翻译] {total} 个段落, {num_pages} 页"
-            f"（页间串行+页内{workers}线程并行）",
+            f"  [🚀 翻译] {total} 个段落, {num_pages} 页（整页翻译+跨页上下文）",
             flush=True,
         )
         completed_count = 0
@@ -623,7 +610,7 @@ class TranslatePipeline:
                 stopped_early = True
                 break
 
-            # 📘 教学笔记：缓存命中 — 相同原文直接复用，不重复翻译
+            # 📘 缓存命中 — 相同原文直接复用
             page_keys_to_translate = []
             page_texts_to_translate = []
             page_items_to_translate = []
@@ -642,7 +629,7 @@ class TranslatePipeline:
 
             if cache_hit_count > 0:
                 logger.info(
-                    f"第 {page_prefix} 页: 缓存命中 {cache_hit_count} 个, "
+                    f"{page_prefix}: 缓存命中 {cache_hit_count} 个, "
                     f"需翻译 {len(page_texts_to_translate)} 个"
                 )
 
@@ -651,68 +638,78 @@ class TranslatePipeline:
                     on_progress(completed_count, total)
                 continue
 
-            # 📘 构建跨页上下文提示（最近 30 对翻译对照）
+            # 📘 构建跨页上下文提示
             cross_page_hint = ""
             if cross_page_pairs:
                 recent = cross_page_pairs[-30:]
-                pairs_str = "; ".join(
-                    f"{src}={tgt}" for src, tgt in recent
-                )
+                pairs_str = "; ".join(f"{src}={tgt}" for src, tgt in recent)
                 cross_page_hint = f"[前文术语参考（相同文字必须使用相同译法）: {pairs_str}]"
 
-            # 📘 页内切分 batch，多线程并行
-            page_batches: List[Tuple[List[str], List[str], List[dict]]] = []
-            for i in range(0, len(page_texts_to_translate), self.batch_size):
-                b_keys = page_keys_to_translate[i:i + self.batch_size]
-                b_texts = page_texts_to_translate[i:i + self.batch_size]
-                b_items = page_items_to_translate[i:i + self.batch_size]
-                page_batches.append((b_keys, b_texts, b_items))
-
-            # 📘 页内并行翻译
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                future_to_idx: Dict[Future, int] = {}
-                for batch_idx, (b_keys, b_texts, b_items) in enumerate(page_batches):
+            # 📘 教学笔记：整页一次性翻译
+            # 把本页所有段落一次性发给 LLM，LLM 注意力机制自然覆盖页内上下文。
+            # 只有当段落数超过 batch_size 时才拆分（极端情况，如超长表格页）。
+            page_count = len(page_texts_to_translate)
+            if page_count <= self.batch_size:
+                # 📘 常规情况：整页一次调用
+                agent = self._acquire_translate_agent()
+                results = self._translate_batch(
+                    page_texts_to_translate, target_lang, lang_english,
+                    agent, page_items_to_translate, cross_page_hint,
+                )
+                for j, key in enumerate(page_keys_to_translate):
+                    trans = results[j] if j < len(results) else page_texts_to_translate[j]
+                    translations[key] = trans
+                    orig = page_texts_to_translate[j].strip()
+                    if orig and trans != orig:
+                        translation_cache[orig] = trans
+            else:
+                # 📘 极端情况：单页段落数超过 batch_size，串行分批
+                # 每批翻完后把结果加入缓存，下一批能看到前面的翻译
+                logger.info(f"{page_prefix}: {page_count} 个段落超过 batch_size={self.batch_size}，分批串行")
+                for i in range(0, page_count, self.batch_size):
                     if self._stop_event.is_set():
                         stopped_early = True
                         break
+                    b_keys = page_keys_to_translate[i:i + self.batch_size]
+                    b_texts = page_texts_to_translate[i:i + self.batch_size]
+                    b_items = page_items_to_translate[i:i + self.batch_size]
+
+                    # 📘 页内分批时，也把前面批次的翻译加入上下文
+                    intra_hint = cross_page_hint
+                    if i > 0:
+                        intra_pairs = []
+                        for prev_j in range(i):
+                            prev_key = page_keys_to_translate[prev_j]
+                            prev_text = page_texts_to_translate[prev_j].strip()
+                            prev_trans = translations.get(prev_key, "")
+                            if prev_text and prev_trans and prev_text != prev_trans and len(prev_text) < 60:
+                                intra_pairs.append(f"{prev_text}={prev_trans}")
+                        if intra_pairs:
+                            intra_str = "; ".join(intra_pairs[-20:])
+                            intra_hint = (cross_page_hint + " " if cross_page_hint else "") + \
+                                f"[本页前文参考: {intra_str}]"
+
                     agent = self._acquire_translate_agent()
-                    future = executor.submit(
-                        self._translate_batch, b_texts, target_lang, lang_english,
-                        agent, b_items, cross_page_hint,
+                    results = self._translate_batch(
+                        b_texts, target_lang, lang_english,
+                        agent, b_items, intra_hint,
                     )
-                    future_to_idx[future] = batch_idx
+                    for j, key in enumerate(b_keys):
+                        trans = results[j] if j < len(results) else b_texts[j]
+                        translations[key] = trans
+                        orig = b_texts[j].strip()
+                        if orig and trans != orig:
+                            translation_cache[orig] = trans
 
-                for future in as_completed(future_to_idx):
-                    if self._stop_event.is_set():
-                        stopped_early = True
-                        break
-                    batch_idx = future_to_idx[future]
-                    b_keys, b_texts, b_items = page_batches[batch_idx]
-                    try:
-                        results = future.result()
-                        for j, key in enumerate(b_keys):
-                            trans = results[j] if j < len(results) else b_texts[j]
-                            translations[key] = trans
-                            # 📘 写入缓存供后续页面复用
-                            orig = b_texts[j].strip()
-                            if orig and trans != orig:
-                                translation_cache[orig] = trans
-                    except Exception as e:
-                        logger.error(f"翻译批次 {page_prefix}_{batch_idx} 异常: {e}")
-                        for j, key in enumerate(b_keys):
-                            translations[key] = b_texts[j]
+            completed_count += len(page_keys_to_translate)
+            if on_progress:
+                on_progress(completed_count, total)
 
-                    completed_count += len(b_keys)
-                    if on_progress:
-                        on_progress(completed_count, total)
-
-            # 📘 教学笔记：收集本页翻译对照，供下一页使用
-            # 只收集短文本（<60字符）作为术语参考，避免 prompt 太长
+            # 📘 收集本页翻译对照，供下一页使用（短文本作为术语参考）
             for key, text in page_items_raw:
                 stripped = text.strip()
                 trans = translations.get(key, "")
                 if stripped and trans and stripped != trans and len(stripped) < 60:
-                    # 📘 去重：同一原文只保留一次
                     if not any(src == stripped for src, _ in cross_page_pairs):
                         cross_page_pairs.append((stripped, trans))
 
