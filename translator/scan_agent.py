@@ -448,7 +448,9 @@ class ScanAgent:
         # Brain 直接翻译时，需要知道前面页面的翻译结果，
         # 确保同一术语/页眉/公司名在全文档中翻译一致。
         # 每页处理完后，从 items 中提取 {原文: 译文} 存入此 dict。
+        # _cross_page_summary: 前文内容摘要，让 Brain 理解文档主题
         self._cross_page_context = {}
+        self._cross_page_summary = ""
 
         for page_idx in range(num_pages):
             progress_pct = int((page_idx / num_pages) * 80)  # 0-80% 给页面处理
@@ -523,6 +525,21 @@ class ScanAgent:
                     trans = page_translations.get(key, "")
                     if orig and trans and orig != trans:
                         self._cross_page_context[orig] = trans
+
+                # 📘 收集本页内容摘要，让 Brain 理解文档主题
+                page_originals = [
+                    item.get("full_text", "").strip()
+                    for item in page_items
+                    if item.get("full_text", "").strip() and len(item.get("full_text", "").strip()) > 3
+                ]
+                if page_originals:
+                    snippets = [t[:40] + ("..." if len(t) > 40 else "") for t in page_originals[:5]]
+                    page_snippet = " / ".join(snippets)
+                    if self._cross_page_summary:
+                        old = self._cross_page_summary[-200:] if len(self._cross_page_summary) > 200 else self._cross_page_summary
+                        self._cross_page_summary = f"{old} | p{page_idx}: {page_snippet}"
+                    else:
+                        self._cross_page_summary = f"p{page_idx}: {page_snippet}"
 
                 elem_count = len(page_structure.get("elements", []))
                 logger.info(
@@ -847,18 +864,26 @@ class ScanAgent:
         self.stats["tool_calls"]["cv"] = self.stats["tool_calls"].get("cv", 0) + 1
 
         # 📘 教学笔记：跨页上下文注入
-        # Brain 直接翻译时，需要知道前面页面的翻译结果，
+        # Brain 直接翻译时，需要知道前面页面的内容和翻译结果，
         # 确保同一术语/页眉/公司名在全文档中翻译一致。
         # _cross_page_context 由 process_scan_pdf 在每页处理后更新。
+        # _cross_page_summary 提供前文内容摘要，让 Brain 理解文档主题。
         cross_page_hint = ""
+        hint_parts = []
+        if hasattr(self, '_cross_page_summary') and self._cross_page_summary:
+            hint_parts.append(
+                f"## 前文内容摘要（帮助你理解文档主题）\n{self._cross_page_summary}"
+            )
         if hasattr(self, '_cross_page_context') and self._cross_page_context:
             # 📘 只取最近的翻译对照（避免 prompt 太长）
             recent_pairs = list(self._cross_page_context.items())[-30:]
             pairs_str = "\n".join(f"  「{src}」→「{tgt}」" for src, tgt in recent_pairs)
-            cross_page_hint = (
-                f"\n\n## 前文翻译参考（确保跨页一致性）\n"
-                f"以下是前面页面已确定的翻译，相同文字必须使用相同译法：\n{pairs_str}\n"
+            hint_parts.append(
+                f"## 前文翻译参考（确保跨页一致性）\n"
+                f"以下是前面页面已确定的翻译，相同文字必须使用相同译法：\n{pairs_str}"
             )
+        if hint_parts:
+            cross_page_hint = "\n\n" + "\n\n".join(hint_parts) + "\n"
 
         messages = [
             {"role": "system", "content": system_prompt},

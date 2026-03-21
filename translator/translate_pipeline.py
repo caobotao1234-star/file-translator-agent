@@ -596,8 +596,12 @@ class TranslatePipeline:
         stopped_early = False
 
         # 📘 教学笔记：跨页翻译缓存 + 上下文
+        # translation_cache: {原文: 译文} — 相同原文只翻译一次
+        # cross_page_pairs: 最近的翻译对照（注入到 prompt 中）
+        # cross_page_summary: 前文内容摘要（让 LLM 理解文档主题和语境）
         translation_cache: Dict[str, str] = {}
         cross_page_pairs: List[Tuple[str, str]] = []
+        cross_page_summary: str = ""
 
         print(
             f"  [🚀 翻译] {total} 个段落, {num_pages} 页（整页翻译+跨页上下文）",
@@ -638,12 +642,17 @@ class TranslatePipeline:
                     on_progress(completed_count, total)
                 continue
 
-            # 📘 构建跨页上下文提示
+            # 📘 构建跨页上下文提示（内容摘要 + 术语对照）
             cross_page_hint = ""
-            if cross_page_pairs:
-                recent = cross_page_pairs[-30:]
-                pairs_str = "; ".join(f"{src}={tgt}" for src, tgt in recent)
-                cross_page_hint = f"[前文术语参考（相同文字必须使用相同译法）: {pairs_str}]"
+            if cross_page_summary or cross_page_pairs:
+                parts = []
+                if cross_page_summary:
+                    parts.append(f"[前文内容摘要: {cross_page_summary}]")
+                if cross_page_pairs:
+                    recent = cross_page_pairs[-30:]
+                    pairs_str = "; ".join(f"{src}={tgt}" for src, tgt in recent)
+                    parts.append(f"[前文术语参考（相同文字必须使用相同译法）: {pairs_str}]")
+                cross_page_hint = "\n".join(parts)
 
             # 📘 教学笔记：整页一次性翻译
             # 把本页所有段落一次性发给 LLM，LLM 注意力机制自然覆盖页内上下文。
@@ -705,7 +714,28 @@ class TranslatePipeline:
             if on_progress:
                 on_progress(completed_count, total)
 
-            # 📘 收集本页翻译对照，供下一页使用（短文本作为术语参考）
+            # 📘 收集本页内容摘要 + 翻译对照，供下一页使用
+            # 内容摘要：取本页前几段原文拼成简短描述，让 LLM 理解文档在讲什么
+            page_originals = []
+            for key, text in page_items_raw:
+                stripped = text.strip()
+                if stripped and len(stripped) > 3:
+                    page_originals.append(stripped)
+            if page_originals:
+                # 📘 取本页前 5 段（每段截断 40 字符），拼成摘要
+                snippet_parts = []
+                for t in page_originals[:5]:
+                    snippet_parts.append(t[:40] + ("..." if len(t) > 40 else ""))
+                page_snippet = " / ".join(snippet_parts)
+                # 📘 滚动摘要：保留最近 3 页的内容，避免 prompt 太长
+                if cross_page_summary:
+                    # 截断旧摘要，只保留最近 200 字符
+                    old = cross_page_summary[-200:] if len(cross_page_summary) > 200 else cross_page_summary
+                    cross_page_summary = f"{old} | {page_prefix}: {page_snippet}"
+                else:
+                    cross_page_summary = f"{page_prefix}: {page_snippet}"
+
+            # 📘 术语对照（短文本）
             for key, text in page_items_raw:
                 stripped = text.strip()
                 trans = translations.get(key, "")
