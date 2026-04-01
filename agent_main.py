@@ -25,6 +25,7 @@ from tools.doc_tools import ParseDocumentTool, GetPageContentTool, WriteDocument
 from tools.translate_tools import TranslatePageTool
 from tools.memory_tools import MemoryStore, ReadMemoryTool, UpdateMemoryTool
 from tools.interaction_tools import AskUserTool, ReportProgressTool
+from tools.format_tools import InspectOutputTool, AdjustFormatTool
 from prompts.agent_prompts import TRANSLATION_AGENT_PROMPT
 
 logger = get_logger("agent_main")
@@ -105,6 +106,8 @@ def build_agent(translate_model_id: str = None, brain_model_id: str = None):
         GetPageContentTool(parse_tool),
         WriteDocumentTool(parse_tool, format_engine),
         TranslatePageTool(translate_pipeline=pipeline),
+        InspectOutputTool(),
+        AdjustFormatTool(),
         ReadMemoryTool(memory),
         UpdateMemoryTool(memory),
         AskUserTool(),  # CLI 模式下用户不回答，Agent 自行决定
