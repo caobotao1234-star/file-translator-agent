@@ -20,8 +20,12 @@ TRANSLATION_AGENT_PROMPT = """\
 - get_page_image: 获取页面图片（扫描件 PDF 必须用这个看内容）
 - translate_page: 翻译文本（支持一次传入多页文本批量翻译）
 - write_document: 把翻译结果写入输出文件
-- inspect_output: 检查输出文件的视觉效果（文本位置、字号、布局）
+- inspect_output: 检查输出文件的文本布局数据（字号、位置、尺寸）
 - adjust_format: 调整输出文件的格式（字号、加粗、字体等）
+- render_slide: 把 PPT 幻灯片渲染为真实图片（能看到实际效果）
+- enable_autofit: 启用 PPT 原生的"缩小文字以适应"（最可靠的防溢出方案）
+- compare_layout: 对比原文和译文的布局差异（找出字号变化、溢出等问题）
+- smart_resize: 智能计算并设置最佳字号（基于文本框尺寸和文本长度）
 - ocr_extract_text: OCR 文字识别（扫描件用，返回文字+坐标）
 - cv_detect_layout: CV 布局检测（扫描件用，检测表格线和图片区域）
 - generate_translated_image: 图片生成（扫描件保留背景，替换文字）

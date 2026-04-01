@@ -27,6 +27,7 @@ from tools.memory_tools import MemoryStore, ReadMemoryTool, UpdateMemoryTool
 from tools.interaction_tools import AskUserTool, ReportProgressTool
 from tools.format_tools import InspectOutputTool, AdjustFormatTool
 from tools.vision_tools import GetPageImageTool, create_scan_tools
+from tools.layout_tools_v2 import RenderSlideTool, EnableAutofitTool, CompareLayoutTool, SmartResizeTool
 from prompts.agent_prompts import TRANSLATION_AGENT_PROMPT
 
 logger = get_logger("agent_main")
@@ -122,6 +123,10 @@ def build_agent(translate_model_id: str = None, brain_model_id: str = None,
         TranslatePageTool(translate_pipeline=pipeline),
         InspectOutputTool(),
         AdjustFormatTool(),
+        RenderSlideTool(),
+        EnableAutofitTool(),
+        CompareLayoutTool(),
+        SmartResizeTool(),
         ReadMemoryTool(memory),
         UpdateMemoryTool(memory),
         AskUserTool(),
