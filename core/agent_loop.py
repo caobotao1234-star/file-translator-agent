@@ -379,10 +379,27 @@ class AgentLoop:
 
                 continue  # 继续循环
 
-            # 📘 Step 5: 模型返回纯文本 -> 任务完成
+            # 📘 Step 5: 模型返回纯文本 -> 可能完成，也可能用户有后续
             if text_content:
                 final_text = text_content
                 self._notify_message("assistant", text_content)
+
+                # 📘 教学笔记：不立即退出，检查用户是否有待处理的消息
+                # 用户可能在 Agent 工作期间发了消息（修改需求、纠正翻译等）
+                # 如果有待处理消息，继续循环让模型处理
+                if self.message_queue.has_pending():
+                    logger.info("Agent 输出了文本，但用户有待处理消息，继续循环")
+                    continue
+
+                # 📘 短暂等待：给用户一个窗口期发送后续指令
+                # 等 3 秒，如果用户在这期间发了消息，继续处理
+                import time
+                time.sleep(3)
+                if self.message_queue.has_pending():
+                    logger.info("Agent 等待期间收到用户新消息，继续循环")
+                    continue
+
+                # 没有新消息，真正结束
                 break
 
         # 📘 达到上限
