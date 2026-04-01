@@ -70,16 +70,28 @@ class TranslatePageTool(BaseTool):
             )
 
         try:
-            # 如果有上下文提示，附加到每段文本前面
-            if context_hint:
-                enriched = [f"[上下文: {context_hint}] {t}" for t in texts]
-                results = self.translate_pipeline.translate_batch(
-                    enriched, target_lang=target_lang
+            lang_hint = {
+                "英文": "English", "中文": "Chinese", "日文": "Japanese",
+                "韩文": "Korean", "法文": "French", "德文": "German",
+                "西班牙文": "Spanish", "俄文": "Russian",
+            }
+            lang_english = lang_hint.get(target_lang, target_lang)
+
+            # 📘 教学笔记：检测格式标记，追加提醒
+            # 如果文本中包含 <r0>...</r0> 格式标记，
+            # 在 cross_page_hint 中追加提醒，确保翻译模型保留标记。
+            has_tags = any("<r0>" in t for t in texts)
+            hint = context_hint or ""
+            if has_tags:
+                hint += (
+                    " [重要：部分段落包含<r0>...</r0><r1>...</r1>格式标记，"
+                    "必须在译文中保留所有标记，只翻译标记内的文字]"
                 )
-            else:
-                results = self.translate_pipeline.translate_batch(
-                    texts, target_lang=target_lang
-                )
+
+            results = self.translate_pipeline._translate_batch(
+                texts, target_lang, lang_english,
+                cross_page_hint=hint,
+            )
 
             return json.dumps({
                 "translations": results,
