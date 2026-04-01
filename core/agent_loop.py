@@ -384,23 +384,28 @@ class AgentLoop:
                 final_text = text_content
                 self._notify_message("assistant", text_content)
 
-                # 📘 教学笔记：不立即退出，检查用户是否有待处理的消息
-                # 用户可能在 Agent 工作期间发了消息（修改需求、纠正翻译等）
-                # 如果有待处理消息，继续循环让模型处理
-                if self.message_queue.has_pending():
-                    logger.info("Agent 输出了文本，但用户有待处理消息，继续循环")
-                    continue
-
-                # 📘 短暂等待：给用户一个窗口期发送后续指令
-                # 等 3 秒，如果用户在这期间发了消息，继续处理
+                # 📘 教学笔记：任务完成后进入待命模式
+                # 用户可能要打开文件看看效果，然后提修改意见。
+                # 持续轮询消息队列，直到超时（5分钟没消息就真正退出）。
                 import time
-                time.sleep(3)
-                if self.message_queue.has_pending():
-                    logger.info("Agent 等待期间收到用户新消息，继续循环")
-                    continue
+                idle_timeout = 300  # 5 分钟无消息则退出
+                idle_start = time.time()
+                while not self._stop_event.is_set():
+                    if self.message_queue.has_pending():
+                        # 用户发了新消息，跳出待命，回到主循环处理
+                        logger.info("待命期间收到用户新消息，继续处理")
+                        break
+                    if time.time() - idle_start > idle_timeout:
+                        logger.info(f"待命 {idle_timeout}s 无新消息，Agent 退出")
+                        break
+                    time.sleep(0.5)  # 每 0.5 秒检查一次
+                else:
+                    break  # stop_event 被设置，退出
 
-                # 没有新消息，真正结束
-                break
+                # 如果是超时退出，真正结束
+                if not self.message_queue.has_pending():
+                    break
+                # 否则继续主循环（下一轮会读到用户消息）
 
         # 📘 达到上限
         if not final_text and not self._stop_event.is_set():
