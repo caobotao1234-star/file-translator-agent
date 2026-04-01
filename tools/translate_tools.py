@@ -76,26 +76,64 @@ class TranslatePageTool(BaseTool):
                 "西班牙文": "Spanish", "俄文": "Russian",
             }
             lang_english = lang_hint.get(target_lang, target_lang)
-
-            # 📘 教学笔记：检测格式标记，追加提醒
-            # 如果文本中包含 <r0>...</r0> 格式标记，
-            # 在 cross_page_hint 中追加提醒，确保翻译模型保留标记。
-            has_tags = any("<r0>" in t for t in texts)
             hint = context_hint or ""
-            if has_tags:
-                hint += (
-                    " [重要：部分段落包含<r0>...</r0><r1>...</r1>格式标记，"
-                    "必须在译文中保留所有标记，只翻译标记内的文字]"
-                )
 
+            # 📘 教学笔记：格式标记的可靠保留策略
+            # 翻译模型经常丢失 <r0>...</r0> 标记，不管怎么提醒都不可靠。
+            # 可靠方案：把带标记的文本拆开，提取纯文本翻译，再重新组装标记。
+            import re
+            TAG_RE = re.compile(r'<r(\d+)>(.*?)</r\1>', re.DOTALL)
+
+            # 分离：带标记的文本 vs 普通文本
+            tagged_indices = []  # 带标记的文本索引
+            plain_texts = []  # 要发给翻译模型的纯文本
+            tag_maps = {}  # {index: [(tag_idx, text), ...]}
+
+            for i, text in enumerate(texts):
+                matches = TAG_RE.findall(text)
+                if matches:
+                    # 带标记：提取每个 Run 的纯文本，拼成一段发给翻译模型
+                    tagged_indices.append(i)
+                    tag_maps[i] = [(int(idx), content) for idx, content in matches]
+                    # 把所有 Run 的文本拼成一段，用 ||| 分隔
+                    run_texts = [content for _, content in matches]
+                    plain_texts.append(" ||| ".join(run_texts))
+                else:
+                    plain_texts.append(text)
+
+            # 翻译所有纯文本
             results = self.translate_pipeline._translate_batch(
-                texts, target_lang, lang_english,
+                plain_texts, target_lang, lang_english,
                 cross_page_hint=hint,
             )
 
+            # 重新组装带标记的译文
+            final_results = []
+            for i, (orig, trans) in enumerate(zip(texts, results)):
+                if i in tag_maps:
+                    # 把翻译结果按 ||| 拆回各个 Run
+                    parts = [p.strip() for p in trans.split("|||")]
+                    tag_info = tag_maps[i]
+                    if len(parts) >= len(tag_info):
+                        # 重新包装标记
+                        tagged = "".join(
+                            f"<r{idx}>{parts[j]}</r{idx}>"
+                            for j, (idx, _) in enumerate(tag_info)
+                        )
+                        final_results.append(tagged)
+                    else:
+                        # 拆分数量不匹配，用整段译文包在 r0 里
+                        logger.warning(
+                            f"标记重组失败: 期望 {len(tag_info)} 段, "
+                            f"得到 {len(parts)} 段, 降级处理"
+                        )
+                        final_results.append(f"<r0>{trans}</r0>")
+                else:
+                    final_results.append(trans)
+
             return json.dumps({
-                "translations": results,
-                "count": len(results),
+                "translations": final_results,
+                "count": len(final_results),
             }, ensure_ascii=False)
 
         except Exception as e:
