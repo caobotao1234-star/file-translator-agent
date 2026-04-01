@@ -341,6 +341,7 @@ class AdjustFormatTool(BaseTool):
         """调整 Word 文档的段落格式"""
         from docx import Document
         from docx.shared import Pt as DocxPt
+        from docx.oxml.ns import qn
 
         doc = Document(path)
         paragraphs = doc.paragraphs
@@ -353,25 +354,62 @@ class AdjustFormatTool(BaseTool):
             font_name = adj.get("font_name")
 
             if para_index is not None and para_index < len(paragraphs):
-                # 调整指定段落
                 target_paras = [paragraphs[para_index]]
             else:
-                # page_index 模拟：每 20 段一页
-                page_idx = adj.get("page_index", 0)
-                chunk_size = 20
-                start = page_idx * chunk_size
-                end = min(start + chunk_size, len(paragraphs))
-                target_paras = paragraphs[start:end]
+                # page_index 模拟：每 20 段一页。page_index=-1 表示全部段落
+                page_idx = adj.get("page_index", -1)
+                if page_idx == -1:
+                    target_paras = list(paragraphs)
+                else:
+                    chunk_size = 20
+                    start = page_idx * chunk_size
+                    end = min(start + chunk_size, len(paragraphs))
+                    target_paras = paragraphs[start:end]
 
             for para in target_paras:
                 for run in para.runs:
+                    if not run.text:
+                        continue  # 跳过空 Run
                     if font_size is not None:
                         run.font.size = DocxPt(font_size)
                     if bold is not None:
                         run.font.bold = bold
                     if font_name is not None:
                         run.font.name = font_name
+                        # 📘 同时设置东亚字体，确保中文也生效
+                        rPr = run._element.get_or_add_rPr()
+                        rFonts = rPr.find(qn('w:rFonts'))
+                        if rFonts is None:
+                            from lxml import etree
+                            rFonts = etree.SubElement(rPr, qn('w:rFonts'))
+                        rFonts.set(qn('w:ascii'), font_name)
+                        rFonts.set(qn('w:hAnsi'), font_name)
+                        rFonts.set(qn('w:eastAsia'), font_name)
                     adjusted_count += 1
+
+            # 📘 也处理表格中的文字
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for para in cell.paragraphs:
+                            for run in para.runs:
+                                if not run.text:
+                                    continue
+                                if font_size is not None:
+                                    run.font.size = DocxPt(font_size)
+                                if bold is not None:
+                                    run.font.bold = bold
+                                if font_name is not None:
+                                    run.font.name = font_name
+                                    rPr = run._element.get_or_add_rPr()
+                                    rFonts = rPr.find(qn('w:rFonts'))
+                                    if rFonts is None:
+                                        from lxml import etree
+                                        rFonts = etree.SubElement(rPr, qn('w:rFonts'))
+                                    rFonts.set(qn('w:ascii'), font_name)
+                                    rFonts.set(qn('w:hAnsi'), font_name)
+                                    rFonts.set(qn('w:eastAsia'), font_name)
+                                adjusted_count += 1
 
         doc.save(path)
         return json.dumps({
