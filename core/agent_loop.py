@@ -24,6 +24,9 @@ from core.logger import get_logger
 logger = get_logger("agent_loop")
 
 MAX_TURNS = 50  # 单次任务最大循环次数，防止失控
+CONTEXT_COMPRESS_THRESHOLD = 0.85  # 消息历史占 context window 的比例超过此值时压缩
+ESTIMATED_CONTEXT_WINDOW = 128000  # 估算的 context window 大小（tokens）
+CHARS_PER_TOKEN = 3.5  # 粗略估算：平均每个 token 约 3.5 个字符
 
 
 class MessageQueue:
@@ -105,6 +108,7 @@ class AgentLoop:
         max_turns: int = MAX_TURNS,
         on_message: Callable[[str, str], None] = None,
         on_tool_call: Callable[[str, dict], None] = None,
+        on_token_update: Callable[[dict], None] = None,
     ):
         """
         📘 参数：
@@ -120,6 +124,7 @@ class AgentLoop:
         self.max_turns = max_turns
         self.on_message = on_message
         self.on_tool_call = on_tool_call
+        self.on_token_update = on_token_update
 
         # 📘 工具注册表
         self.tools: Dict[str, BaseTool] = {}
@@ -165,6 +170,96 @@ class AgentLoop:
             f"max_turns={max_turns}"
         )
 
+    def _estimate_tokens(self) -> int:
+        """
+        📘 粗略估算当前消息历史的 token 数
+
+        精确计算需要 tokenizer，这里用字符数 / 3.5 粗略估算。
+        中文字符密度更高（约 1.5 token/字），英文约 0.75 token/word。
+        取平均值 3.5 chars/token 作为折中。
+        """
+        total_chars = 0
+        for msg in self.messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+            elif isinstance(content, list):
+                # 多模态消息（图片+文本）
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        total_chars += len(part.get("text", ""))
+                    elif isinstance(part, dict) and part.get("type") == "image_url":
+                        total_chars += 1000  # 图片大约占 ~1000 tokens
+            # tool_calls 也占 token
+            if "tool_calls" in msg:
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {})
+                    total_chars += len(fn.get("name", ""))
+                    total_chars += len(fn.get("arguments", ""))
+        return int(total_chars / CHARS_PER_TOKEN)
+
+    def _maybe_compress(self):
+        """
+        📘 教学笔记：Context Window 压缩（参考 Claude Code 的 Compressor）
+
+        当消息历史接近 token 上限时，自动压缩：
+        1. 保留 system prompt（第一条消息）
+        2. 保留最近 N 轮对话
+        3. 中间的旧消息压缩为摘要
+
+        关键信息（术语表、用户偏好）应该已经通过 memory 工具外置，
+        不怕被压缩丢失。
+        """
+        estimated = self._estimate_tokens()
+        threshold = int(ESTIMATED_CONTEXT_WINDOW * CONTEXT_COMPRESS_THRESHOLD)
+
+        if estimated < threshold:
+            return  # 还没到压缩阈值
+
+        logger.info(
+            f"Context 接近上限: ~{estimated} tokens "
+            f"(阈值 {threshold})，开始压缩"
+        )
+
+        # 📘 压缩策略：保留 system prompt + 最近 10 条消息
+        # 中间的消息替换为一条摘要
+        keep_recent = 10
+        if len(self.messages) <= keep_recent + 2:
+            return  # 消息太少，不需要压缩
+
+        system_msg = self.messages[0]  # system prompt
+        old_messages = self.messages[1:-keep_recent]
+        recent_messages = self.messages[-keep_recent:]
+
+        # 📘 从旧消息中提取摘要
+        summary_parts = []
+        for msg in old_messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "assistant" and content:
+                # 只保留 assistant 的文本回复（不保留工具调用细节）
+                summary_parts.append(content[:200])
+            elif role == "tool":
+                # 工具结果只保留前 100 字符
+                if isinstance(content, str) and len(content) > 100:
+                    summary_parts.append(f"[工具结果: {content[:100]}...]")
+
+        summary = " | ".join(summary_parts[-5:])  # 最多保留 5 段摘要
+        if not summary:
+            summary = f"(已压缩 {len(old_messages)} 条旧消息)"
+
+        compressed_msg = {
+            "role": "user",
+            "content": f"[上下文摘要: {summary}]\n请继续之前的任务。",
+        }
+
+        self.messages = [system_msg, compressed_msg] + recent_messages
+        new_estimated = self._estimate_tokens()
+        logger.info(
+            f"Context 压缩完成: {estimated} -> ~{new_estimated} tokens, "
+            f"压缩了 {len(old_messages)} 条消息"
+        )
+
     def run(self, user_message: str) -> str:
         """
         📘 核心方法：执行一次完整的 Agent 任务
@@ -181,7 +276,10 @@ class AgentLoop:
                 logger.info("收到停止信号，Agent 退出")
                 break
 
-            # 📘 Step 1: 检查用户是否有新消息（交互式）
+            # 📘 Step 1: 检查 context window 是否需要压缩
+            self._maybe_compress()
+
+            # 📘 Step 2: 检查用户是否有新消息（交互式）
             while self.message_queue.has_pending():
                 new_msg = self.message_queue.pop()
                 if new_msg:
@@ -189,7 +287,7 @@ class AgentLoop:
                     self.messages.append({"role": "user", "content": new_msg})
                     self._notify_message("user", new_msg)
 
-            # 📘 Step 2: 调用模型
+            # 📘 Step 3: 调用模型
             tool_calls = []
             text_content = ""
 
@@ -206,6 +304,7 @@ class AgentLoop:
                     elif chunk["type"] == "usage":
                         self.stats["prompt_tokens"] += chunk.get("prompt_tokens", 0)
                         self.stats["completion_tokens"] += chunk.get("completion_tokens", 0)
+                        self._notify_token_update()
             except Exception as e:
                 logger.error(f"LLM 调用失败: {e}")
                 error_msg = f"模型调用出错: {type(e).__name__}: {e}"
@@ -214,7 +313,7 @@ class AgentLoop:
 
             self.stats["turns"] += 1
 
-            # 📘 Step 3: 模型要调工具 -> 执行 -> 反馈 -> 继续循环
+            # 📘 Step 4: 模型要调工具 -> 执行 -> 反馈 -> 继续循环
             if tool_calls:
                 # 把 assistant 消息（含 tool_calls）加入历史
                 assistant_msg = {"role": "assistant", "content": text_content or None}
@@ -272,7 +371,7 @@ class AgentLoop:
 
                 continue  # 继续循环
 
-            # 📘 Step 4: 模型返回纯文本 -> 任务完成
+            # 📘 Step 5: 模型返回纯文本 -> 任务完成
             if text_content:
                 final_text = text_content
                 self._notify_message("assistant", text_content)
@@ -316,5 +415,12 @@ class AgentLoop:
         if self.on_tool_call:
             try:
                 self.on_tool_call(tool_name, params)
+            except Exception:
+                pass
+
+    def _notify_token_update(self):
+        if self.on_token_update:
+            try:
+                self.on_token_update(self.stats)
             except Exception:
                 pass

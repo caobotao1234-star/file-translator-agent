@@ -8,6 +8,7 @@
 # =============================================================
 
 import json
+import os
 from typing import Dict, List
 
 from core.agent_loop import BaseTool
@@ -21,13 +22,47 @@ class MemoryStore:
     📘 Agent 的记忆存储
 
     跨页、跨文件的持久化记忆。Agent 通过工具读写。
+    术语表自动保存到磁盘，下次翻译时自动加载。
     """
+
+    PERSIST_PATH = "translator_config/agent_memory.json"
 
     def __init__(self):
         self.glossary: Dict[str, str] = {}  # 术语表 {原文: 译文}
         self.summary: str = ""  # 文档内容摘要
         self.user_preferences: List[str] = []  # 用户偏好
         self.translation_cache: Dict[str, str] = {}  # 翻译缓存
+        self._load()
+
+    def _load(self):
+        """从磁盘加载持久化记忆"""
+        import json as _json
+        if os.path.exists(self.PERSIST_PATH):
+            try:
+                with open(self.PERSIST_PATH, "r", encoding="utf-8") as f:
+                    data = _json.load(f)
+                self.glossary = data.get("glossary", {})
+                self.user_preferences = data.get("user_preferences", [])
+                logger.info(
+                    f"已加载记忆: {len(self.glossary)} 个术语, "
+                    f"{len(self.user_preferences)} 个偏好"
+                )
+            except Exception as e:
+                logger.warning(f"加载记忆失败: {e}")
+
+    def save(self):
+        """保存记忆到磁盘"""
+        import json as _json
+        os.makedirs(os.path.dirname(self.PERSIST_PATH), exist_ok=True)
+        data = {
+            "glossary": self.glossary,
+            "user_preferences": self.user_preferences,
+        }
+        try:
+            with open(self.PERSIST_PATH, "w", encoding="utf-8") as f:
+                _json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"保存记忆失败: {e}")
 
     def to_dict(self) -> dict:
         return {
@@ -107,6 +142,10 @@ class UpdateMemoryTool(BaseTool):
         if pref:
             self.memory.user_preferences.append(pref)
             added.append(f"偏好: {pref}")
+
+        # 📘 自动持久化到磁盘
+        if added:
+            self.memory.save()
 
         return json.dumps({
             "updated": ", ".join(added) if added else "无更新",
