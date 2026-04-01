@@ -329,11 +329,23 @@ class MainWindow(QMainWindow):
         from tools.format_tools import InspectOutputTool, AdjustFormatTool
         from tools.vision_tools import GetPageImageTool, create_scan_tools
         from prompts.agent_prompts import TRANSLATION_AGENT_PROMPT
+        from core.skill_loader import SkillLoader
 
         router = LLMRouter(api_key=Config.ARK_API_KEY)
         router.register_model("translate", model_str=Config.DEFAULT_MODEL_ID)
         router.register_model("agent_brain", model_str=brain_model)
         brain_engine = router.get("agent_brain")
+
+        # 📘 图片生成模型（从 .env 读取，如果有的话）
+        image_gen_engine = None
+        image_models = Config.get_image_gen_models()
+        if image_models:
+            first_image_model = list(image_models.values())[0]
+            try:
+                router.register_model("image_gen", model_str=first_image_model)
+                image_gen_engine = router.get("image_gen")
+            except Exception as e:
+                logger.warning(f"图片生成模型注册失败: {e}")
 
         pipeline = TranslatePipeline(
             translate_llm=router.get("translate"),
@@ -360,6 +372,8 @@ class MainWindow(QMainWindow):
             if self.worker:
                 self.worker.progress_signal.emit(current, total, message)
 
+        from tools.layout_tools_v2 import RenderSlideTool, EnableAutofitTool, CompareLayoutTool, SmartResizeTool
+
         tools = [
             parse_tool,
             GetPageContentTool(parse_tool),
@@ -368,13 +382,20 @@ class MainWindow(QMainWindow):
             TranslatePageTool(translate_pipeline=pipeline),
             InspectOutputTool(),
             AdjustFormatTool(),
+            RenderSlideTool(),
+            EnableAutofitTool(),
+            CompareLayoutTool(),
+            SmartResizeTool(),
             ReadMemoryTool(memory),
             UpdateMemoryTool(memory),
             AskUserTool(on_ask=on_ask),
             ReportProgressTool(on_progress=on_progress_safe),
         ]
 
-        scan_tools, scan_ctx = create_scan_tools(page_image_tool=page_image_tool)
+        scan_tools, scan_ctx = create_scan_tools(
+            page_image_tool=page_image_tool,
+            image_gen_engine=image_gen_engine,
+        )
         tools.extend(scan_tools)
         parse_tool._scan_context = scan_ctx
 
@@ -382,8 +403,7 @@ class MainWindow(QMainWindow):
             llm_engine=brain_engine,
             tools=tools,
             system_prompt=TRANSLATION_AGENT_PROMPT,
-            # 📘 关键：不直接传 GUI 回调给 Agent（会跨线程崩溃）
-            # Agent 的回调通过 worker 的 signal 转发到主线程
+            skill_loader=SkillLoader(),
         )
 
         # 构建用户消息
