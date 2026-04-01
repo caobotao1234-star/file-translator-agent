@@ -180,6 +180,7 @@ class MainWindow(QMainWindow):
         self.agent = None
         self.worker = None
         self._files = []
+        self._waiting_for_answer = False  # 📘 Agent 是否在等用户回答
 
         self._build_ui()
 
@@ -419,14 +420,19 @@ class MainWindow(QMainWindow):
         if not text:
             return
         self.chat_panel.input_field.clear()
+        self.chat_panel.input_field.setPlaceholderText("输入消息... (Enter 发送)")
         self.chat_panel.append_message("user", text)
 
-        # 注入到 Agent 的消息队列
-        if self.agent:
+        # 📘 如果 Agent 在等回答，发到 answer_queue；否则发到 message_queue
+        if self._waiting_for_answer and self.worker:
+            self.worker.provide_answer(text)
+            self._waiting_for_answer = False
+        elif self.agent:
             self.agent.message_queue.inject(text)
 
     def _on_agent_ask(self, question: str):
         """Agent 提问回调（主线程，signal 触发）"""
+        self._waiting_for_answer = True
         self.chat_panel.append_message("assistant", f"❓ {question}")
         self.chat_panel.input_field.setFocus()
         self.chat_panel.input_field.setPlaceholderText("请回答 Agent 的问题...")

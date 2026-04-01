@@ -160,7 +160,8 @@ class GetPageContentTool(BaseTool):
         elif doc_type in ("PDF", "scanned_PDF"):
             return f"pg{page_idx}_"
         else:
-            return f"p{page_idx}"
+            # Word: key 格式是 p_0, p_1, t_0_0_0
+            return f"p_{page_idx}"
 
     def execute(self, params: dict) -> str:
         parsed = self._parse_tool._parsed_cache.get("_last")
@@ -175,12 +176,36 @@ class GetPageContentTool(BaseTool):
             page_idx = params.get("page_index", 0)
             page_indices = [page_idx]
 
+        all_items = parsed.get("items", [])
+
+        # 📘 Word 没有"页"的概念，所有段落是线性的
+        # page_index=0 返回全部内容，page_index=N 返回第 N 批（每批 30 段）
+        if doc_type == "Word":
+            chunk_size = 30
+            result_items = []
+            for pidx in page_indices:
+                start = pidx * chunk_size
+                end = min(start + chunk_size, len(all_items))
+                for item in all_items[start:end]:
+                    result_items.append({
+                        "key": item.get("key", ""),
+                        "text": item.get("full_text", ""),
+                        "type": item.get("type", ""),
+                    })
+            return json.dumps({
+                "pages_requested": len(page_indices),
+                "total_items": len(result_items),
+                "doc_note": "Word 文档按段落分批，每批 30 段",
+                "pages": {"all": result_items},
+            }, ensure_ascii=False)
+
+        # PPT / PDF：按页码前缀过滤
         all_results = {}
         total_items = 0
         for pidx in page_indices:
             prefix = self._get_page_prefix(pidx, doc_type)
             page_items = []
-            for item in parsed.get("items", []):
+            for item in all_items:
                 key = item.get("key", "")
                 if key.startswith(prefix):
                     page_items.append({
