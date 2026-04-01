@@ -20,25 +20,28 @@ class TranslatePageTool(BaseTool):
     """
     📘 翻译一组文本
 
-    支持批量翻译（多页的文本一次性发过来）。
-    内部调用 TranslatePipeline（便宜的翻译模型）。
+    Agent 传 keys 列表，工具自己从 parsed_data 读取原文（含格式标记），
+    翻译后返回 {key: 译文} 映射。工具内部处理格式标记保留。
     """
 
     name = "translate_page"
     description = (
-        "翻译一组文本段落。输入 texts 数组和目标语言，"
-        "返回对应的翻译结果数组。内部使用专业翻译模型，高效且便宜。"
-        "可以一次传入多页的文本一起翻译，提高效率。"
-        "如果你能看到图片且需要上下文理解，"
-        "也可以选择自己直接翻译而不调用此工具。"
+        "翻译指定的段落。传入 keys 数组（从 get_page_content 获取）和目标语言。"
+        "也可以直接传 texts 数组。工具内部自动处理格式标记保留。"
+        "返回 {key: 译文} 或 translations 数组。"
     )
     parameters = {
         "type": "object",
         "properties": {
+            "keys": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "要翻译的段落 key 列表（从 get_page_content 获取）",
+            },
             "texts": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "待翻译的文本列表（可以包含多页的文本）",
+                "description": "直接传入文本列表（备选，不传 keys 时用）",
             },
             "target_lang": {
                 "type": "string",
@@ -46,28 +49,24 @@ class TranslatePageTool(BaseTool):
             },
             "context_hint": {
                 "type": "string",
-                "description": "可选的上下文提示（如文档主题、前文摘要）",
+                "description": "可选的上下文提示",
             },
         },
-        "required": ["texts", "target_lang"],
+        "required": ["target_lang"],
     }
 
-    def __init__(self, translate_pipeline=None):
+    def __init__(self, translate_pipeline=None, parse_tool=None):
         self.translate_pipeline = translate_pipeline
+        self._parse_tool = parse_tool
 
     def execute(self, params: dict) -> str:
-        texts = params["texts"]
         target_lang = params["target_lang"]
         context_hint = params.get("context_hint", "")
-
-        if not texts:
-            return json.dumps({"translations": []}, ensure_ascii=False)
+        keys = params.get("keys", [])
+        texts = params.get("texts", [])
 
         if not self.translate_pipeline:
-            return json.dumps(
-                {"error": "翻译模型未初始化"},
-                ensure_ascii=False,
-            )
+            return json.dumps({"error": "翻译模型未初始化"}, ensure_ascii=False)
 
         try:
             lang_hint = {
@@ -76,23 +75,32 @@ class TranslatePageTool(BaseTool):
                 "西班牙文": "Spanish", "俄文": "Russian",
             }
             lang_english = lang_hint.get(target_lang, target_lang)
-            hint = context_hint or ""
-
-            # 📘 教学笔记：格式标记处理策略
-            # 带 <r0>...</r0> 标记的文本，提取纯文本翻译，
-            # 然后把整段译文包在 <r0> 里（writer 会用第一个 Run 的格式）。
-            # 不再尝试按 Run 拆分（拆分会导致空格丢失和连字问题）。
             import re
             TAG_RE = re.compile(r'<r(\d+)>(.*?)</r\1>', re.DOTALL)
 
-            # 提取纯文本用于翻译
-            plain_texts = []
-            tagged_flags = []  # 记录哪些文本有标记
+            # 📘 如果传了 keys，从 parsed_data 读取原文（含格式标记）
+            if keys and self._parse_tool:
+                parsed = self._parse_tool._parsed_cache.get("_last", {})
+                item_map = {item["key"]: item for item in parsed.get("items", [])}
+                texts = []
+                key_list = []
+                for k in keys:
+                    item = item_map.get(k)
+                    if item and item.get("full_text"):
+                        texts.append(item["full_text"])
+                        key_list.append(k)
+            else:
+                key_list = [f"t_{i}" for i in range(len(texts))]
 
+            if not texts:
+                return json.dumps({"translations": {}, "count": 0}, ensure_ascii=False)
+
+            # 📘 提取纯文本用于翻译（去掉标记）
+            plain_texts = []
+            tagged_flags = []
             for text in texts:
                 matches = TAG_RE.findall(text)
                 if matches:
-                    # 带标记：提取所有 Run 的纯文本拼成完整句子
                     pure = "".join(content for _, content in matches)
                     plain_texts.append(pure)
                     tagged_flags.append(True)
@@ -100,18 +108,20 @@ class TranslatePageTool(BaseTool):
                     plain_texts.append(text)
                     tagged_flags.append(False)
 
-            # 翻译纯文本
+            # 翻译
             results = self.translate_pipeline._translate_batch(
                 plain_texts, target_lang, lang_english,
-                cross_page_hint=hint,
+                cross_page_hint=context_hint or "",
             )
 
-            # 重新包装：不加标记，让 writer 按比例分配到各 Run
-            final_results = list(results)
+            # 📘 构建 key -> 译文 映射
+            translations = {}
+            for i, (key, trans) in enumerate(zip(key_list, results)):
+                translations[key] = trans
 
             return json.dumps({
-                "translations": final_results,
-                "count": len(final_results),
+                "translations": translations,
+                "count": len(translations),
             }, ensure_ascii=False)
 
         except Exception as e:

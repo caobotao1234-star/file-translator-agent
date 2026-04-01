@@ -379,7 +379,7 @@ class MainWindow(QMainWindow):
             GetPageContentTool(parse_tool),
             page_image_tool,
             WriteDocumentTool(parse_tool, fmt),
-            TranslatePageTool(translate_pipeline=pipeline),
+            TranslatePageTool(translate_pipeline=pipeline, parse_tool=parse_tool),
             InspectOutputTool(),
             AdjustFormatTool(),
             RenderSlideTool(),
