@@ -104,6 +104,38 @@ class ParseDocumentTool(BaseTool):
                     sorted(page_stats.items())
                 ),
             }
+
+            # 📘 检测异常文档（图片多/文本少 → 可能是扫描件）
+            warnings = []
+            if ext == ".docx":
+                image_count = self._count_docx_images(filepath)
+                overview["image_count"] = image_count
+                if non_empty == 0 and image_count > 0:
+                    warnings.append(
+                        f"文档没有可提取的文本，但包含 {image_count} 张图片。"
+                        f"这可能是扫描件（图片形式的文档）。"
+                        f"请用 ask_user 确认用户是否需要翻译图片中的文字。"
+                    )
+                elif non_empty < 5 and image_count > non_empty:
+                    warnings.append(
+                        f"文档文本很少（{non_empty} 段），但图片较多（{image_count} 张）。"
+                        f"部分内容可能以图片形式存在。"
+                        f"请用 ask_user 确认用户是否需要翻译图片中的文字。"
+                    )
+            elif ext == ".pdf" and doc_type == "scanned_PDF":
+                warnings.append(
+                    "检测到扫描件 PDF（页面几乎没有可提取的文本）。"
+                    "请用 ask_user 确认用户是否需要翻译，以及翻译后的输出格式偏好。"
+                )
+            elif ext == ".pdf" and doc_type == "PDF" and non_empty < 3:
+                warnings.append(
+                    f"PDF 文本很少（{non_empty} 段），可能是部分扫描件。"
+                    "请用 ask_user 确认文档情况。"
+                )
+
+            if warnings:
+                overview["warnings"] = warnings
+
             return json.dumps(overview, ensure_ascii=False)
 
         except Exception as e:
@@ -122,6 +154,20 @@ class ParseDocumentTool(BaseTool):
         parsed = parse_pdf(filepath)
         parsed["_doc_type"] = "PDF"
         return parsed
+
+    def _count_docx_images(self, filepath: str) -> int:
+        """统计 Word 文档中的图片数量"""
+        try:
+            from docx import Document
+            from docx.opc.constants import RELATIONSHIP_TYPE as RT
+            doc = Document(filepath)
+            count = 0
+            for rel in doc.part.rels.values():
+                if "image" in rel.reltype:
+                    count += 1
+            return count
+        except Exception:
+            return 0
 
 
 class GetPageContentTool(BaseTool):

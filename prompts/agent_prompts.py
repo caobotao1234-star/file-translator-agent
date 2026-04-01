@@ -61,4 +61,6 @@ TRANSLATION_AGENT_PROMPT = """\
 - 专有名词跨页保持一致（用 memory 工具）
 - 不确定的翻译（人名、专业术语），用 ask_user 问用户
 - 翻译结果通过 write_document 输出，translations 格式: {"key": "译文", ...}
+- parse_document 返回 warnings 时，必须先用 ask_user 确认再继续
+- 不要自己假设文档类型就开干，遇到异常情况（文本少、图片多、扫描件）先问用户
 """
