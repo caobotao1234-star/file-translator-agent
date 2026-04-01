@@ -34,7 +34,9 @@ class AgentWorker(QThread):
     📘 Agent 后台线程
 
     Agent Loop 跑在这个线程里，不阻塞 GUI。
-    通过信号把 Agent 的输出发送到 GUI。
+    通过信号把 Agent 的输出发送到 GUI 主线程。
+
+    📘 关键：所有 GUI 更新必须通过 signal，不能直接调用 widget 方法。
     """
     message_signal = pyqtSignal(str, str)  # (role, content)
     tool_signal = pyqtSignal(str, str)  # (tool_name, params_short)
@@ -47,6 +49,18 @@ class AgentWorker(QThread):
         self.agent = agent
         self.user_message = user_message
         self._answer_queue = queue.Queue()
+
+        # 📘 把 Agent 的回调绑定到 signal（线程安全）
+        self.agent.on_message = self._on_message
+        self.agent.on_tool_call = self._on_tool_call
+
+    def _on_message(self, role, content):
+        """从 Agent 线程发射信号到主线程"""
+        self.message_signal.emit(role, content)
+
+    def _on_tool_call(self, name, params):
+        """从 Agent 线程发射信号到主线程"""
+        self.tool_signal.emit(name, str(params)[:80])
 
     def run(self):
         try:
@@ -340,6 +354,11 @@ class MainWindow(QMainWindow):
                     return None
             return None
 
+        # 📘 progress 回调也要通过 signal（线程安全）
+        def on_progress_safe(current, total, message):
+            if self.worker:
+                self.worker.progress_signal.emit(current, total, message)
+
         tools = [
             parse_tool,
             GetPageContentTool(parse_tool),
@@ -351,7 +370,7 @@ class MainWindow(QMainWindow):
             ReadMemoryTool(memory),
             UpdateMemoryTool(memory),
             AskUserTool(on_ask=on_ask),
-            ReportProgressTool(on_progress=self._on_progress_callback),
+            ReportProgressTool(on_progress=on_progress_safe),
         ]
 
         scan_tools, scan_ctx = create_scan_tools(page_image_tool=page_image_tool)
@@ -362,8 +381,8 @@ class MainWindow(QMainWindow):
             llm_engine=brain_engine,
             tools=tools,
             system_prompt=TRANSLATION_AGENT_PROMPT,
-            on_message=lambda r, c: self._on_agent_message(r, c),
-            on_tool_call=lambda n, p: self._on_agent_tool(n, p),
+            # 📘 关键：不直接传 GUI 回调给 Agent（会跨线程崩溃）
+            # Agent 的回调通过 worker 的 signal 转发到主线程
         )
 
         # 构建用户消息
@@ -406,24 +425,11 @@ class MainWindow(QMainWindow):
         if self.agent:
             self.agent.message_queue.inject(text)
 
-    def _on_agent_message(self, role: str, content: str):
-        """Agent 输出回调（从后台线程）"""
-        self.chat_panel.append_message(role, content)
-
-    def _on_agent_tool(self, name: str, params: dict):
-        """工具调用回调"""
-        short = str(params)[:80]
-        self.chat_panel.append_message("tool", f"{name}({short})")
-
     def _on_agent_ask(self, question: str):
-        """Agent 提问回调"""
+        """Agent 提问回调（主线程，signal 触发）"""
         self.chat_panel.append_message("assistant", f"❓ {question}")
         self.chat_panel.input_field.setFocus()
         self.chat_panel.input_field.setPlaceholderText("请回答 Agent 的问题...")
-
-    def _on_progress_callback(self, current: int, total: int, message: str):
-        """进度回调（从工具线程）"""
-        self.chat_panel.set_progress(current, total, message)
 
     def _on_done(self):
         """Agent 完成"""
