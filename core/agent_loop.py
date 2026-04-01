@@ -109,6 +109,7 @@ class AgentLoop:
         on_message: Callable[[str, str], None] = None,
         on_tool_call: Callable[[str, dict], None] = None,
         on_token_update: Callable[[dict], None] = None,
+        skill_loader=None,
     ):
         """
         📘 参数：
@@ -125,6 +126,7 @@ class AgentLoop:
         self.on_message = on_message
         self.on_tool_call = on_tool_call
         self.on_token_update = on_token_update
+        self.skill_loader = skill_loader
 
         # 📘 工具注册表
         self.tools: Dict[str, BaseTool] = {}
@@ -369,6 +371,12 @@ class AgentLoop:
                         "content": tool_result,
                     })
 
+                    # 📘 Skill 按需加载：工具返回后检查是否需要注入 Skill
+                    if self.skill_loader and tool_name == "parse_document":
+                        self._inject_skills_from_parse(tool_result)
+                    elif self.skill_loader and tool_name == "write_document":
+                        self._inject_skills({"phase": "after_write"})
+
                 continue  # 继续循环
 
             # 📘 Step 5: 模型返回纯文本 -> 任务完成
@@ -424,3 +432,27 @@ class AgentLoop:
                 self.on_token_update(self.stats)
             except Exception:
                 pass
+
+    def _inject_skills_from_parse(self, parse_result: str):
+        """📘 从 parse_document 结果中提取 doc_type，加载匹配的 Skill"""
+        try:
+            data = json.loads(parse_result)
+            doc_type = data.get("doc_type", "")
+            if doc_type:
+                self._inject_skills({"doc_type": doc_type})
+        except (json.JSONDecodeError, Exception):
+            pass
+
+    def _inject_skills(self, context: dict):
+        """📘 根据上下文匹配并注入 Skill 到消息历史"""
+        if not self.skill_loader:
+            return
+        matched = self.skill_loader.match_skills(context)
+        for skill in matched:
+            skill_text = self.skill_loader.load_skill(skill)
+            # 📘 作为 system 级消息注入，模型会当作重要指令
+            self.messages.append({
+                "role": "user",
+                "content": f"[系统加载了专业技能包: {skill.name}]\n{skill_text}",
+            })
+            logger.info(f"注入 Skill: {skill.name}")

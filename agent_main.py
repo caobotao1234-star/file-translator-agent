@@ -20,6 +20,7 @@ from core.llm_router import LLMRouter
 from core.agent_loop import AgentLoop
 from translator.translate_pipeline import TranslatePipeline
 from translator.format_engine import FormatEngine
+from core.skill_loader import SkillLoader
 
 from tools.doc_tools import ParseDocumentTool, GetPageContentTool, WriteDocumentTool
 from tools.translate_tools import TranslatePageTool
@@ -144,12 +145,14 @@ def build_agent(translate_model_id: str = None, brain_model_id: str = None,
     parse_tool._scan_context = scan_context
 
     # ── 5. Agent Loop ──
+    skill_loader = SkillLoader()
     agent = AgentLoop(
         llm_engine=brain_engine,
         tools=tools,
         system_prompt=TRANSLATION_AGENT_PROMPT,
         on_message=on_message,
         on_tool_call=on_tool_call,
+        skill_loader=skill_loader,
     )
 
     return agent
