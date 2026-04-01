@@ -233,11 +233,25 @@ class GetPageContentTool(BaseTool):
                 start = pidx * chunk_size
                 end = min(start + chunk_size, len(all_items))
                 for item in all_items[start:end]:
-                    result_items.append({
+                    entry = {
                         "key": item.get("key", ""),
                         "text": item.get("full_text", ""),
                         "type": item.get("type", ""),
-                    })
+                    }
+                    # 📘 返回 Run 格式详情，让 Agent 看到段内格式
+                    runs_data = item.get("runs")
+                    if runs_data and len(runs_data) > 1:
+                        entry["runs"] = [
+                            {
+                                "text": r.get("text", ""),
+                                "bold": r.get("format", {}).get("bold"),
+                                "italic": r.get("format", {}).get("italic"),
+                                "font_color": r.get("format", {}).get("font_color"),
+                            }
+                            for r in runs_data
+                        ]
+                        entry["has_mixed_format"] = True
+                    result_items.append(entry)
             return json.dumps({
                 "pages_requested": len(page_indices),
                 "total_items": len(result_items),
@@ -254,11 +268,24 @@ class GetPageContentTool(BaseTool):
             for item in all_items:
                 key = item.get("key", "")
                 if key.startswith(prefix):
-                    page_items.append({
+                    entry = {
                         "key": key,
                         "text": item.get("full_text", ""),
                         "type": item.get("type", ""),
-                    })
+                    }
+                    runs_data = item.get("runs")
+                    if runs_data and len(runs_data) > 1:
+                        entry["runs"] = [
+                            {
+                                "text": r.get("text", ""),
+                                "bold": r.get("format", {}).get("bold"),
+                                "italic": r.get("format", {}).get("italic"),
+                                "font_color": r.get("format", {}).get("font_color"),
+                            }
+                            for r in runs_data
+                        ]
+                        entry["has_mixed_format"] = True
+                    page_items.append(entry)
             all_results[str(pidx)] = page_items
             total_items += len(page_items)
 
