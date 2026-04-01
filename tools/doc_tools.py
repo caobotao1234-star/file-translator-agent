@@ -117,15 +117,14 @@ class ParseDocumentTool(BaseTool):
 
 class GetPageContentTool(BaseTool):
     """
-    📘 获取指定页的文本内容
+    📘 获取指定页（或多页）的文本内容
 
-    Agent 用这个工具查看某一页的所有文本段落。
-    需要先调用 parse_document。
+    支持单页和批量获取，减少 Agent turn 数。
     """
 
     name = "get_page_content"
     description = (
-        "获取指定页/幻灯片的所有文本段落。"
+        "获取指定页/幻灯片的所有文本段落。支持批量获取多页。"
         "返回每个段落的 key、原文、类型。需要先调用 parse_document。"
     )
     parameters = {
@@ -133,45 +132,60 @@ class GetPageContentTool(BaseTool):
         "properties": {
             "page_index": {
                 "type": "integer",
-                "description": "页码（0-based）",
+                "description": "单页页码（0-based）。与 page_range 二选一。",
+            },
+            "page_range": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "多页页码列表，如 [0,1,2,3,4]。一次获取多页内容。",
             },
         },
-        "required": ["page_index"],
     }
 
     def __init__(self, parse_tool: ParseDocumentTool):
         self._parse_tool = parse_tool
 
+    def _get_page_prefix(self, page_idx: int, doc_type: str) -> str:
+        if doc_type == "PPT":
+            return f"s{page_idx}_"
+        elif doc_type in ("PDF", "scanned_PDF"):
+            return f"pg{page_idx}_"
+        else:
+            return f"p{page_idx}"
+
     def execute(self, params: dict) -> str:
-        page_idx = params["page_index"]
         parsed = self._parse_tool._parsed_cache.get("_last")
         if not parsed:
             return json.dumps({"error": "请先调用 parse_document"}, ensure_ascii=False)
 
         doc_type = self._parse_tool._parsed_cache.get("_last_type", "")
 
-        # 按页码前缀过滤
-        if doc_type == "PPT":
-            prefix = f"s{page_idx}_"
-        elif doc_type in ("PDF", "scanned_PDF"):
-            prefix = f"pg{page_idx}_"
-        else:
-            prefix = f"p{page_idx}"
+        # 支持单页或多页
+        page_indices = params.get("page_range")
+        if page_indices is None:
+            page_idx = params.get("page_index", 0)
+            page_indices = [page_idx]
 
-        page_items = []
-        for item in parsed.get("items", []):
-            key = item.get("key", "")
-            if key.startswith(prefix):
-                page_items.append({
-                    "key": key,
-                    "text": item.get("full_text", ""),
-                    "type": item.get("type", ""),
-                })
+        all_results = {}
+        total_items = 0
+        for pidx in page_indices:
+            prefix = self._get_page_prefix(pidx, doc_type)
+            page_items = []
+            for item in parsed.get("items", []):
+                key = item.get("key", "")
+                if key.startswith(prefix):
+                    page_items.append({
+                        "key": key,
+                        "text": item.get("full_text", ""),
+                        "type": item.get("type", ""),
+                    })
+            all_results[str(pidx)] = page_items
+            total_items += len(page_items)
 
         return json.dumps({
-            "page_index": page_idx,
-            "items_count": len(page_items),
-            "items": page_items,
+            "pages_requested": len(page_indices),
+            "total_items": total_items,
+            "pages": all_results,
         }, ensure_ascii=False)
 
 

@@ -459,3 +459,33 @@ Agent: 收到，已记录。继续...
 | 交互式增加复杂度 | ask_user 有超时兜底，用户不回答就自行决定 |
 | Gemini API 配额限制 | 主模型可以用 doubao（便宜），只在需要看图时用 gemini |
 | 重构期间现有功能不可用 | 新旧并存，feature branch 开发 |
+
+## 7. Phase 1 测试发现的问题
+
+### 7.1 Turn 过多导致速度慢（优先级：高）
+
+Phase 1 实测 23 页 PPT，Agent 每页需要 4-5 个 turn：
+```
+get_page_content(N) → translate_page(N) → update_memory → report_progress
+```
+每个 turn 都要调一次 Brain LLM 来"思考下一步做什么"，23 页 = 100+ 次 Brain 调用。
+旧架构只需要 23 次翻译调用（无 Brain 思考开销）。
+
+#### 优化方案
+
+1. 批量操作工具：让 get_page_content 支持一次拿多页，translate_page 支持一次翻多页
+2. System Prompt 引导：告诉 Agent "你可以一次处理多页，不需要逐页调工具"
+3. 合并工具调用：LLM 支持一次返回多个 tool_call（parallel tool calls），
+   Agent Loop 已经支持，但需要 prompt 引导模型这样做
+4. 减少不必要的 turn：update_memory 和 report_progress 可以合并到 translate 后的同一轮
+5. 考虑"自动驾驶模式"：对于简单文档（纯文本 PPT/Word），Agent 可以一次性
+   拿到所有页面内容 → 一次性翻译 → 一次性写入，只需 3-4 个 turn 完成整个文档
+
+#### 目标
+23 页 PPT 从 100+ turns 降到 10-15 turns，速度接近旧架构。
+
+### 7.2 Gemini 代理超时（优先级：低）
+
+4月1日测试时 Gemini 通过代理连接超时，doubao 正常。
+这是网络问题不是代码问题，但需要在 agent_main.py 中加超时处理，
+避免无限等待。

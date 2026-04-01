@@ -18,17 +18,18 @@ logger = get_logger("translate_tools")
 
 class TranslatePageTool(BaseTool):
     """
-    📘 翻译一页的文本
+    📘 翻译一组文本
 
-    内部调用 TranslatePipeline（便宜的翻译模型），
-    Agent 不需要知道内部用什么模型。
+    支持批量翻译（多页的文本一次性发过来）。
+    内部调用 TranslatePipeline（便宜的翻译模型）。
     """
 
     name = "translate_page"
     description = (
         "翻译一组文本段落。输入 texts 数组和目标语言，"
         "返回对应的翻译结果数组。内部使用专业翻译模型，高效且便宜。"
-        "适合大量纯文本翻译。如果你能看到图片且需要上下文理解，"
+        "可以一次传入多页的文本一起翻译，提高效率。"
+        "如果你能看到图片且需要上下文理解，"
         "也可以选择自己直接翻译而不调用此工具。"
     )
     parameters = {
@@ -37,7 +38,7 @@ class TranslatePageTool(BaseTool):
             "texts": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "待翻译的文本列表",
+                "description": "待翻译的文本列表（可以包含多页的文本）",
             },
             "target_lang": {
                 "type": "string",
