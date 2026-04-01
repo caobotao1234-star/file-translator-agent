@@ -63,9 +63,11 @@ class InspectOutputTool(BaseTool):
                 return self._inspect_pptx(output_path, page_idx)
             elif ext == ".pdf":
                 return self._inspect_pdf(output_path, page_idx)
+            elif ext == ".docx":
+                return self._inspect_docx(output_path, page_idx)
             else:
                 return json.dumps(
-                    {"error": f"不支持检查此文件类型: {ext}，请直接打开文件查看"},
+                    {"error": f"不支持检查此文件类型: {ext}"},
                     ensure_ascii=False,
                 )
         except Exception as e:
@@ -151,6 +153,76 @@ class InspectOutputTool(BaseTool):
             "height": pix.height,
         }, ensure_ascii=False)
 
+    def _inspect_docx(self, path: str, page_idx: int) -> str:
+        """检查 Word 文档的段落格式信息"""
+        from docx import Document
+        from docx.shared import Pt as DocxPt
+
+        doc = Document(path)
+        paragraphs = doc.paragraphs
+
+        # Word 没有"页"的概念，用段落范围模拟
+        # page_idx=0 → 前 20 段，page_idx=1 → 20-40 段，以此类推
+        chunk_size = 20
+        start = page_idx * chunk_size
+        end = min(start + chunk_size, len(paragraphs))
+
+        if start >= len(paragraphs):
+            return json.dumps({
+                "error": f"段落范围越界: 起始 {start} >= 总段落数 {len(paragraphs)}"
+            }, ensure_ascii=False)
+
+        para_infos = []
+        for i in range(start, end):
+            para = paragraphs[i]
+            text = para.text.strip()
+            if not text:
+                continue
+
+            font_sizes = []
+            font_names = []
+            for run in para.runs:
+                if run.font.size:
+                    font_sizes.append(round(run.font.size.pt, 1))
+                if run.font.name:
+                    font_names.append(run.font.name)
+
+            info = {
+                "index": i,
+                "text": text[:80],
+                "char_count": len(text),
+                "style": para.style.name if para.style else None,
+                "alignment": str(para.alignment) if para.alignment else None,
+                "font_sizes": list(set(font_sizes)) if font_sizes else [],
+                "font_names": list(set(font_names)) if font_names else [],
+            }
+
+            # 检测潜在问题
+            if font_sizes and min(font_sizes) < 8:
+                info["warning"] = "字号过小"
+            if len(text) > 200:
+                info["warning"] = "段落很长，检查是否需要分段"
+
+            para_infos.append(info)
+
+        # 也检查表格
+        table_infos = []
+        for t_idx, table in enumerate(doc.tables):
+            table_infos.append({
+                "table_index": t_idx,
+                "rows": len(table.rows),
+                "cols": len(table.columns),
+            })
+
+        return json.dumps({
+            "page_index": page_idx,
+            "paragraph_range": f"{start}-{end}",
+            "total_paragraphs": len(paragraphs),
+            "paragraphs": para_infos,
+            "tables_count": len(table_infos),
+            "tables": table_infos[:5],
+        }, ensure_ascii=False)
+
 
 class AdjustFormatTool(BaseTool):
     """
@@ -179,7 +251,8 @@ class AdjustFormatTool(BaseTool):
                     "type": "object",
                     "properties": {
                         "page_index": {"type": "integer", "description": "页码（0-based）"},
-                        "shape_name": {"type": "string", "description": "形状名称（从 inspect_output 获取）"},
+                        "shape_name": {"type": "string", "description": "PPT 形状名称（从 inspect_output 获取）"},
+                        "paragraph_index": {"type": "integer", "description": "Word 段落索引（从 inspect_output 获取）"},
                         "font_size_pt": {"type": "number", "description": "新字号（pt）"},
                         "bold": {"type": "boolean", "description": "是否加粗"},
                         "font_name": {"type": "string", "description": "字体名称"},
@@ -204,6 +277,8 @@ class AdjustFormatTool(BaseTool):
         try:
             if ext == ".pptx":
                 return self._adjust_pptx(output_path, adjustments)
+            elif ext == ".docx":
+                return self._adjust_docx(output_path, adjustments)
             else:
                 return json.dumps(
                     {"error": f"暂不支持调整此文件类型: {ext}"},
@@ -257,6 +332,48 @@ class AdjustFormatTool(BaseTool):
                         adjusted_count += 1
 
         prs.save(path)
+        return json.dumps({
+            "success": True,
+            "adjusted_runs": adjusted_count,
+        }, ensure_ascii=False)
+
+    def _adjust_docx(self, path: str, adjustments: list) -> str:
+        """调整 Word 文档的段落格式"""
+        from docx import Document
+        from docx.shared import Pt as DocxPt
+
+        doc = Document(path)
+        paragraphs = doc.paragraphs
+        adjusted_count = 0
+
+        for adj in adjustments:
+            para_index = adj.get("paragraph_index")
+            font_size = adj.get("font_size_pt")
+            bold = adj.get("bold")
+            font_name = adj.get("font_name")
+
+            if para_index is not None and para_index < len(paragraphs):
+                # 调整指定段落
+                target_paras = [paragraphs[para_index]]
+            else:
+                # page_index 模拟：每 20 段一页
+                page_idx = adj.get("page_index", 0)
+                chunk_size = 20
+                start = page_idx * chunk_size
+                end = min(start + chunk_size, len(paragraphs))
+                target_paras = paragraphs[start:end]
+
+            for para in target_paras:
+                for run in para.runs:
+                    if font_size is not None:
+                        run.font.size = DocxPt(font_size)
+                    if bold is not None:
+                        run.font.bold = bold
+                    if font_name is not None:
+                        run.font.name = font_name
+                    adjusted_count += 1
+
+        doc.save(path)
         return json.dumps({
             "success": True,
             "adjusted_runs": adjusted_count,
