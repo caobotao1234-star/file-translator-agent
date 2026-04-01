@@ -106,15 +106,8 @@ class TranslatePageTool(BaseTool):
                 cross_page_hint=hint,
             )
 
-            # 重新包装标记
-            final_results = []
-            for i, (trans, is_tagged) in enumerate(zip(results, tagged_flags)):
-                if is_tagged:
-                    # 整段译文包在 <r0> 里
-                    # writer 会把译文放进第一个 Run，保留该 Run 的格式
-                    final_results.append(f"<r0>{trans}</r0>")
-                else:
-                    final_results.append(trans)
+            # 重新包装：不加标记，让 writer 按比例分配到各 Run
+            final_results = list(results)
 
             return json.dumps({
                 "translations": final_results,

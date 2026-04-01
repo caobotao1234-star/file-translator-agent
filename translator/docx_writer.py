@@ -91,6 +91,43 @@ def _replace_paragraph_text(paragraph, translated_text: str, is_tagged: bool,
 
     # ---- 单 Run 或降级：整段替换 ----
     clean_text = RUN_TAG_PATTERN.sub(r'\2', translated_text)
+
+    # 📘 教学笔记：按比例分配译文到各个 Run（保留段内格式）
+    # 如果原文有多个 Run（不同格式），但译文没有标记，
+    # 按原文各 Run 的字符比例把译文切分到各个 Run 中。
+    # 这样每个 Run 保留自己的格式（加粗、斜体、颜色等）。
+    non_empty_runs = [(ri, run) for ri, run in enumerate(original_runs) if run.text]
+    if len(non_empty_runs) > 1:
+        # 计算原文各 Run 的字符比例
+        orig_lengths = [len(run.text) for _, run in non_empty_runs]
+        total_orig = sum(orig_lengths)
+        if total_orig > 0:
+            # 按比例切分译文
+            pos = 0
+            for j, (ri, run) in enumerate(non_empty_runs):
+                ratio = orig_lengths[j] / total_orig
+                if j == len(non_empty_runs) - 1:
+                    # 最后一个 Run 拿剩余所有文本
+                    run.text = clean_text[pos:]
+                else:
+                    end = pos + max(1, round(len(clean_text) * ratio))
+                    # 尝试在单词边界切分（英文）
+                    if end < len(clean_text):
+                        # 往后找最近的空格
+                        space_pos = clean_text.find(' ', end)
+                        if space_pos != -1 and space_pos - end < 10:
+                            end = space_pos + 1
+                    run.text = clean_text[pos:end]
+                    pos = end
+                _remap_run_font(run, format_engine, style_name)
+            # 清空其他 Run
+            used_indices = {ri for ri, _ in non_empty_runs}
+            for ri, run in enumerate(original_runs):
+                if ri not in used_indices and run.text:
+                    run.text = ""
+            return
+
+    # 真正的单 Run 情况
     original_runs[0].text = clean_text
     _remap_run_font(original_runs[0], format_engine, style_name)
     for run in original_runs[1:]:
