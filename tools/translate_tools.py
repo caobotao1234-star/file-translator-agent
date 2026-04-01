@@ -78,56 +78,41 @@ class TranslatePageTool(BaseTool):
             lang_english = lang_hint.get(target_lang, target_lang)
             hint = context_hint or ""
 
-            # 📘 教学笔记：格式标记的可靠保留策略
-            # 翻译模型经常丢失 <r0>...</r0> 标记，不管怎么提醒都不可靠。
-            # 可靠方案：把带标记的文本拆开，提取纯文本翻译，再重新组装标记。
+            # 📘 教学笔记：格式标记处理策略
+            # 带 <r0>...</r0> 标记的文本，提取纯文本翻译，
+            # 然后把整段译文包在 <r0> 里（writer 会用第一个 Run 的格式）。
+            # 不再尝试按 Run 拆分（拆分会导致空格丢失和连字问题）。
             import re
             TAG_RE = re.compile(r'<r(\d+)>(.*?)</r\1>', re.DOTALL)
 
-            # 分离：带标记的文本 vs 普通文本
-            tagged_indices = []  # 带标记的文本索引
-            plain_texts = []  # 要发给翻译模型的纯文本
-            tag_maps = {}  # {index: [(tag_idx, text), ...]}
+            # 提取纯文本用于翻译
+            plain_texts = []
+            tagged_flags = []  # 记录哪些文本有标记
 
-            for i, text in enumerate(texts):
+            for text in texts:
                 matches = TAG_RE.findall(text)
                 if matches:
-                    # 带标记：提取每个 Run 的纯文本，拼成一段发给翻译模型
-                    tagged_indices.append(i)
-                    tag_maps[i] = [(int(idx), content) for idx, content in matches]
-                    # 把所有 Run 的文本拼成一段，用 ||| 分隔
-                    run_texts = [content for _, content in matches]
-                    plain_texts.append(" ||| ".join(run_texts))
+                    # 带标记：提取所有 Run 的纯文本拼成完整句子
+                    pure = "".join(content for _, content in matches)
+                    plain_texts.append(pure)
+                    tagged_flags.append(True)
                 else:
                     plain_texts.append(text)
+                    tagged_flags.append(False)
 
-            # 翻译所有纯文本
+            # 翻译纯文本
             results = self.translate_pipeline._translate_batch(
                 plain_texts, target_lang, lang_english,
                 cross_page_hint=hint,
             )
 
-            # 重新组装带标记的译文
+            # 重新包装标记
             final_results = []
-            for i, (orig, trans) in enumerate(zip(texts, results)):
-                if i in tag_maps:
-                    # 把翻译结果按 ||| 拆回各个 Run
-                    parts = [p.strip() for p in trans.split("|||")]
-                    tag_info = tag_maps[i]
-                    if len(parts) >= len(tag_info):
-                        # 重新包装标记
-                        tagged = "".join(
-                            f"<r{idx}>{parts[j]}</r{idx}>"
-                            for j, (idx, _) in enumerate(tag_info)
-                        )
-                        final_results.append(tagged)
-                    else:
-                        # 拆分数量不匹配，用整段译文包在 r0 里
-                        logger.warning(
-                            f"标记重组失败: 期望 {len(tag_info)} 段, "
-                            f"得到 {len(parts)} 段, 降级处理"
-                        )
-                        final_results.append(f"<r0>{trans}</r0>")
+            for i, (trans, is_tagged) in enumerate(zip(results, tagged_flags)):
+                if is_tagged:
+                    # 整段译文包在 <r0> 里
+                    # writer 会把译文放进第一个 Run，保留该 Run 的格式
+                    final_results.append(f"<r0>{trans}</r0>")
                 else:
                     final_results.append(trans)
 

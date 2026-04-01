@@ -377,7 +377,7 @@ class AdjustFormatTool(BaseTool):
                     if font_name is not None:
                         old_font = run.font.name
                         run.font.name = font_name
-                        # 📘 同时设置东亚字体，确保中文也生效
+                        # 📘 同时设置所有字体属性 + 清除主题字体引用
                         rPr = run._element.get_or_add_rPr()
                         rFonts = rPr.find(qn('w:rFonts'))
                         if rFonts is None:
@@ -386,6 +386,11 @@ class AdjustFormatTool(BaseTool):
                         rFonts.set(qn('w:ascii'), font_name)
                         rFonts.set(qn('w:hAnsi'), font_name)
                         rFonts.set(qn('w:eastAsia'), font_name)
+                        rFonts.set(qn('w:cs'), font_name)
+                        # 📘 清除主题字体引用（否则 Word 会用主题字体覆盖）
+                        for attr in ['w:asciiTheme', 'w:hAnsiTheme', 'w:eastAsiaTheme', 'w:cstheme']:
+                            if qn(attr) in rFonts.attrib:
+                                del rFonts.attrib[qn(attr)]
                         logger.info(
                             f"字体修改: '{run.text[:20]}...' "
                             f"{old_font} -> {font_name}"
@@ -414,6 +419,10 @@ class AdjustFormatTool(BaseTool):
                                     rFonts.set(qn('w:ascii'), font_name)
                                     rFonts.set(qn('w:hAnsi'), font_name)
                                     rFonts.set(qn('w:eastAsia'), font_name)
+                                    rFonts.set(qn('w:cs'), font_name)
+                                    for attr in ['w:asciiTheme', 'w:hAnsiTheme', 'w:eastAsiaTheme', 'w:cstheme']:
+                                        if qn(attr) in rFonts.attrib:
+                                            del rFonts.attrib[qn(attr)]
                                 adjusted_count += 1
 
         doc.save(path)
