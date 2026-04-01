@@ -125,12 +125,19 @@ def build_agent(translate_model_id: str = None, brain_model_id: str = None):
 
 def main():
     if len(sys.argv) < 2:
-        print("用法: python agent_main.py <文件路径> [目标语言]")
+        print("用法: python agent_main.py <文件路径> [目标语言] [--brain MODEL]")
         print("示例: python agent_main.py test.pptx 英文")
+        print("示例: python agent_main.py test.pptx 英文 --brain doubao-seed-2-0-pro-260215")
         sys.exit(1)
 
     filepath = sys.argv[1]
-    target_lang = sys.argv[2] if len(sys.argv) > 2 else "英文"
+    target_lang = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "英文"
+
+    # 📘 --brain 参数：指定 Agent 主模型（默认从 .env 读取）
+    brain_override = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--brain" and i + 1 < len(sys.argv):
+            brain_override = sys.argv[i + 1]
 
     if not os.path.exists(filepath):
         print(f"文件不存在: {filepath}")
@@ -151,7 +158,7 @@ def main():
     print(f"目标语言: {target_lang}")
     print("=" * 50)
 
-    agent = build_agent()
+    agent = build_agent(brain_model_id=brain_override)
 
     # 📘 给 Agent 一条自然语言指令，让它自己干活
     user_message = (
