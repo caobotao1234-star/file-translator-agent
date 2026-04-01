@@ -375,6 +375,7 @@ class AdjustFormatTool(BaseTool):
                     if bold is not None:
                         run.font.bold = bold
                     if font_name is not None:
+                        old_font = run.font.name
                         run.font.name = font_name
                         # 📘 同时设置东亚字体，确保中文也生效
                         rPr = run._element.get_or_add_rPr()
@@ -385,6 +386,10 @@ class AdjustFormatTool(BaseTool):
                         rFonts.set(qn('w:ascii'), font_name)
                         rFonts.set(qn('w:hAnsi'), font_name)
                         rFonts.set(qn('w:eastAsia'), font_name)
+                        logger.info(
+                            f"字体修改: '{run.text[:20]}...' "
+                            f"{old_font} -> {font_name}"
+                        )
                     adjusted_count += 1
 
             # 📘 也处理表格中的文字
@@ -412,7 +417,9 @@ class AdjustFormatTool(BaseTool):
                                 adjusted_count += 1
 
         doc.save(path)
+        logger.info(f"Word 格式调整完成: {path}, 修改了 {adjusted_count} 个 Run")
         return json.dumps({
             "success": True,
             "adjusted_runs": adjusted_count,
+            "output_path": path,
         }, ensure_ascii=False)

@@ -314,6 +314,24 @@ class WriteDocumentTool(BaseTool):
             return json.dumps({"error": "请先调用 parse_document"}, ensure_ascii=False)
 
         try:
+            # 📘 教学笔记：标记修复
+            # Agent（LLM）经常把 <r0>...</r0> 标记去掉，只传纯文本。
+            # 如果原文有标记但译文没有，在这里修复：
+            # 把纯文本译文包装成单个 <r0> 标记，这样 writer 至少能
+            # 把译文放进第一个 Run（保留该 Run 的格式）。
+            import re
+            TAG_RE = re.compile(r'<r\d+>')
+            item_map = {item["key"]: item for item in parsed.get("items", [])}
+
+            for key, trans in list(translations.items()):
+                item = item_map.get(key)
+                if not item:
+                    continue
+                if item.get("tagged_text") and not TAG_RE.search(trans):
+                    # 原文有标记但译文没有 → 包装成 <r0>
+                    translations[key] = f"<r0>{trans}</r0>"
+                    logger.debug(f"标记修复: {key} 译文无标记，包装为 <r0>")
+
             if ext == ".pptx":
                 from translator.pptx_writer import write_pptx
                 write_pptx(parsed, translations, output_path,
