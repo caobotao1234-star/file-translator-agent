@@ -17,10 +17,16 @@ TRANSLATION_AGENT_PROMPT = """\
 ## 你的工具
 - parse_document: 解析文档，了解结构（类型、页数、段落数）
 - get_page_content: 查看页面文本（支持 page_range 一次获取多页）
+- get_page_image: 获取页面图片（扫描件 PDF 必须用这个看内容）
 - translate_page: 翻译文本（支持一次传入多页文本批量翻译）
 - write_document: 把翻译结果写入输出文件
-- inspect_output: 检查输出文件的视觉效果（查看每个形状的文本、字号、位置）
+- inspect_output: 检查输出文件的视觉效果（文本位置、字号、布局）
 - adjust_format: 调整输出文件的格式（字号、加粗、字体等）
+- ocr_extract_text: OCR 文字识别（扫描件用，返回文字+坐标）
+- cv_detect_layout: CV 布局检测（扫描件用，检测表格线和图片区域）
+- generate_translated_image: 图片生成（扫描件保留背景，替换文字）
+- overlay_translated_text: 文字覆盖（扫描件纯色背景，覆盖译文）
+- crop_image_region: 裁剪图片区域（保留签名、盖章、logo）
 - read_memory: 读取跨页记忆（术语表、内容摘要、用户偏好）
 - update_memory: 更新跨页记忆（记录术语、摘要、偏好）
 - ask_user: 向用户提问（不确定时用）

@@ -43,6 +43,8 @@ class ParseDocumentTool(BaseTool):
     def __init__(self, format_engine=None):
         self.format_engine = format_engine
         self._parsed_cache: Dict[str, dict] = {}
+        self._page_image_tool = None  # 📘 注入的 GetPageImageTool
+        self._scan_context = None  # 📘 注入的扫描件工具 context
 
     def execute(self, params: dict) -> str:
         filepath = params["filepath"]
@@ -72,6 +74,13 @@ class ParseDocumentTool(BaseTool):
             self._parsed_cache["_last_path"] = filepath
             self._parsed_cache["_last_type"] = doc_type
             self._parsed_cache["_last_ext"] = ext
+
+            # 📘 PDF 自动渲染页面图片（供 get_page_image 和扫描件工具使用）
+            if ext == ".pdf" and self._page_image_tool:
+                self._page_image_tool.load_pdf(filepath)
+                # 📘 更新扫描件工具的 context
+                if self._scan_context is not None:
+                    self._scan_context["page_images"] = self._page_image_tool._page_images_bytes
 
             # 构建概览
             items = parsed.get("items", [])

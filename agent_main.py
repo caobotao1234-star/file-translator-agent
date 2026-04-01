@@ -26,6 +26,7 @@ from tools.translate_tools import TranslatePageTool
 from tools.memory_tools import MemoryStore, ReadMemoryTool, UpdateMemoryTool
 from tools.interaction_tools import AskUserTool, ReportProgressTool
 from tools.format_tools import InspectOutputTool, AdjustFormatTool
+from tools.vision_tools import GetPageImageTool, create_scan_tools
 from prompts.agent_prompts import TRANSLATION_AGENT_PROMPT
 
 logger = get_logger("agent_main")
@@ -55,12 +56,14 @@ def on_progress(current: int, total: int, message: str):
         print(f"  📊 {message}", flush=True)
 
 
-def build_agent(translate_model_id: str = None, brain_model_id: str = None):
+def build_agent(translate_model_id: str = None, brain_model_id: str = None,
+                image_model_id: str = None):
     """
     📘 构建 Agent：初始化模型 + 工具 + Agent Loop
 
     brain_model_id: Agent 主模型（负责理解、规划、决策）
     translate_model_id: 翻译工具内部用的便宜模型
+    image_model_id: 图片生成模型（扫描件保留背景用）
     """
     # ── 1. 模型初始化 ──
     router = LLMRouter(api_key=Config.ARK_API_KEY)
@@ -73,7 +76,6 @@ def build_agent(translate_model_id: str = None, brain_model_id: str = None):
     # Agent 主模型（Brain）
     b_model = brain_model_id
     if not b_model:
-        # 从 .env 读取
         brain_cfg = Config.get_agent_brain_config()
         if brain_cfg:
             b_model = f"{brain_cfg['provider']}:{brain_cfg['model']}"
@@ -81,11 +83,17 @@ def build_agent(translate_model_id: str = None, brain_model_id: str = None):
         router.register_model("agent_brain", model_str=b_model)
         print(f"Agent 主模型: {b_model}", flush=True)
     else:
-        # 没有 Brain 配置，用翻译模型兼任
         router.register_model("agent_brain", model_str=t_model)
         print(f"Agent 主模型: {t_model}（与翻译模型相同）", flush=True)
 
     brain_engine = router.get("agent_brain")
+
+    # 图片生成模型（可选）
+    image_gen_engine = None
+    if image_model_id:
+        router.register_model("image_gen", model_str=image_model_id)
+        image_gen_engine = router.get("image_gen")
+        print(f"图片生成模型: {image_model_id}", flush=True)
 
     # ── 2. 翻译 Pipeline（工具内部用） ──
     pipeline = TranslatePipeline(
@@ -99,20 +107,36 @@ def build_agent(translate_model_id: str = None, brain_model_id: str = None):
 
     # ── 4. 工具初始化 ──
     parse_tool = ParseDocumentTool(format_engine=format_engine)
+    page_image_tool = GetPageImageTool()
     memory = MemoryStore()
+
+    # 📘 parse_document 完成后，如果是 PDF，自动渲染页面图片
+    # 通过回调机制让 parse_tool 触发 page_image_tool 的加载
+    parse_tool._page_image_tool = page_image_tool
 
     tools = [
         parse_tool,
         GetPageContentTool(parse_tool),
+        page_image_tool,
         WriteDocumentTool(parse_tool, format_engine),
         TranslatePageTool(translate_pipeline=pipeline),
         InspectOutputTool(),
         AdjustFormatTool(),
         ReadMemoryTool(memory),
         UpdateMemoryTool(memory),
-        AskUserTool(),  # CLI 模式下用户不回答，Agent 自行决定
+        AskUserTool(),
         ReportProgressTool(on_progress=on_progress),
     ]
+
+    # 📘 扫描件工具（OCR/CV/图片生成/文字覆盖/裁剪）
+    # 这些工具复用旧架构的实现，Agent 自己决定是否使用
+    scan_tools, scan_context = create_scan_tools(
+        page_image_tool=page_image_tool,
+        image_gen_engine=image_gen_engine,
+    )
+    tools.extend(scan_tools)
+    # 📘 把 scan_context 挂到 parse_tool 上，供 write_document 使用
+    parse_tool._scan_context = scan_context
 
     # ── 5. Agent Loop ──
     agent = AgentLoop(
@@ -138,9 +162,12 @@ def main():
 
     # 📘 --brain 参数：指定 Agent 主模型（默认从 .env 读取）
     brain_override = None
+    image_override = None
     for i, arg in enumerate(sys.argv):
         if arg == "--brain" and i + 1 < len(sys.argv):
             brain_override = sys.argv[i + 1]
+        if arg == "--image" and i + 1 < len(sys.argv):
+            image_override = sys.argv[i + 1]
 
     if not os.path.exists(filepath):
         print(f"文件不存在: {filepath}")
@@ -161,7 +188,7 @@ def main():
     print(f"目标语言: {target_lang}")
     print("=" * 50)
 
-    agent = build_agent(brain_model_id=brain_override)
+    agent = build_agent(brain_model_id=brain_override, image_model_id=image_override)
 
     # 📘 给 Agent 一条自然语言指令，让它自己干活
     user_message = (

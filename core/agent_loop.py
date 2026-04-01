@@ -126,7 +126,20 @@ class AgentLoop:
         self.tool_schemas: List[dict] = []
         for tool in tools:
             self.tools[tool.name] = tool
-            self.tool_schemas.append(tool.get_schema())
+            # 📘 兼容旧工具（get_api_format）和新工具（get_schema）
+            if hasattr(tool, 'get_schema'):
+                self.tool_schemas.append(tool.get_schema())
+            elif hasattr(tool, 'get_api_format'):
+                self.tool_schemas.append(tool.get_api_format())
+            else:
+                self.tool_schemas.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    },
+                })
 
         # 📘 扁平消息历史（Claude Code 风格）
         self.messages: List[dict] = [
