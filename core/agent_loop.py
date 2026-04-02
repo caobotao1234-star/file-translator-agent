@@ -367,8 +367,29 @@ class AgentLoop:
 
                 continue  # 继续循环
 
-            # 📘 Step 5: 模型返回纯文本 -> 可能完成，也可能用户有后续
+            # 📘 Step 5: 模型返回纯文本 -> 可能完成，也可能被截断
             if text_content:
+                # 📘 借鉴 Claude Code：检测输出截断并自动恢复
+                # 如果 completion_tokens 接近 max_tokens，说明输出被截断了
+                # 注入恢复消息让模型接着说，不要道歉不要重复
+                completion_tokens = self.stats.get("completion_tokens", 0)
+                if completion_tokens > 14000 and not tool_calls:
+                    logger.info(
+                        f"检测到输出可能被截断 "
+                        f"(completion_tokens={completion_tokens})，注入恢复消息"
+                    )
+                    self.messages.append({"role": "assistant", "content": text_content})
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "输出被截断了。直接从断点继续，"
+                            "不要道歉，不要重复已经说过的内容，"
+                            "把剩余工作拆成更小的步骤完成。"
+                        ),
+                    })
+                    self._notify_message("system", "输出被截断，自动恢复中...")
+                    continue
+
                 final_text = text_content
                 self._notify_message("assistant", text_content)
 
