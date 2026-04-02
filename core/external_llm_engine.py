@@ -78,6 +78,10 @@ PROVIDER_CONFIG = {
         "base_url": "https://ark.cn-beijing.volces.com/api/v3",
         "env_key": "ARK_API_KEY",
     },
+    "dashscope": {
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "env_key": "DASHSCOPE_API_KEY",
+    },
     "gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "env_key": "GEMINI_API_KEY",

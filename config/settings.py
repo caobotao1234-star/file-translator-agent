@@ -222,6 +222,8 @@ class Config:
             "gpt-4o", "gpt-4-turbo", "gpt-4.1",
             "nanobanana-pro",
             "deepseek",
+            # 百炼（阿里云 DashScope）通义千问系列
+            "qwen-max", "qwen-plus", "qwen-turbo", "qwen-vl", "qwen3",
         ]
 
         if not provider or not model:
