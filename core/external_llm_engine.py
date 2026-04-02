@@ -326,7 +326,7 @@ class ExternalLLMEngine:
         # 3. 下载生成的图片 base64
         # 通过代理时更慢。默认 300 秒（5分钟），可通过环境变量覆盖。
         timeout_seconds = float(os.getenv("IMAGE_GEN_TIMEOUT",
-                                          os.getenv("EXTERNAL_API_TIMEOUT", "300")))
+                                          os.getenv("EXTERNAL_API_TIMEOUT", "600")))
 
         # ── 📘 Step 4: 发送请求（带重试） ──
         last_error = None
