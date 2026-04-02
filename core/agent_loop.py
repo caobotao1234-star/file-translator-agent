@@ -352,6 +352,23 @@ class AgentLoop:
                             ensure_ascii=False,
                         )
 
+                    # 📘 借鉴 Claude Code：工具结果预算
+                    # 限制单条工具结果的大小，防止一个巨大的返回撑爆 context。
+                    # 比如 get_page_content 返回 262 段文本，OCR 返回 54 个文字块，
+                    # 图片 base64 等，都可能非常大。
+                    MAX_TOOL_RESULT_CHARS = 30000  # 约 8500 tokens
+                    if isinstance(tool_result, str) and len(tool_result) > MAX_TOOL_RESULT_CHARS:
+                        original_len = len(tool_result)
+                        tool_result = (
+                            tool_result[:MAX_TOOL_RESULT_CHARS]
+                            + f"\n...[结果被截断: 原始 {original_len} 字符, "
+                            f"保留前 {MAX_TOOL_RESULT_CHARS} 字符]"
+                        )
+                        logger.info(
+                            f"工具 {tool_name} 结果截断: "
+                            f"{original_len} -> {MAX_TOOL_RESULT_CHARS} 字符"
+                        )
+
                     # 反馈给模型
                     self.messages.append({
                         "role": "tool",
