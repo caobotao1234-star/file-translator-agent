@@ -202,15 +202,19 @@ class AgentLoop:
 
     def _maybe_compress(self):
         """
-        📘 教学笔记：Context Window 压缩（参考 Claude Code 的 Compressor）
+        📘 教学笔记：Context Window 压缩（借鉴 Claude Code 的 Compressor）
 
-        当消息历史接近 token 上限时，自动压缩：
-        1. 保留 system prompt（第一条消息）
-        2. 保留最近 N 轮对话
-        3. 中间的旧消息压缩为摘要
+        当消息历史接近 token 上限时，用 LLM 生成结构化摘要。
+        不是简单的字符截断，而是让 LLM 理解对话内容后生成高质量摘要。
 
-        关键信息（术语表、用户偏好）应该已经通过 memory 工具外置，
-        不怕被压缩丢失。
+        摘要包含（参考 Claude Code 的 compact prompt）：
+        1. 用户的请求和意图
+        2. 关键技术细节（文件名、翻译术语）
+        3. 已完成的工作
+        4. 遇到的错误和修复
+        5. 用户的所有反馈（原文）
+        6. 待办任务
+        7. 当前正在做的工作
         """
         estimated = self._estimate_tokens()
         threshold = int(ESTIMATED_CONTEXT_WINDOW * CONTEXT_COMPRESS_THRESHOLD)
@@ -223,36 +227,20 @@ class AgentLoop:
             f"(阈值 {threshold})，开始压缩"
         )
 
-        # 📘 压缩策略：保留 system prompt + 最近 10 条消息
-        # 中间的消息替换为一条摘要
         keep_recent = 10
         if len(self.messages) <= keep_recent + 2:
-            return  # 消息太少，不需要压缩
+            return
 
-        system_msg = self.messages[0]  # system prompt
+        system_msg = self.messages[0]
         old_messages = self.messages[1:-keep_recent]
         recent_messages = self.messages[-keep_recent:]
 
-        # 📘 从旧消息中提取摘要
-        summary_parts = []
-        for msg in old_messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "assistant" and content:
-                # 只保留 assistant 的文本回复（不保留工具调用细节）
-                summary_parts.append(content[:200])
-            elif role == "tool":
-                # 工具结果只保留前 100 字符
-                if isinstance(content, str) and len(content) > 100:
-                    summary_parts.append(f"[工具结果: {content[:100]}...]")
-
-        summary = " | ".join(summary_parts[-5:])  # 最多保留 5 段摘要
-        if not summary:
-            summary = f"(已压缩 {len(old_messages)} 条旧消息)"
+        # 📘 用 LLM 生成结构化摘要
+        summary = self._llm_compress(old_messages)
 
         compressed_msg = {
             "role": "user",
-            "content": f"[上下文摘要: {summary}]\n请继续之前的任务。",
+            "content": f"[以下是之前对话的结构化摘要]\n{summary}\n[摘要结束，请继续任务]",
         }
 
         self.messages = [system_msg, compressed_msg] + recent_messages
@@ -454,6 +442,88 @@ class AgentLoop:
                 self.on_token_update(self.stats)
             except Exception:
                 pass
+
+    # 📘 借鉴 Claude Code 的 compact prompt 结构
+    COMPACT_PROMPT = (
+        "请为以下对话生成结构化摘要。这个摘要将替代原始对话，"
+        "所以必须保留所有关键信息。不要调用任何工具，只输出纯文本。\n\n"
+        "摘要必须包含以下部分：\n"
+        "1. 用户请求：用户要求做什么（原文引用关键需求）\n"
+        "2. 已完成工作：已经完成了哪些步骤，输出了什么文件\n"
+        "3. 翻译术语：已确定的术语对照（原文=译文）\n"
+        "4. 用户反馈：用户提出的所有修改意见和偏好（必须原文保留）\n"
+        "5. 遇到的问题：出现过什么错误，怎么解决的\n"
+        "6. 待办事项：还有什么没做完的\n"
+        "7. 当前状态：最后在做什么，做到哪一步了\n\n"
+        "对话内容：\n"
+    )
+
+    def _llm_compress(self, old_messages: list) -> str:
+        """
+        📘 用 LLM 生成结构化摘要（借鉴 Claude Code 的 Compressor）
+
+        把旧消息发给 LLM，让它生成高质量的结构化摘要。
+        如果 LLM 调用失败，降级为简单的文本截断。
+        """
+        # 📘 构建对话文本（只提取文本内容，跳过图片和大型工具结果）
+        conversation_parts = []
+        for msg in old_messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role == "user":
+                if isinstance(content, str):
+                    conversation_parts.append(f"用户: {content[:500]}")
+                elif isinstance(content, list):
+                    texts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                    if texts:
+                        conversation_parts.append(f"用户: {' '.join(texts)[:500]}")
+            elif role == "assistant":
+                if content:
+                    conversation_parts.append(f"助手: {content[:500]}")
+            elif role == "tool":
+                if isinstance(content, str) and len(content) > 200:
+                    conversation_parts.append(f"工具结果: {content[:200]}...")
+                elif isinstance(content, str):
+                    conversation_parts.append(f"工具结果: {content}")
+
+        conversation_text = "\n".join(conversation_parts)
+
+        # 📘 限制发给压缩 LLM 的文本量（避免压缩本身超 token）
+        if len(conversation_text) > 15000:
+            conversation_text = conversation_text[:15000] + "\n...(截断)"
+
+        compress_prompt = self.COMPACT_PROMPT + conversation_text
+
+        try:
+            summary_text = ""
+            for chunk in self.llm_engine.stream_chat(
+                [{"role": "user", "content": compress_prompt}],
+                max_tokens=2048,
+            ):
+                if chunk["type"] == "text":
+                    summary_text += chunk["content"]
+                elif chunk["type"] == "usage":
+                    # 压缩的 token 也计入统计
+                    self.stats["prompt_tokens"] += chunk.get("prompt_tokens", 0)
+                    self.stats["completion_tokens"] += chunk.get("completion_tokens", 0)
+
+            if summary_text.strip():
+                logger.info(f"LLM 压缩完成: {len(summary_text)} 字符")
+                return summary_text.strip()
+        except Exception as e:
+            logger.warning(f"LLM 压缩失败，降级为简单截断: {e}")
+
+        # 📘 降级：简单截断
+        fallback_parts = []
+        for msg in old_messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "user" and isinstance(content, str):
+                fallback_parts.append(content[:200])
+            elif role == "assistant" and content:
+                fallback_parts.append(content[:200])
+        return " | ".join(fallback_parts[-5:]) or f"(已压缩 {len(old_messages)} 条消息)"
 
     def _inject_skills_from_parse(self, parse_result: str):
         """📘 从 parse_document 结果中提取 doc_type，加载匹配的 Skill"""
