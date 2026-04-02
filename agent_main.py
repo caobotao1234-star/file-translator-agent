@@ -27,6 +27,7 @@ from tools.translate_tools import TranslatePageTool
 from tools.memory_tools import MemoryStore, ReadMemoryTool, UpdateMemoryTool
 from tools.interaction_tools import AskUserTool, ReportProgressTool
 from tools.format_tools import InspectOutputTool, AdjustFormatTool, VerifyOutputTool
+from tools.todo_tools import TodoStore, TodoWriteTool
 from tools.vision_tools import GetPageImageTool, create_scan_tools, SaveScanPDFTool
 from tools.layout_tools_v2 import RenderSlideTool, EnableAutofitTool, CompareLayoutTool, SmartResizeTool
 from prompts.agent_prompts import TRANSLATION_AGENT_PROMPT
@@ -111,6 +112,7 @@ def build_agent(translate_model_id: str = None, brain_model_id: str = None,
     parse_tool = ParseDocumentTool(format_engine=format_engine)
     page_image_tool = GetPageImageTool()
     memory = MemoryStore()
+    todo_store = TodoStore()
 
     # 📘 parse_document 完成后，如果是 PDF，自动渲染页面图片
     # 通过回调机制让 parse_tool 触发 page_image_tool 的加载
@@ -133,6 +135,7 @@ def build_agent(translate_model_id: str = None, brain_model_id: str = None,
         UpdateMemoryTool(memory),
         AskUserTool(),
         ReportProgressTool(on_progress=on_progress),
+        TodoWriteTool(store=todo_store),
     ]
 
     # 📘 扫描件工具（OCR/CV/图片生成/文字覆盖/裁剪）

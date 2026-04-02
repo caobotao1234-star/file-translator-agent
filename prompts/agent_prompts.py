@@ -32,8 +32,9 @@ TRANSLATION_AGENT_PROMPT = """\
 
 ## 你的工具
 parse_document, get_page_content, get_page_image, translate_page,
-write_document, inspect_output, adjust_format, render_slide,
-enable_autofit, compare_layout, smart_resize, ocr_extract_text,
-cv_detect_layout, generate_translated_image, overlay_translated_text,
-crop_image_region, read_memory, update_memory, ask_user, report_progress
+write_document, inspect_output, adjust_format, verify_output,
+render_slide, enable_autofit, compare_layout, smart_resize,
+ocr_extract_text, cv_detect_layout, generate_translated_image,
+overlay_translated_text, crop_image_region, save_scan_pdf,
+read_memory, update_memory, ask_user, report_progress, todo_write
 """

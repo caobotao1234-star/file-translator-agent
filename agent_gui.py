@@ -327,6 +327,7 @@ class MainWindow(QMainWindow):
         from tools.memory_tools import MemoryStore, ReadMemoryTool, UpdateMemoryTool
         from tools.interaction_tools import AskUserTool, ReportProgressTool
         from tools.format_tools import InspectOutputTool, AdjustFormatTool, VerifyOutputTool
+        from tools.todo_tools import TodoStore, TodoWriteTool
         from tools.vision_tools import GetPageImageTool, create_scan_tools, SaveScanPDFTool
         from prompts.agent_prompts import TRANSLATION_AGENT_PROMPT
         from core.skill_loader import SkillLoader
@@ -356,6 +357,9 @@ class MainWindow(QMainWindow):
         page_image_tool = GetPageImageTool()
         parse_tool._page_image_tool = page_image_tool
         memory = MemoryStore()
+        todo_store = TodoStore()
+        # 📘 任务列表更新时通知 GUI
+        todo_store.set_callback(lambda tasks: self._on_todo_update(tasks))
 
         # ask_user 回调：通过信号让 GUI 显示问题
         def on_ask(question):
@@ -391,6 +395,7 @@ class MainWindow(QMainWindow):
             UpdateMemoryTool(memory),
             AskUserTool(on_ask=on_ask),
             ReportProgressTool(on_progress=on_progress_safe),
+            TodoWriteTool(store=todo_store),
         ]
 
         scan_tools, scan_ctx = create_scan_tools(
@@ -461,6 +466,18 @@ class MainWindow(QMainWindow):
         self.chat_panel.append_message("assistant", f"❓ {question}")
         self.chat_panel.input_field.setFocus()
         self.chat_panel.input_field.setPlaceholderText("请回答 Agent 的问题...")
+
+    def _on_todo_update(self, tasks: list):
+        """任务列表更新回调"""
+        # 📘 在聊天面板显示任务列表
+        if not tasks:
+            return
+        lines = ["📋 任务列表:"]
+        for t in tasks:
+            status = t.get("status", "pending")
+            icon = {"pending": "⬜", "in_progress": "🔄", "completed": "✅"}.get(status, "⬜")
+            lines.append(f"  {icon} {t.get('content', '')}")
+        self.chat_panel.append_message("system", "\n".join(lines))
 
     def _on_done(self):
         """Agent 完成"""
