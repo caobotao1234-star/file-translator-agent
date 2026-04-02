@@ -354,10 +354,14 @@ class AgentLoop:
 
                     # 📘 借鉴 Claude Code：工具结果预算
                     # 限制单条工具结果的大小，防止一个巨大的返回撑爆 context。
-                    # 比如 get_page_content 返回 262 段文本，OCR 返回 54 个文字块，
-                    # 图片 base64 等，都可能非常大。
+                    # 但图片类工具（base64）不截断 — 截断后图片不可用。
                     MAX_TOOL_RESULT_CHARS = 30000  # 约 8500 tokens
-                    if isinstance(tool_result, str) and len(tool_result) > MAX_TOOL_RESULT_CHARS:
+                    SKIP_TRUNCATE_TOOLS = {"get_page_image", "render_slide"}
+                    if (
+                        isinstance(tool_result, str)
+                        and len(tool_result) > MAX_TOOL_RESULT_CHARS
+                        and tool_name not in SKIP_TRUNCATE_TOOLS
+                    ):
                         original_len = len(tool_result)
                         tool_result = (
                             tool_result[:MAX_TOOL_RESULT_CHARS]

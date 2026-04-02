@@ -32,3 +32,6 @@ description: 扫描件 PDF 翻译的专业经验
 - 纯白/纯色背景 → 可以用 overlay_translated_text
 - 不确定 → 用 generate_translated_image（更安全）
 - 所有页面处理完后，调用 save_scan_pdf 保存为 PDF 文件
+- 如果 generate_translated_image 失败（API 限额等），不要降级用 overlay_translated_text
+  在有复杂背景的页面上 — overlay 只能处理纯色背景，强行用会覆盖乱七八糟
+- 图片生成失败时，用 ask_user 告诉用户情况，让用户决定是等 API 恢复还是接受 overlay 效果
