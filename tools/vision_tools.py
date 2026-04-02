@@ -130,3 +130,64 @@ def create_scan_tools(
         ))
 
     return tools, context
+
+
+class SaveScanPDFTool(BaseTool):
+    """
+    📘 保存扫描件翻译结果为 PDF
+
+    把 generate_translated_image / overlay_translated_text 生成的
+    页面图片合成为 PDF 文件。
+    """
+
+    name = "save_scan_pdf"
+    description = (
+        "把扫描件翻译后的页面图片保存为 PDF 文件。"
+        "在调用 generate_translated_image 或 overlay_translated_text 之后使用。"
+        "会自动收集所有已生成的页面图片，合成为多页 PDF。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "output_path": {
+                "type": "string",
+                "description": "输出 PDF 文件路径",
+            },
+        },
+        "required": ["output_path"],
+    }
+
+    def __init__(self, page_image_tool: GetPageImageTool, scan_context: dict = None):
+        self._page_image_tool = page_image_tool
+        self._scan_context = scan_context or {}
+
+    def execute(self, params: dict) -> str:
+        output_path = params["output_path"]
+
+        try:
+            from translator.scan_writer import write_overlay_pdf
+
+            overlay_images = self._scan_context.get("overlay_images", {})
+            page_images = self._page_image_tool._page_images_bytes
+            num_pages = len(page_images)
+
+            if num_pages == 0:
+                return json.dumps({"error": "没有页面图片，请先调用 parse_document"}, ensure_ascii=False)
+
+            result_path = write_overlay_pdf(
+                overlay_images=overlay_images,
+                page_images=page_images,
+                output_path=output_path,
+                num_pages=num_pages,
+            )
+
+            return json.dumps({
+                "success": True,
+                "output_path": result_path,
+                "pages": num_pages,
+                "overlay_pages": len(overlay_images),
+            }, ensure_ascii=False)
+
+        except Exception as e:
+            logger.error(f"保存扫描件 PDF 失败: {e}")
+            return json.dumps({"error": str(e)}, ensure_ascii=False)

@@ -327,7 +327,7 @@ class MainWindow(QMainWindow):
         from tools.memory_tools import MemoryStore, ReadMemoryTool, UpdateMemoryTool
         from tools.interaction_tools import AskUserTool, ReportProgressTool
         from tools.format_tools import InspectOutputTool, AdjustFormatTool
-        from tools.vision_tools import GetPageImageTool, create_scan_tools
+        from tools.vision_tools import GetPageImageTool, create_scan_tools, SaveScanPDFTool
         from prompts.agent_prompts import TRANSLATION_AGENT_PROMPT
         from core.skill_loader import SkillLoader
 
@@ -397,6 +397,10 @@ class MainWindow(QMainWindow):
             image_gen_engine=image_gen_engine,
         )
         tools.extend(scan_tools)
+        tools.append(SaveScanPDFTool(
+            page_image_tool=page_image_tool,
+            scan_context=scan_ctx,
+        ))
         parse_tool._scan_context = scan_ctx
 
         self.agent = AgentLoop(

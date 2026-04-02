@@ -31,3 +31,4 @@ description: 扫描件 PDF 翻译的专业经验
 - 有照片/水印/花纹 → 必须用 generate_translated_image
 - 纯白/纯色背景 → 可以用 overlay_translated_text
 - 不确定 → 用 generate_translated_image（更安全）
+- 所有页面处理完后，调用 save_scan_pdf 保存为 PDF 文件

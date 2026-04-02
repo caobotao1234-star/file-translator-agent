@@ -27,7 +27,7 @@ from tools.translate_tools import TranslatePageTool
 from tools.memory_tools import MemoryStore, ReadMemoryTool, UpdateMemoryTool
 from tools.interaction_tools import AskUserTool, ReportProgressTool
 from tools.format_tools import InspectOutputTool, AdjustFormatTool
-from tools.vision_tools import GetPageImageTool, create_scan_tools
+from tools.vision_tools import GetPageImageTool, create_scan_tools, SaveScanPDFTool
 from tools.layout_tools_v2 import RenderSlideTool, EnableAutofitTool, CompareLayoutTool, SmartResizeTool
 from prompts.agent_prompts import TRANSLATION_AGENT_PROMPT
 
@@ -141,7 +141,12 @@ def build_agent(translate_model_id: str = None, brain_model_id: str = None,
         image_gen_engine=image_gen_engine,
     )
     tools.extend(scan_tools)
-    # 📘 把 scan_context 挂到 parse_tool 上，供 write_document 使用
+    # 📘 扫描件 PDF 保存工具
+    tools.append(SaveScanPDFTool(
+        page_image_tool=page_image_tool,
+        scan_context=scan_context,
+    ))
+    # 📘 把 scan_context 挂到 parse_tool 上
     parse_tool._scan_context = scan_context
 
     # ── 5. Agent Loop ──
