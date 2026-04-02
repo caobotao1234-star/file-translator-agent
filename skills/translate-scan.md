@@ -14,26 +14,21 @@ description: 扫描件 PDF 翻译的专业经验
 ## 工作流程
 1. 用 get_page_image 查看页面图片
 2. 用 ocr_extract_text 获取文字坐标
-3. 用 cv_detect_layout 检测表格和图片区域
-4. 你直接翻译（你能看到图片，翻译更准确）
-5. 选择输出方式：
-   - generate_translated_image：图片生成（有背景/花纹/照片时用）
-   - overlay_translated_text：文字覆盖（纯白/纯色背景时用）
-6. 用 crop_image_region 保留签名、盖章、logo
+3. 你直接翻译（你能看到图片，翻译更准确）
+4. 用 generate_translated_image 生成翻译后的页面图片
+5. 用 save_scan_pdf 保存为 PDF
 
 ## 关键原则
+- 扫描件优先用 generate_translated_image，因为它能保留原始背景
+- overlay_translated_text 只适合纯白/纯色背景，大多数扫描件不适合
+- 如果 generate_translated_image 失败，用 ask_user 问用户怎么处理，不要自己降级
 - OCR 经常识别错字，以你从图片中看到的为准
 - 专有名词用 update_memory 记录，确保跨页一致
 - 每页处理完用 report_progress 通知用户
 
-## 保留背景模式
-- 目标：原图一模一样，只是文字从原文变成译文
-- 有照片/水印/花纹/表格线/国徽/印章 → 必须先尝试 generate_translated_image
-- 纯白/纯色背景且无任何装饰 → 才可以用 overlay_translated_text
-- 不确定 → 用 generate_translated_image（更安全）
-- 绝对不要跳过 generate_translated_image 直接用 overlay_translated_text
-  除非页面确实是纯白背景无任何装饰元素
-- 所有页面处理完后，调用 save_scan_pdf 保存为 PDF 文件
-- 如果 generate_translated_image 失败（API 限额/超时），不要降级用 overlay_translated_text
-  在有复杂背景的页面上 — overlay 只能处理纯色背景，强行用会覆盖乱七八糟
-- 图片生成失败时，用 ask_user 告诉用户情况，让用户决定是等 API 恢复还是接受 overlay 效果
+## 必须问用户的情况
+- 人名翻译（拼音→汉字是一对多，你不可能猜对）
+- 不确定的专业术语、机构名、地名
+- 文档用途（用户可能有特殊要求）
+- 任何你拿不准的翻译选择
+- 用 ask_user 工具提问，用户回答后必须严格遵守
