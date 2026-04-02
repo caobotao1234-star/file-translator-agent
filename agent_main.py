@@ -26,7 +26,7 @@ from tools.doc_tools import ParseDocumentTool, GetPageContentTool, WriteDocument
 from tools.translate_tools import TranslatePageTool
 from tools.memory_tools import MemoryStore, ReadMemoryTool, UpdateMemoryTool
 from tools.interaction_tools import AskUserTool, ReportProgressTool
-from tools.format_tools import InspectOutputTool, AdjustFormatTool
+from tools.format_tools import InspectOutputTool, AdjustFormatTool, VerifyOutputTool
 from tools.vision_tools import GetPageImageTool, create_scan_tools, SaveScanPDFTool
 from tools.layout_tools_v2 import RenderSlideTool, EnableAutofitTool, CompareLayoutTool, SmartResizeTool
 from prompts.agent_prompts import TRANSLATION_AGENT_PROMPT
@@ -124,6 +124,7 @@ def build_agent(translate_model_id: str = None, brain_model_id: str = None,
         TranslatePageTool(translate_pipeline=pipeline, parse_tool=parse_tool),
         InspectOutputTool(),
         AdjustFormatTool(),
+        VerifyOutputTool(),
         RenderSlideTool(),
         EnableAutofitTool(),
         CompareLayoutTool(),

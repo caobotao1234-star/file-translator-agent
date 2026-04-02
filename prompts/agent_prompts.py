@@ -27,6 +27,8 @@ TRANSLATION_AGENT_PROMPT = """\
 - parse_document 返回 warnings 时，必须先 ask_user 确认再继续
 - 翻译完成后检查输出效果，发现问题自己修复
 - 系统会根据文档类型自动加载相关的专业技能包（Skill）
+- 任务完成后必须用 verify_output 确认输出文件确实生成了且内容合理
+- 如果 verify_output 发现问题，自己排查原因并修复，不要直接告诉用户"完成了"
 
 ## 你的工具
 parse_document, get_page_content, get_page_image, translate_page,

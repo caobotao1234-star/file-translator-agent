@@ -326,7 +326,7 @@ class MainWindow(QMainWindow):
         from tools.translate_tools import TranslatePageTool
         from tools.memory_tools import MemoryStore, ReadMemoryTool, UpdateMemoryTool
         from tools.interaction_tools import AskUserTool, ReportProgressTool
-        from tools.format_tools import InspectOutputTool, AdjustFormatTool
+        from tools.format_tools import InspectOutputTool, AdjustFormatTool, VerifyOutputTool
         from tools.vision_tools import GetPageImageTool, create_scan_tools, SaveScanPDFTool
         from prompts.agent_prompts import TRANSLATION_AGENT_PROMPT
         from core.skill_loader import SkillLoader
@@ -382,6 +382,7 @@ class MainWindow(QMainWindow):
             TranslatePageTool(translate_pipeline=pipeline, parse_tool=parse_tool),
             InspectOutputTool(),
             AdjustFormatTool(),
+            VerifyOutputTool(),
             RenderSlideTool(),
             EnableAutofitTool(),
             CompareLayoutTool(),

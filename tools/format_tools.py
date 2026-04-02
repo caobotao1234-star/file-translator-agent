@@ -432,3 +432,61 @@ class AdjustFormatTool(BaseTool):
             "adjusted_runs": adjusted_count,
             "output_path": path,
         }, ensure_ascii=False)
+
+
+class VerifyOutputTool(BaseTool):
+    """
+    📘 验证输出文件
+
+    检查输出文件是否存在、大小是否合理、能否正常打开。
+    Agent 完成任务后应该调用这个工具做端到端验证。
+    """
+
+    name = "verify_output"
+    description = (
+        "验证输出文件是否成功生成。检查文件是否存在、大小是否合理。"
+        "翻译任务完成后必须调用此工具确认输出文件确实生成了。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "output_path": {
+                "type": "string",
+                "description": "要验证的输出文件路径",
+            },
+        },
+        "required": ["output_path"],
+    }
+
+    def execute(self, params: dict) -> str:
+        output_path = params["output_path"]
+
+        if not os.path.exists(output_path):
+            return json.dumps({
+                "exists": False,
+                "error": f"文件不存在: {output_path}",
+                "suggestion": "输出文件未生成，请检查是否调用了正确的写入工具",
+            }, ensure_ascii=False)
+
+        size = os.path.getsize(output_path)
+        ext = os.path.splitext(output_path)[1].lower()
+
+        result = {
+            "exists": True,
+            "path": output_path,
+            "size_bytes": size,
+            "size_readable": f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/1024/1024:.1f} MB",
+            "extension": ext,
+        }
+
+        # 基本合理性检查
+        if size == 0:
+            result["warning"] = "文件大小为 0，可能写入失败"
+        elif size < 100:
+            result["warning"] = "文件非常小，可能内容不完整"
+        elif ext == ".pdf" and size < 1000:
+            result["warning"] = "PDF 文件很小，可能只有空白页"
+        elif ext in (".docx", ".pptx") and size < 5000:
+            result["warning"] = "文档文件很小，可能内容不完整"
+
+        return json.dumps(result, ensure_ascii=False)
