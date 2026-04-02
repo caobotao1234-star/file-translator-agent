@@ -390,6 +390,25 @@ class AgentLoop:
 
             # 📘 Step 5: 模型返回纯文本 -> 可能完成，也可能被截断
             if text_content:
+                # 📘 检测模型在文本里提问（应该用 ask_user 工具）
+                # 如果文本包含问号且不是最终总结，提醒模型用 ask_user
+                has_question = "?" in text_content or "？" in text_content
+                is_short = len(text_content) < 500
+                if has_question and is_short and not tool_calls:
+                    logger.info("检测到模型在文本里提问，注入提醒用 ask_user")
+                    self.messages.append({"role": "assistant", "content": text_content})
+                    self._notify_message("assistant", text_content)
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "[系统提醒] 你刚才在文本里提了问题。"
+                            "如果需要用户回答，请用 ask_user 工具提问，"
+                            "这样用户的回答才能被可靠接收。"
+                            "如果不需要用户回答，请继续工作。"
+                        ),
+                    })
+                    continue
+
                 # 📘 借鉴 Claude Code：检测输出截断并自动恢复
                 # 如果 completion_tokens 接近 max_tokens，说明输出被截断了
                 # 注入恢复消息让模型接着说，不要道歉不要重复

@@ -29,6 +29,8 @@ TRANSLATION_AGENT_PROMPT = """\
 - 系统会根据文档类型自动加载相关的专业技能包（Skill）
 - 任务完成后必须用 verify_output 确认输出文件确实生成了且内容合理
 - 如果 verify_output 发现问题，自己排查原因并修复，不要直接告诉用户"完成了"
+- 需要问用户问题时，必须用 ask_user 工具，不要在回复文本里提问
+  （用户的回答只有通过 ask_user 才能被可靠接收，文本里的提问用户回答后你可能收不到）
 
 ## 你的工具
 parse_document, get_page_content, get_page_image, translate_page,
