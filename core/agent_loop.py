@@ -388,6 +388,11 @@ class AgentLoop:
 
                 continue  # 继续循环
 
+            # 📘 清理大型工具结果（图片 base64 等），防止 token 爆炸
+            # 图片 base64 留在消息历史里每轮都重发，9 轮 × 2 张图 = 576K tokens
+            # 模型已经看过了，后续轮次不需要再看
+            self._cleanup_large_tool_results()
+
             # 📘 Step 5: 模型返回纯文本 -> 可能完成，也可能被截断
             if text_content:
                 # 📘 检测模型在文本里提问（应该用 ask_user 工具）
@@ -503,6 +508,37 @@ class AgentLoop:
                 self.on_token_update(self.stats)
             except Exception:
                 pass
+
+    IMAGE_B64_PLACEHOLDER = "[图片已查看，base64 已清除以节省 token]"
+
+    def _cleanup_large_tool_results(self):
+        """
+        📘 清理消息历史中的大型工具结果
+
+        图片 base64、大型 OCR 结果等在模型看过一次后就不需要了。
+        替换为占位符，防止每轮循环都重发导致 token 爆炸。
+        """
+        import re
+        cleaned = 0
+        for msg in self.messages:
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
+            # 清理 base64 图片数据（image_base64 字段）
+            if "image_base64" in content and len(content) > 50000:
+                # 用正则替换 base64 数据，保留其他字段
+                new_content = re.sub(
+                    r'"image_base64"\s*:\s*"[A-Za-z0-9+/=]{1000,}"',
+                    '"image_base64": "' + self.IMAGE_B64_PLACEHOLDER + '"',
+                    content,
+                )
+                if len(new_content) < len(content):
+                    msg["content"] = new_content
+                    cleaned += 1
+        if cleaned:
+            logger.info(f"清理了 {cleaned} 条大型工具结果中的图片 base64")
 
     # 📘 借鉴 Claude Code 的 compact prompt 结构
     COMPACT_PROMPT = (
