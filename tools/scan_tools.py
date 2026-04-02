@@ -432,10 +432,14 @@ class ImageGenTool(BaseTool):
 
     name = "generate_translated_image"
     description = (
-        "用图片生成模型将页面中的文字替换为目标语言译文，保留原始背景和视觉效果。"
-        "图片生成 LLM 会在原图上直接重绘——保留所有背景纹理、花纹、水印、颜色，"
-        "只把文字内容替换为译文。生成的图片自动保存，供最终 PDF 合成。\n"
-        "适用场景：有花纹背景、水印、彩色底图的文档，或排版极复杂的页面。"
+        "用图片生成模型（Gemini/NanoBanana）在原图上重绘译文。\n"
+        "你需要写一个详细的英文 prompt 传给图片生成模型，prompt 必须包含：\n"
+        "1. 原图的完整描述（尺寸、方向、布局、背景特征）\n"
+        "2. 每个文字区域的精确位置和对应的译文\n"
+        "3. 字体大小、粗细、颜色等视觉要求\n"
+        "4. 哪些区域不要修改（签名、盖章、logo、二维码等）\n"
+        "5. 强调保留所有背景元素\n"
+        "prompt 质量直接决定生成图片的质量，请认真编写。"
     )
     parameters = {
         "type": "object",
@@ -444,27 +448,16 @@ class ImageGenTool(BaseTool):
                 "type": "integer",
                 "description": "页码索引（从0开始）",
             },
-            "translated_text": {
-                "type": "string",
-                "description": "准确的译文内容（所有文字区域的译文，按位置标注）",
-            },
-            "image_prompt": {
+            "prompt": {
                 "type": "string",
                 "description": (
-                    "给图片生成模型的详细指令，必须包含：\n"
-                    "1. 每个文字区域在图片中的大致位置描述\n"
-                    "2. 对应的译文内容\n"
-                    "3. 字体大小、粗细、颜色等视觉要求\n"
-                    "4. 明确指出哪些区域不要修改（签名、盖章、logo 等）\n"
-                    "5. 强调：保留所有背景元素，只替换文字"
+                    "给图片生成模型的完整英文 prompt。"
+                    "你完全控制这个 prompt 的内容，工具不会添加任何模板。"
+                    "写得越详细，生成效果越好。"
                 ),
             },
-            "target_lang": {
-                "type": "string",
-                "description": "目标语言，如'中文'、'英文'、'日文'",
-            },
         },
-        "required": ["page_index", "translated_text", "image_prompt", "target_lang"],
+        "required": ["page_index", "prompt"],
     }
 
     def __init__(self, image_gen_engine=None, context: Dict[str, Any] = None):
@@ -483,9 +476,7 @@ class ImageGenTool(BaseTool):
             )
 
         page_index = params["page_index"]
-        translated_text = params["translated_text"]
-        image_prompt = params["image_prompt"]
-        target_lang = params["target_lang"]
+        prompt = params["prompt"]
 
         page_images = self.context.get("page_images", [])
         # 📘 page_index 自动修正
@@ -502,27 +493,8 @@ class ImageGenTool(BaseTool):
         try:
             import base64
 
-            # 📘 构建图片生成请求
+            # 📘 Agent 完全控制 prompt，工具只负责发送
             img_b64 = base64.b64encode(page_images[page_index]).decode("utf-8")
-
-            full_prompt = (
-                f"You are a professional document translator. Your task is to modify this document image "
-                f"by replacing ALL original text with the {target_lang} translation below.\n\n"
-                f"## CRITICAL: Complete text replacement\n"
-                f"- REMOVE every single character of the original language text from the image\n"
-                f"- Replace each text region with ONLY the translated text provided below\n"
-                f"- There must be ZERO original language characters remaining in the output image\n"
-                f"- If the original has both Chinese and English (e.g. a bilingual heading), "
-                f"replace the entire region with ONLY the translated version\n\n"
-                f"## Translated text to place on the image\n{translated_text}\n\n"
-                f"## Layout and style instructions\n{image_prompt}\n\n"
-                f"## Visual preservation rules\n"
-                f"- The background must be IDENTICAL to the original - no white patches, no color changes\n"
-                f"- Text position, size ratio, weight, and color must match the original layout\n"
-                f"- Do NOT modify any non-text elements (signatures, stamps, logos, photos, barcodes)\n"
-                f"- If space is tight, slightly reduce font size but keep readability\n"
-                f"- Output a complete document image with the same dimensions as the input"
-            )
 
             messages = [
                 {
@@ -534,7 +506,7 @@ class ImageGenTool(BaseTool):
                                 "url": f"data:image/jpeg;base64,{img_b64}",
                             },
                         },
-                        {"type": "text", "text": full_prompt},
+                        {"type": "text", "text": prompt},
                     ],
                 },
             ]
