@@ -105,6 +105,13 @@ class ParseDocumentTool(BaseTool):
                 ),
             }
 
+            # 📘 图片统计（PDF 和 Word）
+            image_count = parsed.get("image_count", 0)
+            if not image_count:
+                image_count = sum(1 for i in items if i.get("type") == "pdf_image")
+            if image_count > 0:
+                overview["image_count"] = image_count
+
             # 📘 检测异常文档（图片多/文本少 → 可能是扫描件）
             warnings = []
             if ext == ".docx":
@@ -273,6 +280,12 @@ class GetPageContentTool(BaseTool):
                         "text": item.get("full_text", ""),
                         "type": item.get("type", ""),
                     }
+                    # 📘 图片信息
+                    if item.get("type") == "pdf_image":
+                        entry["image_width"] = item.get("image_width")
+                        entry["image_height"] = item.get("image_height")
+                        entry["bbox"] = item.get("bbox")
+                    # 📘 Run 格式详情
                     runs_data = item.get("runs")
                     if runs_data and len(runs_data) > 1:
                         entry["runs"] = [

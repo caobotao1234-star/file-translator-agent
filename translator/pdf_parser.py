@@ -447,6 +447,25 @@ def parse_pdf(filepath: str) -> Dict[str, Any]:
 
         page_items = []
         for block_idx, block in enumerate(text_dict.get("blocks", [])):
+            # 📘 图片块：提取图片信息（位置、大小），让 Agent 决定怎么处理
+            if block.get("type") == 1:
+                img_bbox = block.get("bbox", [0, 0, 0, 0])
+                img_w = img_bbox[2] - img_bbox[0]
+                img_h = img_bbox[3] - img_bbox[1]
+                # 跳过太小的图片（可能是图标/装饰）
+                if img_w * img_h < 2000:
+                    continue
+                page_items.append({
+                    "key": f"pg{page_idx}_img{block_idx}",
+                    "type": "pdf_image",
+                    "full_text": "",
+                    "bbox": list(img_bbox),
+                    "image_width": round(img_w, 1),
+                    "image_height": round(img_h, 1),
+                    "is_empty": True,
+                })
+                continue
+
             if block.get("type") != 0:
                 continue
 
@@ -520,9 +539,11 @@ def parse_pdf(filepath: str) -> Dict[str, Any]:
     doc.close()
 
     block_count = len(raw_items)
+    image_count = sum(1 for i in raw_items if i.get("type") == "pdf_image")
+    text_count = block_count - image_count
     logger.info(
-        f"PDF 解析完成: {block_count} 个文本块（合并后），{page_count} 页，"
-        f"跳过页眉页脚 {skipped_header_footer} 个，跳过短文本 {skipped_short} 个"
+        f"PDF 解析完成: {text_count} 个文本块, {image_count} 个图片, {page_count} 页, "
+        f"跳过页眉页脚 {skipped_header_footer} 个, 跳过短文本 {skipped_short} 个"
     )
 
-    return {"items": raw_items, "page_count": page_count}
+    return {"items": raw_items, "page_count": page_count, "image_count": image_count}
