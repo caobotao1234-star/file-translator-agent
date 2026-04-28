@@ -224,7 +224,7 @@ class Config:
             "deepseek",
             # 百炼（阿里云 DashScope）通义千问系列
             "qwen-max", "qwen-plus", "qwen-turbo", "qwen-vl", "qwen3",
-            "qwen3.5",
+            "qwen3.5", "qwen3.6",
         ]
 
         if not provider or not model:
